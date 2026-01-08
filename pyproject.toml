@@ -1,0 +1,15 @@
+[project]
+name = "FastBEMT"
+version = "0.1.0"
+description = "Fast approximate BEMT solver"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aerosandbox>=4.2.9",
+    "ipython>=9.9.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.0",
+    "pandas>=2.3.3",
+    "pip>=25.3",
+    "scipy>=1.16.3",
+]
