@@ -1,7 +1,7 @@
 [project]
 name = "FastBEMT"
 version = "0.1.0"
-description = "Fast approximate BEMT solver"
+description = "A fast approximate BEMT solver"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

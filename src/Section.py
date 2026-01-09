@@ -3,7 +3,6 @@
 This module provides a faster version of the BEMT solver by:
 - Reusing pre-built `aerosandbox.Airfoil` objects per section
 - Caching / pre-tabulating airfoil coefficients
-- Avoiding repeated DataFrame c[oncatenations
 """
 
 import numpy as np
@@ -16,39 +15,34 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 class SectionForces:
     """Solve BEMT for a single blade section."""
-
     def __init__(self, airfoil, r, dr, chord, theta, propellerParams):
         """Initialize per-section geometry, flow state, and cached data."""
-        # Pre-built aerosandbox Airfoil object (reused across many evaluations)
         self.airfoil = airfoil
         self.r = r
         self.dr = dr
         self.chord = chord
         self.theta = theta
         self.propellerParams = propellerParams
-        self.Ma = self.propellerParams.omega * self.r / self.propellerParams.aInf
+        self.Ma = self.propellerParams.omega * self.r / self.propellerParams.a_inf
         self.Re = self.propellerParams.rho * self.propellerParams.omega * self.r * self.chord / self.propellerParams.mu
-        # Pre-tabulated CL/CD vs alpha tables keyed by (ReBin, MaBin)
         self._tables = {}
-        # Precompute Prandtl loss factor table
         self._buildPrandtlLossTable()
 
     @property
     def sigma(self):
         """Local solidity for this section."""
-        return self.propellerParams.nBlades * self.chord / (2 * np.pi * self.r)
+        return self.propellerParams.n_blades * self.chord / (2 * np.pi * self.r)
 
     def _buildPrandtlLossTable(self):
         """Precompute Prandtl loss factor on a phi grid for fast interpolation."""
-        # Phi grid (radians)
         self._phi_grid = np.linspace(np.radians(0.1), np.radians(89.9), 100)
 
         sin_phi = np.sin(self._phi_grid)
-        B = self.propellerParams.nBlades
+        B = self.propellerParams.n_blades
         r = self.r
 
-        f_tip = B * (self.propellerParams.propRadius - r) / (2 * r * sin_phi)
-        f_hub = B * (r - self.propellerParams.hubRadius) / (2 * r * sin_phi)
+        f_tip = B * (self.propellerParams.prop_radius - r) / (2 * r * sin_phi)
+        f_hub = B * (r - self.propellerParams.hub_radius) / (2 * r * sin_phi)
 
         # Clip to avoid overflow
         f_tip = np.clip(f_tip, 0.0, 500.0)
@@ -73,7 +67,7 @@ class SectionForces:
         # Lazily build the CL/CD vs alpha table for this (ReBin, MaBin)
         if key not in self._tables:
             # Alpha grid in degrees for tabulation
-            alpha_grid = np.linspace(0.0, 30.0, 61)  # 0.5 deg step
+            alpha_grid = np.linspace(0.0, 30.0, 61)
             full_output = asb.Airfoil.get_aero_from_neuralfoil(self.airfoil, alpha=alpha_grid, Re=ReBin, mach=MaBin, model_size=modelSize)
             cl_grid = np.asarray(full_output["CL"], dtype=float)
             cd_grid = np.asarray(full_output["CD"], dtype=float)
@@ -97,17 +91,17 @@ class SectionForces:
         F = self.prandtlLoss(phi)
         a = 1 / ((4 * F * np.sin(phi) ** 2) / (self.sigma * cLPrime) - 1)
         aPrime = 1 / ((4 * F * np.sin(phi) * np.cos(phi)) / (self.sigma * cDPrime) + 1)
-        vA = (1 + a) * self.propellerParams.vInf
+        vA = (1 + a) * self.propellerParams.v_inf
         vT = self.propellerParams.omega * self.r * (1 - aPrime)
         W = np.sqrt(vA**2 + vT**2)
         self.Re = self.propellerParams.rho * W * self.chord / self.propellerParams.mu
-        self.Ma = W / self.propellerParams.aInf
+        self.Ma = W / self.propellerParams.a_inf
         return alpha, cL, cD, F, a, aPrime, W, cLPrime, cDPrime
 
     def residualFunction(self, phi):
         """Residual of the inflow angle equation for root finding."""
         _, _, _, _, a, aPrime, _, _, _ = self.sectionParameters(phi)
-        return np.sin(phi) / (1 + a) - self.propellerParams.vInf / (self.propellerParams.omega * self.r) * (np.cos(phi) / (1 - aPrime))
+        return np.sin(phi) / (1 + a) - self.propellerParams.v_inf / (self.propellerParams.omega * self.r) * (np.cos(phi) / (1 - aPrime))
 
     def solve(self, prevPhi=None):
         """Solve for inflow angle phi and return section forces and kinematics.
@@ -116,19 +110,15 @@ class SectionForces:
         bracket for the root search and expand it until a sign change is found;
         otherwise fall back to the full range (> 0, < 90).
         """
-        # Default wide bracket in radians
         phiMinDefault = np.radians(0.1)
         phiMaxDefault = np.radians(89.9)
 
         if prevPhi is None:
-            # No prior information: use the full bracket
             bracket = [phiMinDefault, phiMaxDefault]
         else:
-            # Start with a tight bracket around the previous section's solution
             center = np.clip(prevPhi, phiMinDefault, phiMaxDefault)
             delta = np.radians(1)  # initial half-width: ±1 deg
 
-            # Helper to evaluate residual safely
             def safeResidual(x):
                 try:
                     return self.residualFunction(x)
@@ -143,17 +133,14 @@ class SectionForces:
                 fLower = safeResidual(lower)
                 fUpper = safeResidual(upper)
 
-                # Check for valid sign change
                 if np.isfinite(fLower) and np.isfinite(fUpper) and fLower * fUpper < 0:
                     bracket = [lower, upper]
                     break
 
-                # If we've already reached the full default bracket, give up and use it
                 if lower <= phiMinDefault or upper >= phiMaxDefault:
                     bracket = [phiMinDefault, phiMaxDefault]
                     break
 
-                # Otherwise, expand the search region
                 delta *= 2.0
 
         result = scipy.optimize.root_scalar(
