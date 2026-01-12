@@ -1,5 +1,4 @@
 import numpy as np
-from typing import Union, List
 
 class CompactAcousticSourceArray:
     """
@@ -50,7 +49,7 @@ class CompactAcousticSourceArray:
         self._initialize_geometry_and_kinematics()
 
     def _initialize_geometry_and_kinematics(self):
-        """Vectorized calculation of fixed-frame positions, velocities, and forces."""
+        """Vectorized calculation of fixed-frame positions, velocities, and forces (assumed constant in the moving frame)."""
         # Source position in the moving (blade) frame (Ns, 3)
         pos_moving = np.stack([
             self.chord * self.com_shift_forward * np.sin(self.twist_rad),

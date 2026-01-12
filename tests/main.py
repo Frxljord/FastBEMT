@@ -3,11 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as ticker
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.Propeller import Propeller
 from src.JobParameters import AerodynamicParameters, AcousticParameters
 
 def main():
-    # Load geometry
     with open("10x7E.pkl", "rb") as f:
         blade_dict = pickle.load(f)
 
@@ -27,12 +30,11 @@ def main():
         aero_params=aerodynamic_params,
         p_ref=2e-5,
         revolutions=10,
-        num_obs_times_per_rev=1000
+        num_obs_times_per_rev=100
     )
 
     # Observer positions in meters [x, y, z]
     r_observer = np.array([[0, 1.8, 0],
-                           [1.8, 0, 0],
                            [0, 0, 1.8]])
 
     propeller = Propeller(
@@ -48,25 +50,20 @@ def main():
     thrust, torque, ct, cp = propeller.compute_total_forces()
     print(f"BEMT Results: Thrust={thrust:.4f} N, Torque={torque:.4f} N·m, Ct={ct:.6f}, Cp={cp:.6f}")
 
-    # --- Plotting Configuration ---
     n_obs = r_observer.shape[0]
     fig = plt.figure(figsize=(15, 3.5 * n_obs)) 
     gs = gridspec.GridSpec(n_obs, 2, figure=fig)
 
     fontsize = 10
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    # Reference inherited attribute from aerodynamic_params
     blade_passing_freq = 1 / acoustic_params.blade_passing_period
 
-    # Create unified SPL plot on the right
     ax_spl = fig.add_subplot(gs[:, 1])
 
     for idx in range(n_obs):
-        # --- Left Plots: Time Domain (Column 0) ---
         ax_time = fig.add_subplot(gs[idx, 0])
         color = colors[idx % len(colors)]
         
-        # Plot components with small markers and solid lines
         ax_time.plot(propeller.t[:, idx], propeller.p_m[:, idx], 
                     label='Monopole', linestyle='-', marker='o', markersize=1.5, alpha=0.4)
         ax_time.plot(propeller.t[:, idx], propeller.p_d[:, idx], 
@@ -81,19 +78,16 @@ def main():
         ax_time.grid(True, alpha=0.3)
         ax_time.legend(loc='upper right', fontsize='small')
 
-        # --- Right Plot: Frequency Domain (SPL) ---
         label_text = f'Obs {idx} (OSPL: {propeller.ospl[idx]:.3f} dB)'
         
         ax_spl.semilogx(propeller.freq[:, idx], propeller.spl[:, idx], 
                         color=color, linestyle='-', marker='.', markersize=2, 
                         label=label_text, alpha=0.8)
 
-    # Finalize SPL Plot decorations
     ax_spl.set_title('Acoustic Spectrum (SPL)', fontsize=fontsize, fontweight='bold')
     ax_spl.set_xlabel('Frequency [Hz]', fontsize=fontsize)
     ax_spl.set_ylabel('SPL [dB]', fontsize=fontsize)
 
-    # Vertical BPF harmonic lines
     max_f = np.max(propeller.freq)
     harmonic_freqs = np.arange(blade_passing_freq, max_f, blade_passing_freq)
     for bpf in harmonic_freqs:

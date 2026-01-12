@@ -23,8 +23,12 @@ class SectionForces:
         self.chord = chord
         self.theta = theta
         self.propellerParams = propellerParams
-        self.Ma = self.propellerParams.omega * self.r / self.propellerParams.a_inf
-        self.Re = self.propellerParams.rho * self.propellerParams.omega * self.r * self.chord / self.propellerParams.mu
+        self.v_local = np.sqrt(
+            self.propellerParams.v_inf**2 +
+            (self.propellerParams.omega * self.r)**2
+        )
+        self.Ma = self.v_local / self.propellerParams.a_inf
+        self.Re = self.propellerParams.rho * self.v_local * self.chord / self.propellerParams.mu
         self._tables = {}
         self._buildPrandtlLossTable()
 
@@ -54,7 +58,7 @@ class SectionForces:
         self._F_grid = F_tip * F_hub
 
     def prandtlLoss(self, phi):
-        """Return Prandtl tip–hub loss factor for a given inflow angle phi (rad)."""
+        """Return Prandtl tip-hub loss factor for a given inflow angle phi (rad)."""
         return np.interp(phi, self._phi_grid, self._F_grid)
 
     def airfoilCoefficients(self, alpha, Re, Ma, modelSize="xxxlarge"):
