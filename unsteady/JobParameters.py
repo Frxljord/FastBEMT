@@ -9,6 +9,7 @@ class AerodynamicParameters:
         hub_radius: float, 
         n_blades: int, 
         rpm: float, 
+        v_inf: np.ndarray, 
         a_inf: float, 
         rho: float, 
         mu: float, 
@@ -19,6 +20,7 @@ class AerodynamicParameters:
         self.n_blades = n_blades
         self.rpm = rpm
         self.omega = 2.0 * np.pi * rpm / 60.0
+        self.v_inf = v_inf
         self.a_inf = a_inf
         self.rho = rho
         self.mu = mu
@@ -46,4 +48,3 @@ class AcousticParameters(AerodynamicParameters):
         self.num_obs_times = self.num_obs_times_per_rev * self.revolutions
         self.dt = self.duration / (2.0 * self.num_obs_times_per_rev - 1.0)
         self.src_times = np.arange(0, 2 * self.num_obs_times_per_rev) * self.dt
-        self.num_src_times = self.src_times.size

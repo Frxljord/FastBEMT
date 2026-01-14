@@ -23,12 +23,6 @@ class SectionForces:
         self.chord = chord
         self.theta = theta
         self.propellerParams = propellerParams
-        self.v_local = np.sqrt(
-            self.propellerParams.v_inf**2 +
-            (self.propellerParams.omega * self.r)**2
-        )
-        self.Ma = self.v_local / self.propellerParams.a_inf
-        self.Re = self.propellerParams.rho * self.v_local * self.chord / self.propellerParams.mu
         self._tables = {}
         self._buildPrandtlLossTable()
 
@@ -59,6 +53,8 @@ class SectionForces:
 
     def prandtlLoss(self, phi):
         """Return Prandtl tip-hub loss factor for a given inflow angle phi (rad)."""
+        if phi <= 0:
+            return 1.0
         return np.interp(phi, self._phi_grid, self._F_grid)
 
     def airfoilCoefficients(self, alpha, Re, Ma, modelSize="xxxlarge"):
@@ -93,27 +89,34 @@ class SectionForces:
         cLPrime = cL * np.cos(phi) - cD * np.sin(phi)
         cDPrime = cL * np.sin(phi) + cD * np.cos(phi)
         F = self.prandtlLoss(phi)
-        a = 1 / ((4 * F * np.sin(phi) ** 2) / (self.sigma * cLPrime) - 1)
-        aPrime = 1 / ((4 * F * np.sin(phi) * np.cos(phi)) / (self.sigma * cDPrime) + 1)
-        vA = (1 + a) * self.propellerParams.v_inf
+        k_t = self.sigma * cLPrime / (4 * F * np.sin(phi) * np.cos(phi)) 
+        k_q = self.sigma * cDPrime / (4 * F * np.sin(phi) * np.cos(phi))
+        u = self.propellerParams.omega * self.r * k_t / (1 + k_q)
+        aPrime = k_q / (1 + k_q)
+        vA = self.v_inf + u
         vT = self.propellerParams.omega * self.r * (1 - aPrime)
         W = np.sqrt(vA**2 + vT**2)
         self.Re = self.propellerParams.rho * W * self.chord / self.propellerParams.mu
         self.Ma = W / self.propellerParams.a_inf
-        return alpha, cL, cD, F, a, aPrime, W, cLPrime, cDPrime
+        return alpha, cL, cD, F, u, aPrime, W, cLPrime, cDPrime
 
     def residualFunction(self, phi):
         """Residual of the inflow angle equation for root finding."""
-        _, _, _, _, a, aPrime, _, _, _ = self.sectionParameters(phi)
-        return np.sin(phi) / (1 + a) - self.propellerParams.v_inf / (self.propellerParams.omega * self.r) * (np.cos(phi) / (1 - aPrime))
+        _, _, _, _, u, aPrime, _, _, _ = self.sectionParameters(phi)
+        return np.tan(phi) - (self.v_inf + u) / (self.propellerParams.omega * self.r) / (1 - aPrime)
 
-    def solve(self, prevPhi=None):
+    def solve(self, v_inf, prevPhi=None):
         """Solve for inflow angle phi and return section forces and kinematics.
 
         If a previous-section phi is provided, use it to define a tighter
         bracket for the root search and expand it until a sign change is found;
         otherwise fall back to the full range (> 0, < 90).
         """
+        self.v_inf = v_inf
+        v_local = np.sqrt(self.v_inf**2 +(self.propellerParams.omega * self.r)**2)
+        self.Ma = v_local / self.propellerParams.a_inf
+        self.Re = self.propellerParams.rho * v_local * self.chord / self.propellerParams.mu
+
         phiMinDefault = np.radians(0.1)
         phiMaxDefault = np.radians(89.9)
 
@@ -147,17 +150,25 @@ class SectionForces:
 
                 delta *= 2.0
 
-        result = scipy.optimize.root_scalar(
-            self.residualFunction,
-            method="brentq",
-            xtol=1e-4,
-            bracket=bracket,
-        )
+        try:
+            result = scipy.optimize.root_scalar(
+                self.residualFunction,
+                method="brentq",
+                xtol=1e-4,
+                bracket=bracket,
+            )
+        except ValueError:
+            result = scipy.optimize.root_scalar(
+                self.residualFunction,
+                method="newton",
+                xtol=1e-4,
+                x0 = np.mean(bracket)
+            )
         if not result.converged:
             raise RuntimeError("Root finding did not converge")
 
         phi = result.root
-        alpha, cL, cD, F, a, aPrime, W, cLPrime, cDPrime = self.sectionParameters(phi)
+        alpha, cL, cD, F, u, aPrime, W, cLPrime, cDPrime = self.sectionParameters(phi)
         dT = self.sigma * np.pi * self.propellerParams.rho * W**2 * cLPrime * self.r * self.dr
         dQ = self.sigma * np.pi * self.propellerParams.rho * W**2 * cDPrime * self.r**2 * self.dr
-        return phi, dT, dQ, alpha, a, aPrime, cLPrime, cDPrime, F, W, self.Re, self.Ma
+        return phi, dT, dQ, alpha, u, aPrime, cLPrime, cDPrime, F, W, self.Re, self.Ma

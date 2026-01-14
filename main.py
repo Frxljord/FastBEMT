@@ -2,10 +2,6 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import matplotlib.ticker as ticker
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.Propeller import Propeller
 from src.JobParameters import AerodynamicParameters, AcousticParameters
@@ -19,17 +15,15 @@ def main():
         hub_radius=blade_dict['hub_radius'],
         n_blades=blade_dict['n_blades'],
         rpm=7000,
-        v_inf=0,
         a_inf=343,
         rho=1.225,
         mu=1.81e-5,
-        p_ref=2e-5
     )
 
     acoustic_params = AcousticParameters(
         aero_params=aerodynamic_params,
         p_ref=2e-5,
-        revolutions=10,
+        revolutions=5,
         num_obs_times_per_rev=100
     )
 
@@ -42,8 +36,8 @@ def main():
         aero_params=aerodynamic_params,
         acoustic_params=acoustic_params
     )
-    
-    propeller.run_bemt()
+
+    propeller.run_bemt(v_inf=0*np.ones(len(blade_dict['r'])))
     propeller.run_compact_f1a(observer_positions=r_observer)
 
     # Performance output
@@ -80,7 +74,7 @@ def main():
 
         label_text = f'Obs {idx} (OSPL: {propeller.ospl[idx]:.3f} dB)'
         
-        ax_spl.semilogx(propeller.freq[:, idx], propeller.spl[:, idx], 
+        ax_spl.semilogx(propeller.freq[1:, idx], propeller.spl[1:, idx], 
                         color=color, linestyle='-', marker='.', markersize=2, 
                         label=label_text, alpha=0.8)
 
@@ -95,7 +89,7 @@ def main():
 
     ax_spl.grid(True, which='both', alpha=0.3)
     ax_spl.legend(fontsize=fontsize, loc='lower left')
-
+    ax_spl.set_ylim()
     plt.tight_layout()
     plt.show()
 

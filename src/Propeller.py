@@ -18,53 +18,52 @@ class Propeller:
         
         self.set_section_areas()
 
-        # Check which is which
-        self.com_shift_up = [s[0] for s in self.geometry['COM_shift']]
-        self.com_shift_forward = [s[1] for s in self.geometry['COM_shift']]
+        # com_shift_up positive in forward direction (+ x), com_shift_forward positive in upward direction (+ z)
+        self.com_shift_up = [s[1] for s in self.geometry['COM_shift']]
+        self.com_shift_forward = [-s[0] for s in self.geometry['COM_shift']]
 
         self.solution_data = pd.DataFrame(
             columns=[
                 "radius", "chord", "twist", "phi", "alpha", 
-                "Cl", "Cd", "a", "a_prime", "dT", "dQ", 
+                "Cl", "Cd", "u", "a_prime", "dT", "dQ", 
                 "F", "W", "Re", "Ma"
             ]
         )
         
         self._section_airfoils = [asb.Airfoil(coordinates=af) for af in self.geometry["airfoil"]]
 
+        self._sections = [SectionForces(
+            airfoil=self._section_airfoils[idx],
+            r=self.geometry['r'][idx],
+            dr=self.geometry['dr'][idx],
+            chord=self.geometry['chord'][idx],
+            theta=np.radians(self.geometry['twist'][idx]),
+            propellerParams=self.aero_params,
+        ) for idx in range(len(self.geometry["r"]))]
+
         # Acoustic results containers
         self.t, self.p_m, self.p_d, self.p_tot = None, None, None, None
         self.freq, self.spl, self.spl_a, self.ospl, self.oaspl = [None] * 5
 
-    def process_section(self, r, dr, chord, theta_deg, airfoil_asb, prev_phi=None):
+    def process_section(self, section_index, v_inf, prev_phi=None):
         """Run the BEMT solver for a single radial section."""
-        section_force = SectionForces(
-            airfoil=airfoil_asb,
-            r=r,
-            dr=dr,
-            chord=chord,
-            theta=np.radians(theta_deg),
-            propellerParams=self.aero_params,
-        )
-
         try:
-            phi, dT, dQ, alpha, a, a_prime, cl, cd, f, w, re, ma = section_force.solve(prevPhi=prev_phi)
-            return [r, chord, theta_deg, np.degrees(phi), alpha, cl, cd, a, a_prime, dT, dQ, f, w, re, ma]
+            phi, dT, dQ, alpha, u, a_prime, cl, cd, f, w, re, ma = self._sections[section_index].solve(v_inf, prevPhi=prev_phi)
+            return [self.geometry['r'][section_index], self.geometry['chord'][section_index], self.geometry['twist'][section_index], np.degrees(phi), alpha, cl, cd, u, a_prime, dT, dQ, f, w, re, ma]
         except RuntimeError as e:
-            print(f"Error in section at r={r}: {e}")
+            print(f"Error in section at r={self.geometry['r'][section_index]}: {e}")
             return [np.nan] * 15
 
-    def run_bemt(self):
+    def run_bemt(self, v_inf):
         """Execute the BEMT radial sweep sequentially."""
         prev_phi = None
         rows = []
 
-        for r, dr, chord, twist, af_asb in zip(
+        for i, (r, dr, chord, twist, af_asb) in enumerate(zip(
             self.geometry["r"], self.geometry["dr"], self.geometry["chord"], 
             self.geometry["twist"], self._section_airfoils
-        ):
-            res = self.process_section(r, dr, chord, twist, af_asb, prev_phi=prev_phi)
-            
+            )):
+            res = self.process_section(i, v_inf[i], prev_phi=prev_phi)
             if not np.isnan(res[3]): # index 3 is phiDeg
                 prev_phi = np.radians(res[3])
             
@@ -127,7 +126,7 @@ class Propeller:
         self.fft_amp = np.abs(fft_p) * np.sqrt(2) / n
         self.fft_amp[0, :] /= np.sqrt(2) 
 
-        self.spl = 20 * np.log10(np.maximum(self.fft_amp, 1e-15) / self.aero_params.p_ref)
+        self.spl = 20 * np.log10(np.maximum(self.fft_amp, 1e-15) / self.acoustic_params.p_ref)
         
         def r_a_func(f):
             f_sq = f**2
@@ -140,17 +139,23 @@ class Propeller:
 
         # RMS-based Overall levels
         p_rms = np.sqrt(self.fft_amp[0, :]**2 + 2 * np.sum(self.fft_amp[1:, :]**2, axis=0))
-        self.ospl = 20 * np.log10(p_rms / self.aero_params.p_ref)
+        self.ospl = 20 * np.log10(p_rms / self.acoustic_params.p_ref)
 
-        amp_a = 10 ** (self.spl_a / 20) * self.aero_params.p_ref
+        amp_a = 10 ** (self.spl_a / 20) * self.acoustic_params.p_ref
         p_rms_a = np.sqrt(amp_a[0, :]**2 + 2 * np.sum(amp_a[1:, :]**2, axis=0))
-        self.oaspl = 20 * np.log10(p_rms_a / self.aero_params.p_ref)
-
-    def run_compact_f1a(self, observer_positions):
+        self.oaspl = 20 * np.log10(p_rms_a / self.acoustic_params.p_ref)
+        
+    def run_compact_f1a(self, observer_positions, local_dT=None, local_dQ=None):
         """Initialize the acoustic array and compute total pressure at observers."""
         # Force per unit span logic
-        local_dT = self.solution_data['dT'] / self.geometry['dr'] / self.aero_params.n_blades
-        local_dQ = self.solution_data['dQ'] / self.geometry['dr'] / self.geometry['r'] / self.aero_params.n_blades
+        if local_dT is None or local_dQ is None:
+            local_dT = self.solution_data['dT'].values / self.geometry['dr'] / self.aero_params.n_blades
+            local_dQ = self.solution_data['dQ'].values / self.geometry['dr'] / self.geometry['r'] / self.aero_params.n_blades
+            local_dT = np.broadcast_to(local_dT[None, None, :], (self.acoustic_params.num_src_times, self.aero_params.n_blades, len(self.geometry['r'])))
+            local_dQ = np.broadcast_to(local_dQ[None, None, :], (self.acoustic_params.num_src_times, self.aero_params.n_blades, len(self.geometry['r'])))
+        else:
+            local_dT = local_dT / self.geometry['dr']
+            local_dQ = local_dQ / self.geometry['dr'] / self.geometry['r']
 
         acoustic_array = CompactAcousticSourceArray(
             self.aero_params.rho, 

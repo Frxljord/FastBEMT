@@ -27,7 +27,7 @@ class CompactAcousticSourceArray:
         self.a_inf = a_inf
         self.omega = omega
 
-        # Geometry and loading inputs (Ns,)
+        # Geometry (Ns,)
         self.r = np.asarray(r)
         self.dr = np.asarray(dr)
         self.area = np.asarray(area)
@@ -35,11 +35,15 @@ class CompactAcousticSourceArray:
         self.twist_rad = np.deg2rad(np.asarray(twist))
         self.com_shift_forward = np.asarray(com_shift_forward)
         self.com_shift_up = np.asarray(com_shift_up)
+
+        # Forces (Nt, Nb, Ns)
         self.d_t = np.asarray(d_t)
         self.d_q = np.asarray(d_q)
 
-        # Time and Phase: (Nt,) and (Nb,)
+        # Source Times (Nt,)
         self.tau = np.atleast_1d(source_times)
+
+        # Blade Angles (Nb,)
         self.blade_angles = np.atleast_1d(blade_angles)
 
         self.nt, self.ns, self.nb = self.tau.size, self.r.size, self.blade_angles.size
@@ -52,9 +56,9 @@ class CompactAcousticSourceArray:
         """Vectorized calculation of fixed-frame positions, velocities, and forces (assumed constant in the moving frame)."""
         # Source position in the moving (blade) frame (Ns, 3)
         pos_moving = np.stack([
-            self.chord * self.com_shift_forward * np.sin(self.twist_rad),
+            self.chord * self.com_shift_up * np.sin(self.twist_rad),
             self.r,
-            self.chord * self.com_shift_up * np.sin(self.twist_rad)
+            self.chord * self.com_shift_forward * np.sin(self.twist_rad)
         ], axis=-1)
 
         # Rotation Matrices (Nt, Nb, 3, 3)
@@ -76,7 +80,10 @@ class CompactAcousticSourceArray:
 
         # Forces in Fixed Frame (Nt, Ns, Nb, 3)
         force_moving = np.stack((self.d_t, np.zeros_like(self.d_t), -self.d_q), axis=-1)
-        self.force_fixed = np.einsum('tbik,sk->tsbi', rot, force_moving)
+        self.force_fixed = np.einsum('tbik,tbks->tsbi', rot, force_moving.swapaxes(2,3))
+        df_dt_moving = np.gradient(force_moving, self.tau, axis=0)
+        df_dt_fixed = np.einsum('tbik,tbks->tsbi', rot, df_dt_moving.swapaxes(2,3))
+        self.force_der_fixed = (self.omega * np.einsum('ij,tsbj->tsbi', self.skew_matrix, self.force_fixed) + df_dt_fixed)
 
     def get_observer_times(self, observers: np.ndarray) -> np.ndarray:
         """Calculate the time the sound reaches the observer (retarded time)."""
@@ -123,11 +130,13 @@ class CompactAcousticSourceArray:
                m_r_ddot * get_rf(1, 2) + m_r_dot * get_rp(1, 2)) + 
                get_rf(0, 1) * get_rp(0, 1) * get_rp(1, 1))
 
+        d1a = (get_rf(0, 1) * get_rf(1, 1))[..., None] * r_hat
+
         e1a = (get_rf(0, 1)[..., None] * (get_rp(1, 1)[..., None] * r_hat + get_rf(1, 1)[..., None] * r_hat_dot) + 
                self.a_inf * get_rf(2, 1)[..., None] * r_hat)
 
         # Pressure summation
         p_m = (self.rho / (4 * np.pi)) * self.area[None, :, None, None] * c1a * self.dr[None, :, None, None]
-        p_d = (1.0 / (4 * np.pi * self.a_inf)) * np.sum(self.force_fixed[..., None, :] * e1a, axis=-1) * self.dr[None, :, None, None]
+        p_d = (1.0 / (4 * np.pi * self.a_inf)) * (np.sum(self.force_fixed[..., None, :] * e1a, axis=-1) + np.sum(self.force_der_fixed[..., None, :] * d1a, axis=-1)) * self.dr[None, :, None, None]
 
         return np.stack((p_m, p_d), axis=-1)

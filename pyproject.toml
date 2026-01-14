@@ -6,10 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aerosandbox>=4.2.9",
+    "drdmannturb>=1.0.2",
     "ipython>=9.9.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.0",
     "pandas>=2.3.3",
     "pip>=25.3",
+    "plotly>=6.5.1",
+    "scikit-learn>=1.8.0",
     "scipy>=1.16.3",
+    "shapely>=2.1.2",
 ]
