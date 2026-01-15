@@ -86,11 +86,12 @@ class SectionForces:
         """Compute aerodynamic section parameters for a given inflow angle phi."""
         alpha = np.degrees(self.theta - phi)
         cL, cD = self.airfoilCoefficients(alpha, self.Re, self.Ma)
-        cLPrime = cL * np.cos(phi) - cD * np.sin(phi)
-        cDPrime = cL * np.sin(phi) + cD * np.cos(phi)
+        c, s = np.cos(phi), np.sin(phi)
+        cLPrime = cL * c - cD * s
+        cDPrime = cL * s + cD * c
         F = self.prandtlLoss(phi)
-        k_t = self.sigma * cLPrime / (4 * F * np.sin(phi) * np.cos(phi)) 
-        k_q = self.sigma * cDPrime / (4 * F * np.sin(phi) * np.cos(phi))
+        k_t = self.sigma * cLPrime / (4 * F * s * c) 
+        k_q = self.sigma * cDPrime / (4 * F * s * c)
         u = self.propellerParams.omega * self.r * k_t / (1 + k_q)
         aPrime = k_q / (1 + k_q)
         vA = self.v_inf + u
@@ -98,12 +99,12 @@ class SectionForces:
         W = np.sqrt(vA**2 + vT**2)
         self.Re = self.propellerParams.rho * W * self.chord / self.propellerParams.mu
         self.Ma = W / self.propellerParams.a_inf
-        return alpha, cL, cD, F, u, aPrime, W, cLPrime, cDPrime
+        return alpha, cL, cD, F, u, aPrime, W, cLPrime, cDPrime, vA, vT
 
     def residualFunction(self, phi):
         """Residual of the inflow angle equation for root finding."""
-        _, _, _, _, u, aPrime, _, _, _ = self.sectionParameters(phi)
-        return np.tan(phi) - (self.v_inf + u) / (self.propellerParams.omega * self.r) / (1 - aPrime)
+        _, _, _, _, u, aPrime, _, _, _, vA, vT = self.sectionParameters(phi)
+        return np.tan(phi) - vA / vT
 
     def solve(self, v_inf, prevPhi=None):
         """Solve for inflow angle phi and return section forces and kinematics.
@@ -162,13 +163,13 @@ class SectionForces:
                 self.residualFunction,
                 method="newton",
                 xtol=1e-4,
-                x0 = np.mean(bracket)
+                x0=np.mean(bracket)
             )
         if not result.converged:
             raise RuntimeError("Root finding did not converge")
 
         phi = result.root
-        alpha, cL, cD, F, u, aPrime, W, cLPrime, cDPrime = self.sectionParameters(phi)
+        alpha, _, _, F, u, aPrime, W, cLPrime, cDPrime, _, _ = self.sectionParameters(phi)
         dT = self.sigma * np.pi * self.propellerParams.rho * W**2 * cLPrime * self.r * self.dr
         dQ = self.sigma * np.pi * self.propellerParams.rho * W**2 * cDPrime * self.r**2 * self.dr
         return phi, dT, dQ, alpha, u, aPrime, cLPrime, cDPrime, F, W, self.Re, self.Ma

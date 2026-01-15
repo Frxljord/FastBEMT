@@ -44,6 +44,6 @@ class AcousticParameters(AerodynamicParameters):
         self.blade_passing_period = self.duration / self.revolutions / self.n_blades
         self.observer_time_range = self.revolutions * self.blade_passing_period
         self.num_obs_times = self.num_obs_times_per_rev * self.revolutions
-        self.dt = self.duration / (2.0 * self.num_obs_times_per_rev - 1.0)
-        self.src_times = np.arange(0, 2 * self.num_obs_times_per_rev) * self.dt
+        self.dt = self.duration / self.num_obs_times 
+        self.src_times = np.arange(0, self.num_obs_times) * self.dt
         self.num_src_times = self.src_times.size

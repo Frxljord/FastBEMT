@@ -1,10 +1,12 @@
 import numpy as np
 import pandas as pd
 import aerosandbox as asb
+import torch
 from typing import List, Tuple 
 
 from .Section import SectionForces
 from .CompactSource import CompactAcousticSourceArray
+from .TorchCompactSource import TorchCompactAcousticSourceArray
 from .JobParameters import *
 
 class Propeller:
@@ -145,7 +147,7 @@ class Propeller:
         p_rms_a = np.sqrt(amp_a[0, :]**2 + 2 * np.sum(amp_a[1:, :]**2, axis=0))
         self.oaspl = 20 * np.log10(p_rms_a / self.acoustic_params.p_ref)
         
-    def run_compact_f1a(self, observer_positions, local_dT=None, local_dQ=None):
+    def run_compact_f1a(self, observer_positions, local_dT=None, local_dQ=None, use_GPU=False):
         """Initialize the acoustic array and compute total pressure at observers."""
         # Force per unit span logic
         if local_dT is None or local_dQ is None:
@@ -157,29 +159,174 @@ class Propeller:
             local_dT = local_dT / self.geometry['dr']
             local_dQ = local_dQ / self.geometry['dr'] / self.geometry['r']
 
-        acoustic_array = CompactAcousticSourceArray(
-            self.aero_params.rho, 
-            self.aero_params.a_inf,
-            self.geometry['r'],
-            self.geometry['dr'],
-            self.geometry['cross_section'],
-            self.geometry['chord'],
-            self.geometry['twist'],
-            self.com_shift_forward,
-            self.com_shift_up,
-            self.acoustic_params.src_times,
-            self.acoustic_params.omega,
-            local_dT,
-            local_dQ,
-            self.aero_params.blade_angles
-        )
+        if not use_GPU:
+            acoustic_array = CompactAcousticSourceArray(
+                self.aero_params.rho, 
+                self.aero_params.a_inf,
+                self.geometry['r'],
+                self.geometry['dr'],
+                self.geometry['cross_section'],
+                self.geometry['chord'],
+                self.geometry['twist'],
+                self.com_shift_forward,
+                self.com_shift_up,
+                self.acoustic_params.src_times,
+                self.acoustic_params.omega,
+                local_dT,
+                local_dQ,
+                self.aero_params.blade_angles
+            )
+            obs_times = acoustic_array.get_observer_times(observer_positions)
+            f1a_output = acoustic_array.calculate_f1a_pressure(observer_positions)
+            self.combine_sources(
+                obs_times=obs_times, 
+                f1a_output=f1a_output, 
+                t_range=self.acoustic_params.observer_time_range, 
+                n_steps=self.acoustic_params.num_obs_times
+            )
+        else:
+            acoustic_array = TorchCompactAcousticSourceArray(
+                self.aero_params.rho, 
+                self.aero_params.a_inf,
+                self.geometry['r'],
+                self.geometry['dr'],
+                self.geometry['cross_section'],
+                self.geometry['chord'],
+                self.geometry['twist'],
+                self.com_shift_forward,
+                self.com_shift_up,
+                self.acoustic_params.src_times,
+                self.acoustic_params.omega,
+                local_dT,
+                local_dQ,
+                self.aero_params.blade_angles
+            )
+            obs_times = acoustic_array.get_observer_times(observer_positions)
+            f1a_output = acoustic_array.calculate_f1a_pressure(observer_positions)
+            self.combine_sources_torch(
+                obs_times=obs_times, 
+                f1a_output=f1a_output, 
+                t_range=self.acoustic_params.observer_time_range, 
+                n_steps=self.acoustic_params.num_obs_times
+            )
+            self.t = self.t.cpu().numpy()
+            self.p_d = self.p_d.cpu().numpy()
+            self.p_m = self.p_m.cpu().numpy()
+            self.p_tot = self.p_tot.cpu().numpy()
+            self.freq = self.freq.cpu().numpy()
+            self.spl = self.spl.cpu().numpy()
 
-        obs_times = acoustic_array.get_observer_times(observer_positions)
-        f1a_output = acoustic_array.calculate_f1a_pressure(observer_positions)
+    def combine_sources_torch(self, obs_times, f1a_output, t_range, n_steps):
+        if not torch.is_tensor(obs_times):
+            obs_times = torch.tensor(obs_times, dtype=torch.float32, device="cuda")
+        if not torch.is_tensor(f1a_output):
+            f1a_output = torch.tensor(f1a_output, dtype=torch.float32, device="cuda")
+
+        device = obs_times.device
+        nt, ns, nb, no, _ = f1a_output.shape
         
-        self.combine_sources(
-            obs_times=obs_times, 
-            f1a_output=f1a_output, 
-            t_range=self.acoustic_params.observer_time_range, 
-            n_steps=self.acoustic_params.num_obs_times
-        )
+        t_raw = obs_times.reshape(nt, -1, no) # (Nt, Ns*Nb, No)
+        pm_raw = f1a_output[..., 0].reshape(nt, -1, no)
+        pd_raw = f1a_output[..., 1].reshape(nt, -1, no)
+
+        t_start, _ = torch.max(t_raw[0, :, :], dim=0) 
+        
+        self.t = t_start[None, :] + torch.linspace(0, t_range, n_steps, device=device)[:, None]
+        
+        # Completely vectorized interpolation (No more 'for o in range(no)')
+        self.p_m = self._interp_tensor_vectorized(self.t, t_raw, pm_raw)
+        self.p_d = self._interp_tensor_vectorized(self.t, t_raw, pd_raw)
+
+        self.p_tot = (self.p_m + self.p_d)
+        self.p_tot -= torch.mean(self.p_tot, dim=0)
+        
+        self._perform_spectral_analysis_torch()
+
+    def _interp_tensor_vectorized(self, x_new, x_old, y_old):
+        """
+        Full 3D vectorized interpolation.
+        x_new: (N_steps, No)
+        x_old: (Nt, N_sources, No)
+        y_old: (Nt, N_sources, No)
+        """
+        n_steps, no = x_new.shape
+        nt, n_src, _ = x_old.shape
+
+        # Permute and reshape to align for searchsorted: (No, N_src, Nt)
+        # searchsorted operates on the last dimension
+        x_old_p = x_old.permute(2, 1, 0).contiguous()
+        y_old_p = y_old.permute(2, 1, 0).contiguous()
+        
+        # Prepare x_new for searchsorted: (No, N_src, N_steps)
+        x_new_p = x_new.T.unsqueeze(1).expand(-1, n_src, -1).contiguous()
+        
+        # Find indices across all observers and sources at once
+        idx = torch.searchsorted(x_old_p, x_new_p)
+        idx = torch.clamp(idx, 1, nt - 1)
+        
+        # Linear interpolation math
+        # We gather from the Nt dimension (dim=2)
+        x0 = torch.gather(x_old_p, 2, idx - 1)
+        x1 = torch.gather(x_old_p, 2, idx)
+        y0 = torch.gather(y_old_p, 2, idx - 1)
+        y1 = torch.gather(y_old_p, 2, idx)
+        
+        weights = (x_new_p - x0) / (x1 - x0 + 1e-12)
+        interp_vals = y0 + weights * (y1 - y0) # (No, N_src, N_steps)
+        
+        # Sum across sources (dim=1) and return as (N_steps, No)
+        return torch.sum(interp_vals, dim=1).T
+    
+    def _perform_spectral_analysis_torch(self):
+        n, no = self.t.shape
+        device = self.t.device
+        
+        # Frequency calculation
+        dt = (self.t[1, 0] - self.t[0, 0]).item()
+        f_single = torch.fft.rfftfreq(n, dt).to(device)
+        self.freq = f_single.unsqueeze(1).expand(-1, no)
+        
+        # FFT and Amplitude
+        fft_p = torch.fft.rfft(self.p_tot, dim=0)
+        self.fft_amp = torch.abs(fft_p)
+        self.fft_amp.mul_(np.sqrt(2) / n) 
+        self.fft_amp[0, :].div_(np.sqrt(2)) 
+
+        # SPL Calculation
+        p_ref = self.acoustic_params.p_ref
+        self.spl = torch.clamp(self.fft_amp, min=1e-15)
+        self.spl.div_(p_ref).log10_().mul_(20.0)
+        
+        def r_a_func_torch(f):
+            f_sq = f.square()
+            c1 = 12194.0**2
+            c2 = 20.6**2
+            c3 = 107.7**2
+            c4 = 737.9**2
+            
+            num = f_sq.square().mul_(c1**2)
+            # den = (f^2+c2) * sqrt((f^2+c3)*(f^2+c4)) * (f^2+c1)
+            den = f_sq.add(c2).mul_(torch.sqrt(f_sq.add(c3).mul_(f_sq.add(c4)))).mul_(f_sq.add(c1))
+            return num.div_(den)
+
+        r_a_1000 = r_a_func_torch(torch.tensor(1000.0, device=device))
+        
+        # a_weight = 20 * log10(r_a(f) / r_a(1000))
+        a_weight = r_a_func_torch(self.freq).div_(r_a_1000).log10_().mul_(20.0)
+        
+        self.spl_a = self.spl.clone()
+        self.spl_a.add_(a_weight)
+
+        # OSPL
+        p_rms_sq = self.fft_amp[0, :].square()
+        p_rms_sq.add_(torch.sum(self.fft_amp[1:, :].square(), dim=0).mul_(2.0))
+        self.ospl = torch.sqrt(p_rms_sq).div_(p_ref).log10_().mul_(20.0)
+
+        # OASPL - Fixed 10^x logic
+        # amp_a = 10^(spl_a / 20) * p_ref
+        LN10_OVER_20 = 0.11512925464970229  # ln(10) / 20
+        amp_a = self.spl_a.mul(LN10_OVER_20).exp_().mul_(p_ref) 
+        
+        p_rms_a_sq = amp_a[0, :].square()
+        p_rms_a_sq.add_(torch.sum(amp_a[1:, :].square(), dim=0).mul_(2.0))
+        self.oaspl = torch.sqrt(p_rms_a_sq).div_(p_ref).log10_().mul_(20.0)

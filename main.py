@@ -72,7 +72,7 @@ def main():
         ax_time.grid(True, alpha=0.3)
         ax_time.legend(loc='upper right', fontsize='small')
 
-        label_text = f'Obs {idx} (OSPL: {propeller.ospl[idx]:.3f} dB)'
+        label_text = f'Obs {idx} (OASPL: {propeller.oaspl[idx]:.3f} dB)'
         
         ax_spl.semilogx(propeller.freq[1:, idx], propeller.spl[1:, idx], 
                         color=color, linestyle='-', marker='.', markersize=2, 
@@ -89,7 +89,8 @@ def main():
 
     ax_spl.grid(True, which='both', alpha=0.3)
     ax_spl.legend(fontsize=fontsize, loc='lower left')
-    ax_spl.set_ylim()
+    ax_spl.set_xlim(10, 10000)
+    ax_spl.set_ylim(-50,70)
     plt.tight_layout()
     plt.show()
 
