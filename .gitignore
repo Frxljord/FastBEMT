@@ -9,6 +9,6 @@ wheels/
 # Virtual environments
 .FastBEMT
 
-.vscode/settings.json
+.vscode
 
-DataSets/Measurements/
+Datasets/Measurements/

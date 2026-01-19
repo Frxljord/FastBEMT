@@ -1,11 +1,8 @@
 import pickle
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.Propeller import Propeller
-from src.JobParameters import AerodynamicParameters, AcousticParameters
+from Propeller import Propeller
+from JobParameters import AerodynamicParameters, AcousticParameters
 
-with open("10x7E.pkl", "rb") as f:
+with open("Datasets/Propellers/10x7E.pkl", "rb") as f:
     blade_dict = pickle.load(f)
 
 aerodynamic_params = AerodynamicParameters(
@@ -13,11 +10,9 @@ aerodynamic_params = AerodynamicParameters(
     hub_radius=blade_dict['hub_radius'],
     n_blades=blade_dict['n_blades'],
     rpm=7000,
-    v_inf=0,
     a_inf=343,
     rho=1.225,
     mu=1.81e-5,
-    p_ref=2e-5
 )
 
 acoustic_params = AcousticParameters(
@@ -38,8 +33,8 @@ import timeit
 n_iterations = 20
 
 def measure():
-    propeller.run_bemt()
+    propeller.run_bemt(v_inf=0)
 
-avg_time_1 = timeit.timeit(measure, number=n_iterations) / n_iterations
+avg_time = timeit.timeit(measure, number=n_iterations) / n_iterations
 
-print(f"Average BEMT execution time over {n_iterations} runs: {avg_time_1:.4f} seconds")
+print(f"Average BEMT execution time over {n_iterations} runs: {avg_time:.4f} seconds")
