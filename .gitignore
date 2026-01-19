@@ -10,3 +10,5 @@ wheels/
 .FastBEMT
 
 .vscode/settings.json
+
+DataSets/Measurements/
