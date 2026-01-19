@@ -6,10 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aerosandbox>=4.2.9",
-    "drdmannturb>=1.0.2",
     "ipython>=9.9.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.0",
+    "opt-einsum>=3.4.0",
     "pandas>=2.3.3",
     "pip>=25.3",
     "plotly>=6.5.1",
@@ -17,3 +17,7 @@ dependencies = [
     "scipy>=1.16.3",
     "shapely>=2.1.2",
 ]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -7,7 +7,7 @@ from src.Propeller import Propeller
 from src.JobParameters import AerodynamicParameters, AcousticParameters
 
 def main():
-    with open("10x7E.pkl", "rb") as f:
+    with open("Datasets/Propellers/10x7E.pkl", "rb") as f:
         blade_dict = pickle.load(f)
 
     aerodynamic_params = AerodynamicParameters(
@@ -38,7 +38,7 @@ def main():
     )
 
     propeller.run_bemt(v_inf=0*np.ones(len(blade_dict['r'])))
-    propeller.run_compact_f1a(observer_positions=r_observer)
+    propeller.run_compact_f1a(observer_positions=r_observer, use_GPU=True)
 
     # Performance output
     thrust, torque, ct, cp = propeller.compute_total_forces()

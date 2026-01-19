@@ -77,18 +77,47 @@ class TorchCompactAcousticSourceArray:
         force_moving = torch.stack((self.d_t, torch.zeros_like(self.d_t), -self.d_q), dim=-1)
         self.force_fixed = torch.einsum('tbik,tbsk->tsbi', rot, force_moving).contiguous()
 
-        dt = self.tau[1] - self.tau[0] 
+        dt = self.tau[1] - self.tau[0]
+        n = force_moving.shape[0]
         df_dt_moving = torch.zeros_like(force_moving)
-        df_dt_moving[1:-1] = (force_moving[2:] - force_moving[:-2]) / (2.0 * dt)
-        
-        # 2. Forward difference at the start (O(dt^2))
-        # f'(t0) ≈ [-3f(t0) + 4f(t1) - f(t2)] / (2*dt)
-        df_dt_moving[0] = (-3.0 * force_moving[0] + 4.0 * force_moving[1] - force_moving[2]) / (2.0 * dt)
-        
-        # 3. Backward difference at the end (O(dt^2))
-        # f'(tn) ≈ [3f(tn) - 4f(tn-1) + f(tn-2)] / (2*dt)
-        df_dt_moving[-1] = (3.0 * force_moving[-1] - 4.0 * force_moving[-2] + force_moving[-3]) / (2.0 * dt)
-        
+
+        # 1. Interior points (4th-order Central Difference)
+        # Uses points: [i-2, i-1, i+1, i+2]
+        df_dt_moving[2:-2] = (
+            -force_moving[4:] 
+            + 8.0 * force_moving[3:-1] 
+            - 8.0 * force_moving[1:-3] 
+            + force_moving[:-4]
+        ) / (12.0 * dt)
+
+        # 2. Start Boundaries (4th-order Forward Difference)
+        # Points 0 and 1 need five points of look-ahead to maintain accuracy
+        # f'(t0) coefficients: [-25/12, 4, -3, 4/3, -1/4]
+        df_dt_moving[0] = (
+            -25/12 * force_moving[0] + 4.0 * force_moving[1] - 3.0 * force_moving[2] 
+            + 4/3 * force_moving[3] - 0.25 * force_moving[4]
+        ) / dt
+
+        # f'(t1) coefficients: [-1/4, -5/6, 3/2, -1/2, 1/12]
+        df_dt_moving[1] = (
+            -0.25 * force_moving[0] - 5/6 * force_moving[1] + 1.5 * force_moving[2] 
+            - 0.5 * force_moving[3] + 1/12 * force_moving[4]
+        ) / dt
+
+        # 3. End Boundaries (4th-order Backward Difference)
+        # f'(tn) coefficients: [25/12, -4, 3, -4/3, 1/4]
+        df_dt_moving[-1] = (
+            25/12 * force_moving[-1] - 4.0 * force_moving[-2] + 3.0 * force_moving[-3] 
+            - 4/3 * force_moving[-4] + 0.25 * force_moving[-5]
+        ) / dt
+
+        # f'(tn-1) coefficients: [1/4, 5/6, -3/2, 1/2, -1/12]
+        df_dt_moving[-2] = (
+            0.25 * force_moving[-1] + 5/6 * force_moving[-2] - 1.5 * force_moving[-3] 
+            + 0.5 * force_moving[-4] - 1/12 * force_moving[-5]
+        ) / dt
+
+        # 4. Apply rotation
         df_dt_fixed = torch.einsum('tbik,tbsk->tsbi', rot, df_dt_moving).contiguous()
         
         # In-place addition for the force derivative

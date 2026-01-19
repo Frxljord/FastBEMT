@@ -4,10 +4,10 @@ import aerosandbox as asb
 import torch
 from typing import List, Tuple 
 
-from .Section import SectionForces
-from .CompactSource import CompactAcousticSourceArray
-from .TorchCompactSource import TorchCompactAcousticSourceArray
-from .JobParameters import *
+from Section import SectionForces
+from CompactSource import CompactAcousticSourceArray
+from TorchCompactSource import TorchCompactAcousticSourceArray
+from JobParameters import *
 
 class Propeller:
     """High-level propeller BEMT and F1A acoustic analysis controller."""
@@ -60,7 +60,8 @@ class Propeller:
         """Execute the BEMT radial sweep sequentially."""
         prev_phi = None
         rows = []
-
+        if isinstance(v_inf, (int, float)):
+            v_inf = np.full(len(self.geometry["r"]), v_inf)
         for i, (r, dr, chord, twist, af_asb) in enumerate(zip(
             self.geometry["r"], self.geometry["dr"], self.geometry["chord"], 
             self.geometry["twist"], self._section_airfoils
@@ -158,51 +159,26 @@ class Propeller:
         else:
             local_dT = local_dT / self.geometry['dr']
             local_dQ = local_dQ / self.geometry['dr'] / self.geometry['r']
-
-        if not use_GPU:
-            acoustic_array = CompactAcousticSourceArray(
-                self.aero_params.rho, 
-                self.aero_params.a_inf,
-                self.geometry['r'],
-                self.geometry['dr'],
-                self.geometry['cross_section'],
-                self.geometry['chord'],
-                self.geometry['twist'],
-                self.com_shift_forward,
-                self.com_shift_up,
-                self.acoustic_params.src_times,
-                self.acoustic_params.omega,
-                local_dT,
-                local_dQ,
-                self.aero_params.blade_angles
-            )
-            obs_times = acoustic_array.get_observer_times(observer_positions)
-            f1a_output = acoustic_array.calculate_f1a_pressure(observer_positions)
-            self.combine_sources(
-                obs_times=obs_times, 
-                f1a_output=f1a_output, 
-                t_range=self.acoustic_params.observer_time_range, 
-                n_steps=self.acoustic_params.num_obs_times
-            )
-        else:
-            acoustic_array = TorchCompactAcousticSourceArray(
-                self.aero_params.rho, 
-                self.aero_params.a_inf,
-                self.geometry['r'],
-                self.geometry['dr'],
-                self.geometry['cross_section'],
-                self.geometry['chord'],
-                self.geometry['twist'],
-                self.com_shift_forward,
-                self.com_shift_up,
-                self.acoustic_params.src_times,
-                self.acoustic_params.omega,
-                local_dT,
-                local_dQ,
-                self.aero_params.blade_angles
-            )
-            obs_times = acoustic_array.get_observer_times(observer_positions)
-            f1a_output = acoustic_array.calculate_f1a_pressure(observer_positions)
+        ArrayClass = TorchCompactAcousticSourceArray if use_GPU else CompactAcousticSourceArray
+        acoustic_array = ArrayClass(
+            self.aero_params.rho, 
+            self.aero_params.a_inf,
+            self.geometry['r'],
+            self.geometry['dr'],
+            self.geometry['cross_section'],
+            self.geometry['chord'],
+            self.geometry['twist'],
+            self.com_shift_forward,
+            self.com_shift_up,
+            self.acoustic_params.src_times,
+            self.acoustic_params.omega,
+            local_dT,
+            local_dQ,
+            self.aero_params.blade_angles
+        )
+        obs_times = acoustic_array.get_observer_times(observer_positions)
+        f1a_output = acoustic_array.calculate_f1a_pressure(observer_positions)
+        if use_GPU:
             self.combine_sources_torch(
                 obs_times=obs_times, 
                 f1a_output=f1a_output, 
@@ -215,6 +191,13 @@ class Propeller:
             self.p_tot = self.p_tot.cpu().numpy()
             self.freq = self.freq.cpu().numpy()
             self.spl = self.spl.cpu().numpy()
+        else:
+            self.combine_sources(
+                obs_times=obs_times, 
+                f1a_output=f1a_output, 
+                t_range=self.acoustic_params.observer_time_range, 
+                n_steps=self.acoustic_params.num_obs_times
+            )
 
     def combine_sources_torch(self, obs_times, f1a_output, t_range, n_steps):
         if not torch.is_tensor(obs_times):
@@ -233,7 +216,6 @@ class Propeller:
         
         self.t = t_start[None, :] + torch.linspace(0, t_range, n_steps, device=device)[:, None]
         
-        # Completely vectorized interpolation (No more 'for o in range(no)')
         self.p_m = self._interp_tensor_vectorized(self.t, t_raw, pm_raw)
         self.p_d = self._interp_tensor_vectorized(self.t, t_raw, pd_raw)
 
@@ -249,7 +231,6 @@ class Propeller:
         x_old: (Nt, N_sources, No)
         y_old: (Nt, N_sources, No)
         """
-        n_steps, no = x_new.shape
         nt, n_src, _ = x_old.shape
 
         # Permute and reshape to align for searchsorted: (No, N_src, Nt)
@@ -321,12 +302,14 @@ class Propeller:
         p_rms_sq = self.fft_amp[0, :].square()
         p_rms_sq.add_(torch.sum(self.fft_amp[1:, :].square(), dim=0).mul_(2.0))
         self.ospl = torch.sqrt(p_rms_sq).div_(p_ref).log10_().mul_(20.0)
+        self.ospl = self.ospl.cpu().numpy()
 
         # OASPL - Fixed 10^x logic
         # amp_a = 10^(spl_a / 20) * p_ref
         LN10_OVER_20 = 0.11512925464970229  # ln(10) / 20
-        amp_a = self.spl_a.mul(LN10_OVER_20).exp_().mul_(p_ref) 
+        amp_a = torch.pow(10.0, self.spl_a.div_(20.0)).mul_(p_ref) 
         
         p_rms_a_sq = amp_a[0, :].square()
         p_rms_a_sq.add_(torch.sum(amp_a[1:, :].square(), dim=0).mul_(2.0))
         self.oaspl = torch.sqrt(p_rms_a_sq).div_(p_ref).log10_().mul_(20.0)
+        self.oaspl = self.oaspl.cpu().numpy()
