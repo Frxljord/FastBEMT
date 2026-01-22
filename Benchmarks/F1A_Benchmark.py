@@ -55,7 +55,6 @@ def run_performance_test(scales, r_observer):
             acoustic_params=acoustic_params
         )
         propeller.run_bemt(v_inf=0)
-
                 
         # --- GPU BENCHMARK ---
         # Warm-up

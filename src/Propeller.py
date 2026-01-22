@@ -17,8 +17,8 @@ class Propeller:
         self.geometry = propeller_geometry
         self.aero_params = aero_params
         self.acoustic_params = acoustic_params
-        
-        self.set_section_areas()
+        self.section_areas()
+        self.calculate_boat_tail_angle()
 
         # com_shift_up positive in forward direction (+ x), com_shift_forward positive in upward direction (+ z)
         self.com_shift_up = [s[1] for s in self.geometry['COM_shift']]
@@ -26,9 +26,9 @@ class Propeller:
 
         self.solution_data = pd.DataFrame(
             columns=[
-                "radius", "chord", "twist", "phi", "alpha", 
+                "r", "dr", "chord", "twist", "phi", "alpha", 
                 "Cl", "Cd", "u", "a_prime", "dT", "dQ", 
-                "F", "W", "Re", "Ma"
+                "F", "W", "Re", "Ma", "ds", "dp"
             ]
         )
         
@@ -50,8 +50,8 @@ class Propeller:
     def process_section(self, section_index, v_inf, prev_phi=None):
         """Run the BEMT solver for a single radial section."""
         try:
-            phi, dT, dQ, alpha, u, a_prime, cl, cd, f, w, re, ma = self._sections[section_index].solve(v_inf, prevPhi=prev_phi)
-            return [self.geometry['r'][section_index], self.geometry['chord'][section_index], self.geometry['twist'][section_index], np.degrees(phi), alpha, cl, cd, u, a_prime, dT, dQ, f, w, re, ma]
+            phi, dT, dQ, alpha, u, a_prime, cl, cd, f, w, re, ma, delta_star_upper, delta_star_lower = self._sections[section_index].solve(v_inf, prevPhi=prev_phi)
+            return [self.geometry['r'][section_index], self.geometry['dr'][section_index], self.geometry['chord'][section_index], self.geometry['twist'][section_index], np.degrees(phi), alpha, cl, cd, u, a_prime, dT, dQ, f, w, re, ma, delta_star_upper[0], delta_star_lower[0]]
         except RuntimeError as e:
             print(f"Error in section at r={self.geometry['r'][section_index]}: {e}")
             return [np.nan] * 15
@@ -88,15 +88,33 @@ class Propeller:
         
         return total_t, total_q, ct, cp
 
-    def set_section_areas(self):
-        """Calculate physical cross-sectional areas (m^2) using the Shoelace formula."""
+    def section_areas(self):
+        """Calculate cross-sectional areas (m^2) using the Shoelace formula."""
         areas = []
         for idx, coords in enumerate(self.geometry["airfoil"]):
             x, y = coords[:, 0], coords[:, 1]
-            # Normalized area * chord^2 to get physical area
             a_norm = 0.5 * np.abs(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y))
             areas.append(a_norm * self.geometry['chord'][idx]**2)
-        self.geometry["cross_section"] = areas
+        self.geometry["cross_section"] = np.array(areas)
+
+    def calculate_boat_tail_angle(self):
+        angles = []
+        for idx, coords in enumerate(self.geometry["airfoil"]):
+            le_idx = np.argmin(coords[:, 0])
+            upper = coords[:le_idx + 1]
+            lower = coords[le_idx:]
+            
+            u_pts = upper[upper[:, 0] > 0.95]
+            l_pts = lower[lower[:, 0] > 0.95]
+            
+            if len(u_pts) < 2 or len(l_pts) < 2:
+                return 0.0
+                
+            m_u, _ = np.polyfit(u_pts[:, 0], u_pts[:, 1], 1)
+            m_l, _ = np.polyfit(l_pts[:, 0], l_pts[:, 1], 1)
+            
+            angles.append(np.degrees(np.abs(np.arctan(m_u) - np.arctan(m_l))))
+        self.geometry["boat_tail_angle"] = np.array(angles)
 
     def combine_sources(self, obs_times, f1a_output, t_range, n_steps):
         """Interpolate source signals onto the uniform observer time grid."""
@@ -149,8 +167,8 @@ class Propeller:
         self.oaspl = 20 * np.log10(p_rms_a / self.acoustic_params.p_ref)
         
     def run_compact_f1a(self, observer_positions, local_dT=None, local_dQ=None, use_GPU=False):
+        self.observer_positions = observer_positions
         """Initialize the acoustic array and compute total pressure at observers."""
-        # Force per unit span logic
         if local_dT is None or local_dQ is None:
             local_dT = self.solution_data['dT'].values / self.geometry['dr'] / self.aero_params.n_blades
             local_dQ = self.solution_data['dQ'].values / self.geometry['dr'] / self.geometry['r'] / self.aero_params.n_blades
@@ -286,13 +304,11 @@ class Propeller:
             c4 = 737.9**2
             
             num = f_sq.square().mul_(c1**2)
-            # den = (f^2+c2) * sqrt((f^2+c3)*(f^2+c4)) * (f^2+c1)
             den = f_sq.add(c2).mul_(torch.sqrt(f_sq.add(c3).mul_(f_sq.add(c4)))).mul_(f_sq.add(c1))
             return num.div_(den)
 
         r_a_1000 = r_a_func_torch(torch.tensor(1000.0, device=device))
         
-        # a_weight = 20 * log10(r_a(f) / r_a(1000))
         a_weight = r_a_func_torch(self.freq).div_(r_a_1000).log10_().mul_(20.0)
         
         self.spl_a = self.spl.clone()
@@ -304,9 +320,6 @@ class Propeller:
         self.ospl = torch.sqrt(p_rms_sq).div_(p_ref).log10_().mul_(20.0)
         self.ospl = self.ospl.cpu().numpy()
 
-        # OASPL - Fixed 10^x logic
-        # amp_a = 10^(spl_a / 20) * p_ref
-        LN10_OVER_20 = 0.11512925464970229  # ln(10) / 20
         amp_a = torch.pow(10.0, self.spl_a.div_(20.0)).mul_(p_ref) 
         
         p_rms_a_sq = amp_a[0, :].square()

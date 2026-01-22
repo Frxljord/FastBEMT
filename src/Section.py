@@ -172,4 +172,9 @@ class SectionForces:
         alpha, _, _, F, u, aPrime, W, cLPrime, cDPrime, _, _ = self.sectionParameters(phi)
         dT = self.sigma * np.pi * self.propellerParams.rho * W**2 * cLPrime * self.r * self.dr
         dQ = self.sigma * np.pi * self.propellerParams.rho * W**2 * cDPrime * self.r**2 * self.dr
-        return phi, dT, dQ, alpha, u, aPrime, cLPrime, cDPrime, F, W, self.Re, self.Ma
+
+        full_output = asb.Airfoil.get_aero_from_neuralfoil(self.airfoil, alpha=alpha, Re=self.Re, mach=self.Ma, model_size='xxxlarge')
+
+        delta_star_upper, delta_star_lower = full_output['upper_bl_H_31']*full_output['upper_bl_theta_31']*self.chord, full_output['lower_bl_H_31']*full_output['lower_bl_theta_31']*self.chord
+
+        return phi, dT, dQ, alpha, u, aPrime, cLPrime, cDPrime, F, W, self.Re, self.Ma, delta_star_upper, delta_star_lower
