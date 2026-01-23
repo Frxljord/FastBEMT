@@ -1,5 +1,5 @@
 import numpy as np
-from Propeller import Propeller
+from .Propeller import Propeller
 
 def St(f, L, U):
     return f[:, None]*L/U[None, :]
@@ -356,15 +356,28 @@ def G5_tot(q, eta, psi):
 def calc_l_tip(chord, alpha_tip):
     return chord * 0.008 * alpha_tip
 
+def Phi_ww(f, U, sigma, L):
+    """von Karman Turbulence Spectrum for vertical velocity fluctuations."""
+    k1 = 2 * np.pi * f / U
+    num = (2 * sigma**2 * L / np.pi)
+    denom = (1 + (1.339 * L * k1)**2)**(5/6)
+    return num/denom
+
+def Amiet_L(omega, U, L, y, sigma, a_inf, xi):
+    return 2 * L * (xi * omega / U) / ((xi * omega / U)**2 + (omega * y / a_inf / sigma)**2)
+
 class BPM:
     def __init__(self, propeller : Propeller, frequencies, num_azim=360):
         self.frequencies = frequencies
+        self.propeller = propeller
         self.aero_params = propeller.aero_params
         self.acoustic_params = propeller.acoustic_params
+        self.v_inf = propeller.v_inf
         self.r = propeller.solution_data['r'].values
         self.dr = propeller.solution_data['dr'].values
         self.chord = propeller.solution_data['chord'].values
         self.alpha = propeller.solution_data['alpha'].values  # alpha in degrees
+        self.vi = propeller.solution_data['u'].values
         self.U = propeller.solution_data['W'].values          # Local velocity
         self.Re_c = propeller.solution_data['Re'].values      # Reynolds number
         self.M = propeller.solution_data['Ma'].values         # Mach number
@@ -376,13 +389,13 @@ class BPM:
         y_el = self.r[None, None, :] * np.cos(self.azimuth_positions[:, None, None] + propeller.aero_params.blade_angles[None, :, None])
         z_el = self.r[None, None, :] * np.sin(self.azimuth_positions[:, None, None] + propeller.aero_params.blade_angles[None, :, None])
 
-        r_element = np.zeros((*y_el.shape, 3))
-        r_element[..., 1] = y_el
-        r_element[..., 2] = z_el
+        self.r_element = np.zeros((*y_el.shape, 3))
+        self.r_element[..., 1] = y_el
+        self.r_element[..., 2] = z_el
 
-        self.R, self.Dh_TE = calculate_directivity(r_element, propeller.observer_positions, self.M, type = 'TE')
-        _, self.Dh_LE = calculate_directivity(r_element, propeller.observer_positions, self.M, type = 'LE')
-        _, self.Dl = calculate_directivity(r_element, propeller.observer_positions, self.M, type = 'low')
+        self.R, self.Dh_TE = calculate_directivity(self.r_element, propeller.observer_positions, self.M, type = 'TE')
+        _, self.Dh_LE = calculate_directivity(self.r_element, propeller.observer_positions, self.M, type = 'LE')
+        _, self.Dl = calculate_directivity(self.r_element, propeller.observer_positions, self.M, type = 'low')
 
         self.base_val_TE = (self.M**5 * self.dr * self.Dh_TE) / (self.R**2)
         self.base_val_LE = (self.M**5 * self.dr * self.Dh_LE) / (self.R**2)
@@ -480,3 +493,29 @@ class BPM:
         SPP_TIP = np.zeros_like(SPL_TIP) 
         SPP_TIP += 10**(SPL_TIP/10)
         self.SPL_TIP = 10 * np.log10(SPP_TIP.sum(axis=-1).mean(axis=-1))
+
+    # Inside your BPM Class:
+    def BWI_noise(self, xi=1, b=1, sigma_turb=0.1, L_scale=0.125):
+        """
+        Computes Blade-Wake Interaction (BWI) noise.
+        
+        sigma_factor: Turbulence intensity as fraction of induced velocity (BEMT v_i)
+        Lambda_factor: Integral length scale as fraction of chord
+        h_miss: Vertical distance from blade to wake center (m)
+        """
+        vT = np.sqrt(self.U ** 2 - (self.v_inf + self.vi) ** 2)
+        y_vT = vT[None, None, :] * np.sin(self.azimuth_positions[:, None, None] + self.propeller.aero_params.blade_angles[None, :, None])
+        z_vT = - vT[None, None, :] * np.cos(self.azimuth_positions[:, None, None] + self.propeller.aero_params.blade_angles[None, :, None])
+        vT = np.stack([np.zeros_like(y_vT), y_vT, z_vT], axis=-1)        
+        R_vec = self.propeller.observer_positions[:, np.newaxis, np.newaxis, np.newaxis, :] - self.r_element[np.newaxis, ...]
+        R_mag = np.linalg.norm(R_vec, axis=-1)
+        sigma = R_mag ** 2 * (1 - self.M * np.sum(vT * R_vec, axis=-1))
+
+        f = self.frequencies[:, np.newaxis, np.newaxis, np.newaxis]
+        U = self.U[np.newaxis, np.newaxis, np.newaxis, :]
+
+        omega = 2 * np.pi * f
+        Phi = Phi_ww(f, U, sigma_turb, L_scale)
+        L_sq = Amiet_L(omega, U, self.dr, R_vec[..., 1], sigma, self.aero_params.a_inf, xi)
+        Spp_BWI = (omega * R_vec[..., 0] / 4 / np.pi / self.aero_params.a_inf / sigma**2)**2 * b * self.chord * Phi * L_sq
+        self.SPL_BWI = 10 * np.log10(Spp_BWI.sum(axis=(2,3)).mean(axis=-1))

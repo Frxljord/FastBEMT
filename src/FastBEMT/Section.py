@@ -169,7 +169,7 @@ class SectionForces:
             raise RuntimeError("Root finding did not converge")
 
         phi = result.root
-        alpha, _, _, F, u, aPrime, W, cLPrime, cDPrime, _, _ = self.sectionParameters(phi)
+        alpha, _, _, F, u, aPrime, W, cLPrime, cDPrime, _,_vT = self.sectionParameters(phi)
         dT = self.sigma * np.pi * self.propellerParams.rho * W**2 * cLPrime * self.r * self.dr
         dQ = self.sigma * np.pi * self.propellerParams.rho * W**2 * cDPrime * self.r**2 * self.dr
 

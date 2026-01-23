@@ -4,10 +4,10 @@ import aerosandbox as asb
 import torch
 from typing import List, Tuple 
 
-from Section import SectionForces
-from CompactSource import CompactAcousticSourceArray
-from TorchCompactSource import TorchCompactAcousticSourceArray
-from JobParameters import *
+from .Section import SectionForces
+from .CompactSource import CompactAcousticSourceArray
+from .TorchCompactSource import TorchCompactAcousticSourceArray
+from .JobParameters import *
 
 class Propeller:
     """High-level propeller BEMT and F1A acoustic analysis controller."""
@@ -58,6 +58,7 @@ class Propeller:
 
     def run_bemt(self, v_inf):
         """Execute the BEMT radial sweep sequentially."""
+        self.v_inf = v_inf
         prev_phi = None
         rows = []
         if isinstance(v_inf, (int, float)):
