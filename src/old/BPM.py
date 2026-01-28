@@ -552,8 +552,7 @@ class BPM:
         """Compute turbulence ingestion (TI) noise.
         
         Args:
-            z: Reference height for turbulence length scale (m).
-            z0: Surface roughness length (m).
+            lt: Turbulence length scale (m).
             i: Turbulence intensity.
         """
         f_co = 10 * self.u / np.pi / self.chord

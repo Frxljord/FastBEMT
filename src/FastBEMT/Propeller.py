@@ -2,11 +2,10 @@ import numpy as np
 import pandas as pd
 import aerosandbox as asb
 import torch
-from typing import List, Tuple 
+from typing import Tuple 
 import pyfar as pf
 
 from .Section import SectionForces
-from .CompactSource import CompactAcousticSourceArray
 from .TorchCompactSource import TorchCompactAcousticSourceArray
 from .JobParameters import LowFidelityParameters
 

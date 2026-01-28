@@ -42,8 +42,8 @@ class TorchCompactAcousticSourceArray:
             com_shift_up: Upward center-of-mass shift (fraction of chord)
             source_times: Time array for source evaluation (s)
             omega: Blade angular velocity (rad/s)
-            d_t: Thickness force distribution (N)
-            d_q: Loading force distribution (N)
+            d_t: Thrust force distribution (N)
+            d_q: Drag force distribution (N)
             blade_angles: Initial blade angles (radians)
             device: Torch device for computation ('cpu' or 'cuda')
         """
@@ -182,7 +182,7 @@ class TorchCompactAcousticSourceArray:
         self.force_der_fixed = torch.linalg.cross(self.omega_vec, self.force_fixed)
         self.force_der_fixed.add_(df_dt_fixed)
 
-    def get_rf_fused(self, m1: int, m2: int, inv_r: torch.Tensor, inv_omr: torch.Tensor) -> torch.Tensor:
+    def get_rf(self, m1: int, m2: int, inv_r: torch.Tensor, inv_omr: torch.Tensor) -> torch.Tensor:
         """Compute combined scaling factors for compact source formulation.
         
         Evaluates r^(-m1) * (1 - M_r)^(-m2) efficiently by fusing inverse computations.
@@ -203,7 +203,7 @@ class TorchCompactAcousticSourceArray:
         # Multiply the two factors
         return res_r.mul(res_omr)
 
-    def get_rp_fused(
+    def get_rp(
         self,
         m1: int,
         m2: int,
@@ -213,7 +213,7 @@ class TorchCompactAcousticSourceArray:
         m_mag_sq: torch.Tensor,
         m_r_dot: torch.Tensor
     ) -> torch.Tensor:
-        """Compute polynomial term in compact source formulation.
+        """Compute derivative of rf term in compact source formulation.
         
         Evaluates the polynomial contribution involving Mach numbers and distance scaling:
         (M_r - M^2) * a_inf * m2 * r^(-(m1+1)) * (1-M_r)^(-(m2+1))
@@ -233,9 +233,9 @@ class TorchCompactAcousticSourceArray:
             Polynomial term tensor
         """
         # Compute required scaling factors
-        rf_m1_m2p1 = self.get_rf_fused(m1, m2 + 1, inv_r, inv_omr)
-        rf_m1p1_m2p1 = self.get_rf_fused(m1 + 1, m2 + 1, inv_r, inv_omr)
-        rf_m1p1_m2 = self.get_rf_fused(m1 + 1, m2, inv_r, inv_omr)
+        rf_m1_m2p1 = self.get_rf(m1, m2 + 1, inv_r, inv_omr)
+        rf_m1p1_m2p1 = self.get_rf(m1 + 1, m2 + 1, inv_r, inv_omr)
+        rf_m1p1_m2 = self.get_rf(m1 + 1, m2, inv_r, inv_omr)
         
         # First term: (M_r - M^2) * a_inf * m2 * rf(m1+1, m2+1)
         res = (m_r.sub(m_mag_sq)).mul_(self.a_inf).mul_(m2).mul_(rf_m1p1_m2p1)
@@ -315,18 +315,18 @@ class TorchCompactAcousticSourceArray:
         m_r_ddot.add_(self.a_inf.mul(geo_term.add_(kin_term)))
 
         # Pre-compute all required scaling factors for F1A formulation
-        rf02 = self.get_rf_fused(0, 2, inv_r, inv_omr)
-        rf22 = self.get_rf_fused(2, 2, inv_r, inv_omr)
-        rf12 = self.get_rf_fused(1, 2, inv_r, inv_omr)
-        rf01 = self.get_rf_fused(0, 1, inv_r, inv_omr)
-        rf11 = self.get_rf_fused(1, 1, inv_r, inv_omr)
-        rf21 = self.get_rf_fused(2, 1, inv_r, inv_omr)
+        rf02 = self.get_rf(0, 2, inv_r, inv_omr)
+        rf22 = self.get_rf(2, 2, inv_r, inv_omr)
+        rf12 = self.get_rf(1, 2, inv_r, inv_omr)
+        rf01 = self.get_rf(0, 1, inv_r, inv_omr)
+        rf11 = self.get_rf(1, 1, inv_r, inv_omr)
+        rf21 = self.get_rf(2, 1, inv_r, inv_omr)
         
         # Pre-compute derivative terms
-        rp22 = self.get_rp_fused(2, 2, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
-        rp12 = self.get_rp_fused(1, 2, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
-        rp01 = self.get_rp_fused(0, 1, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
-        rp11 = self.get_rp_fused(1, 1, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
+        rp22 = self.get_rp(2, 2, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
+        rp12 = self.get_rp(1, 2, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
+        rp01 = self.get_rp(0, 1, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
+        rp11 = self.get_rp(1, 1, inv_r, inv_omr, m_r, m_mag_sq, m_r_dot)
 
         # Thickness source scalar coefficient (F1A formulation)
         # c_1A = rf02 * [a_inf * (rp22*(M_r - M^2) + rf22*(...)) + rf12*dM_r/dt + rp12*dM_r/dt2 + rf01*rp01*rp11]
