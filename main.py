@@ -2,55 +2,52 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import pyfar as pf
+from FastBEMT.Propeller import Propeller
+from FastBEMT.JobParameters import LowFidelityParameters
+from FastBEMT.BPM import BPM
 
-from src.Propeller import Propeller
-from src.JobParameters import AerodynamicParameters, AcousticParameters
 
-def main():
+def main() -> None:
+    """Main analysis pipeline for propeller BEMT and acoustic modeling."""
+
     with open("Datasets/Propellers/10x7E.pkl", "rb") as f:
         blade_dict = pickle.load(f)
 
-    aerodynamic_params = AerodynamicParameters(
-        prop_radius=blade_dict['tip_radius'],
-        hub_radius=blade_dict['hub_radius'],
-        n_blades=blade_dict['n_blades'],
+    params = LowFidelityParameters(
         rpm=7000,
         a_inf=343,
         rho=1.225,
         mu=1.81e-5,
-    )
-
-    acoustic_params = AcousticParameters(
-        aero_params=aerodynamic_params,
+        n_blades=blade_dict['n_blades'],
         p_ref=2e-5,
-        revolutions=5,
-        num_obs_times_per_rev=100
+        revolutions=100,
+        num_obs_times_per_rev=100,
     )
 
     # Observer positions in meters [x, y, z]
-    r_observer = np.array([[0, 1.8, 0],
-                           [0, 0, 1.8]])
+    r_observer = np.array([[0.1, 1.8, 0], [0.1, 0, 1.8]])
+    # r_observer = np.array([[0, 1.8, 0]])
 
     propeller = Propeller(
         propeller_geometry=blade_dict,
-        aero_params=aerodynamic_params,
-        acoustic_params=acoustic_params
+        params=params,
     )
 
-    propeller.run_bemt(v_inf=0*np.ones(len(blade_dict['r'])))
-    propeller.run_compact_f1a(observer_positions=r_observer, use_GPU=True)
+    propeller.run_bemt(v_inf=0)
+    propeller.run_compact_f1a(observer_positions=r_observer, use_gpu=True)
 
     # Performance output
     thrust, torque, ct, cp = propeller.compute_total_forces()
     print(f"BEMT Results: Thrust={thrust:.4f} N, Torque={torque:.4f} N·m, Ct={ct:.6f}, Cp={cp:.6f}")
 
     n_obs = r_observer.shape[0]
-    fig = plt.figure(figsize=(15, 3.5 * n_obs)) 
+    fig = plt.figure(figsize=(15, 3.5 * n_obs))
     gs = gridspec.GridSpec(n_obs, 2, figure=fig)
 
     fontsize = 10
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    blade_passing_freq = 1 / acoustic_params.blade_passing_period
+    blade_passing_freq = 1 / params.blade_passing_period
 
     ax_spl = fig.add_subplot(gs[:, 1])
 
@@ -90,9 +87,36 @@ def main():
     ax_spl.grid(True, which='both', alpha=0.3)
     ax_spl.legend(fontsize=fontsize, loc='lower left')
     ax_spl.set_xlim(10, 10000)
-    ax_spl.set_ylim(-50,70)
+    ax_spl.set_ylim(-50, 70)
     plt.tight_layout()
     plt.show()
+
+    third_octave_freqs = pf.dsp.filter.fractional_octave_frequencies(num_fractions=3, frequency_range=(20,20000))[0]
+
+    bpm = BPM(propeller=propeller, frequencies=third_octave_freqs)
+    bpm.run_bpm()
+
+    f1a_spl_3oct = []
+    for fc in third_octave_freqs:
+        f_low, f_high = fc / (2 ** (1 / 6)), fc * (2 ** (1 / 6))
+        mask = (propeller.freq >= f_low) & (propeller.freq < f_high)
+        p_band = np.sum(10 ** (propeller.spl*mask / 10), axis=0)
+        f1a_spl_3oct.append(10 * np.log10(p_band))
+
+    f1a_spl_3oct = np.array(f1a_spl_3oct)
+
+    l_total = 10 * np.log10(
+        10 ** (f1a_spl_3oct / 10) # ok
+        + 10 ** (bpm.spl_lbl / 10) # ok
+        + 10 ** (bpm.spl_tbl / 10)
+        + 10 ** (bpm.spl_teb / 10)
+        + 10 ** (bpm.spl_ti / 10)
+        + 10 ** (bpm.spl_tip / 10) # ok
+    )
+
+    ospl_third_octave = 10 * np.log10(np.sum(10 ** (l_total / 10), axis=0))
+    print(f"F1A Results: OSPL={ospl_third_octave} dB")
+
 
 if __name__ == "__main__":
     main()

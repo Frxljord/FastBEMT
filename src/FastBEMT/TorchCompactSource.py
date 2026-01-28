@@ -9,10 +9,10 @@ class TorchCompactAcousticSourceArray:
         com_shift_forward, com_shift_up, 
         source_times, omega: float, 
         d_t, d_q, blade_angles,
-        device: str = "cuda"
+        device: str
     ):
         torch.backends.opt_einsum.strategy = 'branch-all'
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device)
         self.dtype = torch.float32
 
         self.rho = torch.tensor(rho, dtype=self.dtype, device=self.device)

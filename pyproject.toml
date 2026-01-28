@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aerosandbox>=4.2.9",
     "ipython>=9.9.0",
+    "line-profiler>=5.0.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.0",
     "opt-einsum>=3.4.0",
@@ -14,9 +15,11 @@ dependencies = [
     "pip>=25.3",
     "plotly>=6.5.1",
     "pyfar>=0.7.3",
+    "scienceplots>=2.2.0",
     "scikit-learn>=1.8.0",
     "scipy>=1.16.3",
     "shapely>=2.1.2",
+    "snakeviz>=2.2.2",
 ]
 
 [build-system]

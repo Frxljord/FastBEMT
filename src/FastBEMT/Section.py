@@ -10,171 +10,412 @@ import scipy.optimize
 import pandas as pd
 import aerosandbox as asb
 import warnings
+from FastBEMT.JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 class SectionForces:
-    """Solve BEMT for a single blade section."""
-    def __init__(self, airfoil, r, dr, chord, theta, propellerParams):
-        """Initialize per-section geometry, flow state, and cached data."""
+    """Blade Element Momentum Theory (BEMT) solver for a single radial section.
+    
+    Handles aerodynamic calculations for a blade section including airfoil
+    coefficient lookup, loss factor calculations, and iterative inflow angle
+    solutions.
+    """
+
+    def __init__(
+        self,
+        airfoil: asb.Airfoil,
+        r: float,
+        dr: float,
+        chord: float,
+        theta: float,
+        params: LowFidelityParameters,
+        prop_radius: float,
+        hub_radius: float,
+        n_blades: int,
+    ) -> None:
+        """Initialize per-section geometry, flow state, and cached data.
+        
+        Args:
+            airfoil: AeroSandbox Airfoil object for aerodynamic lookups.
+            r: Radial distance from propeller hub (m).
+            dr: Radial element thickness (m).
+            chord: Section chord length (m).
+            theta: Section geometric twist angle (radians).
+            propeller_params: Global aerodynamic parameters object.
+        """
         self.airfoil = airfoil
         self.r = r
         self.dr = dr
         self.chord = chord
         self.theta = theta
-        self.propellerParams = propellerParams
-        self._tables = {}
-        self._buildPrandtlLossTable()
+        self.params = params
+        self.prop_radius = prop_radius
+        self.hub_radius = hub_radius
+        self.n_blades = n_blades
+        self._tables: dict = {}
+        self.v_inf: float | None = None
+        self.re: float | None = None
+        self.ma: float | None = None
+        self._build_prandtl_loss_table()
 
     @property
-    def sigma(self):
-        """Local solidity for this section."""
-        return self.propellerParams.n_blades * self.chord / (2 * np.pi * self.r)
+    def sigma(self) -> float:
+        """Local solidity (blade area ratio) for this section.
+        
+        Returns:
+            Solidity value (dimensionless).
+        """
+        return (
+            self.n_blades
+            * self.chord
+            / (2 * np.pi * self.r)
+        )
 
-    def _buildPrandtlLossTable(self):
-        """Precompute Prandtl loss factor on a phi grid for fast interpolation."""
+    def _build_prandtl_loss_table(self) -> None:
+        """Precompute Prandtl tip-hub loss factor on inflow angle grid.
+        
+        Pre-tabulates the loss factor on a phi (inflow angle) grid for fast
+        interpolation during iterative BEMT solving. Avoids recomputation.
+        """
         self._phi_grid = np.linspace(np.radians(0.1), np.radians(89.9), 100)
 
         sin_phi = np.sin(self._phi_grid)
-        B = self.propellerParams.n_blades
+        n_blades = self.n_blades
         r = self.r
 
-        f_tip = B * (self.propellerParams.prop_radius - r) / (2 * r * sin_phi)
-        f_hub = B * (r - self.propellerParams.hub_radius) / (2 * r * sin_phi)
+        f_tip = (
+            n_blades
+            * (self.prop_radius - r)
+            / (2 * r * sin_phi)
+        )
+        f_hub = (
+            n_blades
+            * (r - self.hub_radius)
+            / (2 * r * sin_phi)
+        )
 
-        # Clip to avoid overflow
+        # Clip to avoid overflow in exponential
         f_tip = np.clip(f_tip, 0.0, 500.0)
         f_hub = np.clip(f_hub, 0.0, 500.0)
 
-        F_tip = 2 * np.arccos(np.exp(-f_tip)) / np.pi
-        F_hub = 2 * np.arccos(np.exp(-f_hub)) / np.pi
+        # Compute tip and hub loss factors
+        f_tip_loss = 2 * np.arccos(np.exp(-f_tip)) / np.pi
+        f_hub_loss = 2 * np.arccos(np.exp(-f_hub)) / np.pi
 
-        self._F_grid = F_tip * F_hub
+        self._f_grid = f_tip_loss * f_hub_loss
 
-    def prandtlLoss(self, phi):
-        """Return Prandtl tip-hub loss factor for a given inflow angle phi (rad)."""
+    def prandtl_loss(self, phi: float) -> float:
+        """Return Prandtl tip-hub loss factor for a given inflow angle.
+        
+        Args:
+            phi: Inflow angle (radians).
+            
+        Returns:
+            Prandtl loss factor (0 to 1), where 1 means no loss.
+        """
         if phi <= 0:
             return 1.0
-        return np.interp(phi, self._phi_grid, self._F_grid)
+        return np.interp(phi, self._phi_grid, self._f_grid)
 
-    def airfoilCoefficients(self, alpha, Re, Ma, modelSize="xxxlarge"):
-        """Return CL, CD for the given alpha, Re, Ma using a pre-tabulated lookup."""
-        # Bin Reynolds and Mach to a coarse grid to maximize table reuse
-        ReBin = round(Re, -4)
-        MaBin = round(Ma, 1)
-        key = (ReBin, MaBin)
+    def airfoil_coefficients(
+        self,
+        alpha: float,
+        re: float,
+        ma: float,
+        model_size: str = "xxxlarge",
+    ) -> tuple[float, float]:
+        """Return lift and drag coefficients for given angle and flow conditions.
+        
+        Uses neural network predictions (NeuralFoil) with caching to maximize
+        table reuse. Coefficients are binned by Reynolds and Mach for efficiency.
+        
+        Args:
+            alpha: Angle of attack (degrees).
+            re: Reynolds number.
+            ma: Mach number.
+            model_size: NeuralFoil model size (default 'xxxlarge').
+            
+        Returns:
+            Tuple of (lift_coefficient, drag_coefficient).
+        """
+        # Bin Reynolds and Mach to coarse grid for table reuse
+        re_bin = round(re, -4)
+        ma_bin = round(ma, 0)
+        key = (re_bin, ma_bin)
 
-        # Lazily build the CL/CD vs alpha table for this (ReBin, MaBin)
+        # Lazily build lookup table for this (Re_bin, Ma_bin)
         if key not in self._tables:
             # Alpha grid in degrees for tabulation
             alpha_grid = np.linspace(0.0, 30.0, 61)
-            full_output = asb.Airfoil.get_aero_from_neuralfoil(self.airfoil, alpha=alpha_grid, Re=ReBin, mach=MaBin, model_size=modelSize)
-            cl_grid = np.asarray(full_output["CL"], dtype=float)
-            cd_grid = np.asarray(full_output["CD"], dtype=float)
-            self._tables[key] = (alpha_grid, cl_grid, cd_grid)
+            full_output = asb.Airfoil.get_aero_from_neuralfoil(
+                self.airfoil,
+                alpha=alpha_grid,
+                Re=re_bin,
+                mach=ma_bin,
+                model_size=model_size,
+            )
+            c_l_grid = np.asarray(full_output["CL"], dtype=float)
+            c_d_grid = np.asarray(full_output["CD"], dtype=float)
+            H_u_te_grid = np.asarray(full_output["upper_bl_H_31"], dtype=float)
+            H_l_te_grid = np.asarray(full_output["lower_bl_H_31"], dtype=float)
+            theta_u_te_grid = np.asarray(full_output["upper_bl_theta_31"], dtype=float)
+            theta_l_te_grid = np.asarray(full_output["lower_bl_theta_31"], dtype=float)
+            self._tables[key] = (alpha_grid, c_l_grid, c_d_grid, H_u_te_grid, H_l_te_grid, theta_u_te_grid, theta_l_te_grid)
 
-        alpha_grid, cl_grid, cd_grid = self._tables[key]
-        # 1D linear interpolation in alpha (degrees)
-        cL = np.interp(alpha, alpha_grid, cl_grid)
-        cD = np.interp(alpha, alpha_grid, cd_grid)
-        if np.isnan(cL) or np.isnan(cD):
-            full_output = asb.Airfoil.get_aero_from_neuralfoil(self.airfoil, alpha=alpha, Re=Re, mach=Ma, model_size=modelSize)
-            cL, cD = full_output["CL"].item(), full_output["CD"].item()
-        return cL, cD
+        alpha_grid, c_l_grid, c_d_grid, H_u_te_grid, H_l_te_grid, theta_u_te_grid, theta_l_te_grid = self._tables[key]
+        # Linear interpolation in alpha
+        c_l = np.interp(alpha, alpha_grid, c_l_grid)
+        c_d = np.interp(alpha, alpha_grid, c_d_grid)
+        H_u_te = np.interp(alpha, alpha_grid, H_u_te_grid)
+        H_l_te = np.interp(alpha, alpha_grid, H_l_te_grid)
+        theta_u_te = np.interp(alpha, alpha_grid, theta_u_te_grid)
+        theta_l_te = np.interp(alpha, alpha_grid, theta_l_te_grid)
 
-    def sectionParameters(self, phi):
-        """Compute aerodynamic section parameters for a given inflow angle phi."""
+        self.delta_star_upper = H_u_te * theta_u_te * self.chord
+        self.delta_star_lower = H_l_te * theta_l_te * self.chord
+
+        # Fallback: query directly if interpolation fails
+        if np.isnan(c_l) or np.isnan(c_d):
+            full_output = asb.Airfoil.get_aero_from_neuralfoil(
+                self.airfoil,
+                alpha=alpha,
+                Re=re,
+                mach=ma,
+                model_size=model_size,
+            )
+            c_l = full_output["CL"].item()
+            c_d = full_output["CD"].item()
+
+        return c_l, c_d
+
+    def section_parameters(self, phi: float) -> tuple:
+        """Compute aerodynamic section parameters for a given inflow angle.
+        
+        Args:
+            phi: Inflow angle (radians).
+            
+        Returns:
+            Tuple of (alpha, c_l, c_d, loss_factor, u, a_prime, w, c_l_prime,
+            c_d_prime, v_a, v_t) containing angle of attack, force coefficients,
+            loss factor, and velocity components.
+        """
+        # Compute angle of attack
         alpha = np.degrees(self.theta - phi)
-        cL, cD = self.airfoilCoefficients(alpha, self.Re, self.Ma)
-        c, s = np.cos(phi), np.sin(phi)
-        cLPrime = cL * c - cD * s
-        cDPrime = cL * s + cD * c
-        F = self.prandtlLoss(phi)
-        k_t = self.sigma * cLPrime / (4 * F * s * c) 
-        k_q = self.sigma * cDPrime / (4 * F * s * c)
-        u = self.propellerParams.omega * self.r * k_t / (1 + k_q)
-        aPrime = k_q / (1 + k_q)
-        vA = self.v_inf + u
-        vT = self.propellerParams.omega * self.r * (1 - aPrime)
-        W = np.sqrt(vA**2 + vT**2)
-        self.Re = self.propellerParams.rho * W * self.chord / self.propellerParams.mu
-        self.Ma = W / self.propellerParams.a_inf
-        return alpha, cL, cD, F, u, aPrime, W, cLPrime, cDPrime, vA, vT
 
-    def residualFunction(self, phi):
-        """Residual of the inflow angle equation for root finding."""
-        _, _, _, _, u, aPrime, _, _, _, vA, vT = self.sectionParameters(phi)
-        return np.tan(phi) - vA / vT
+        # Get aerodynamic coefficients from airfoil lookup
+        c_l, c_d = self.airfoil_coefficients(alpha, self.re, self.ma)
 
-    def solve(self, v_inf, prevPhi=None):
-        """Solve for inflow angle phi and return section forces and kinematics.
+        # Rotate coefficients to inflow frame
+        cos_phi = np.cos(phi)
+        sin_phi = np.sin(phi)
+        c_l_prime = c_l * cos_phi - c_d * sin_phi
+        c_d_prime = c_l * sin_phi + c_d * cos_phi
 
-        If a previous-section phi is provided, use it to define a tighter
-        bracket for the root search and expand it until a sign change is found;
-        otherwise fall back to the full range (> 0, < 90).
+        # Compute loss factor and momentum parameters
+        loss_factor = self.prandtl_loss(phi)
+        k_t = self.sigma * c_l_prime / (4 * loss_factor * sin_phi * cos_phi)
+        k_q = self.sigma * c_d_prime / (4 * loss_factor * sin_phi * cos_phi)
+
+        # Compute velocity components
+        u = (
+            self.params.omega
+            * self.r
+            * k_t
+            / (1 + k_q)
+        )
+        a_prime = k_q / (1 + k_q)
+        v_a = self.v_inf + u
+        v_t = self.params.omega * self.r * (1 - a_prime)
+        w = np.sqrt(v_a**2 + v_t**2)
+
+        # Update Reynolds and Mach numbers for next iteration
+        self.re = (
+            self.params.rho
+            * w
+            * self.chord
+            / self.params.mu
+        )
+        self.ma = w / self.params.a_inf
+
+        return (
+            alpha,
+            c_l,
+            c_d,
+            loss_factor,
+            u,
+            a_prime,
+            w,
+            c_l_prime,
+            c_d_prime,
+            v_a,
+            v_t,
+        )
+
+    def residual_function(self, phi: float) -> float:
+        """Residual of the inflow angle equation for root finding.
+        
+        Args:
+            phi: Inflow angle to evaluate (radians).
+            
+        Returns:
+            Residual value; root is where this equals zero.
+        """
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            v_a,
+            v_t,
+        ) = self.section_parameters(phi)
+        return np.tan(phi) - v_a / v_t
+
+    def solve(
+        self,
+        v_inf: float,
+        prev_phi: float | None = None,
+    ) -> tuple:
+        """Solve for inflow angle and return section forces and kinematics.
+        
+        Uses iterative root finding to solve the momentum equation. If a previous
+        inflow angle is provided, uses it to define a tighter bracket for faster
+        convergence.
+        
+        Args:
+            v_inf: Freestream velocity (m/s).
+            prev_phi: Previous section inflow angle (radians) for bracket initialization.
+            
+        Returns:
+            Tuple of (phi, d_t, d_q, alpha, u, a_prime, c_l, c_d, loss_factor,
+            w, reynolds, mach, delta_star_upper, delta_star_lower) containing
+            inflow angle, forces, and boundary layer displacement thicknesses.
         """
         self.v_inf = v_inf
-        v_local = np.sqrt(self.v_inf**2 +(self.propellerParams.omega * self.r)**2)
-        self.Ma = v_local / self.propellerParams.a_inf
-        self.Re = self.propellerParams.rho * v_local * self.chord / self.propellerParams.mu
+        v_local = np.sqrt(
+            self.v_inf**2 + (self.params.omega * self.r) ** 2
+        )
+        self.ma = v_local / self.params.a_inf
+        self.re = (
+            self.params.rho
+            * v_local
+            * self.chord
+            / self.params.mu
+        )
 
-        phiMinDefault = np.radians(0.1)
-        phiMaxDefault = np.radians(89.9)
+        # Define bounds for inflow angle
+        phi_min_default = np.radians(0.1)
+        phi_max_default = np.radians(89.9)
 
-        if prevPhi is None:
-            bracket = [phiMinDefault, phiMaxDefault]
+        if prev_phi is None:
+            bracket = [phi_min_default, phi_max_default]
         else:
-            center = np.clip(prevPhi, phiMinDefault, phiMaxDefault)
-            delta = np.radians(1)  # initial half-width: ±1 deg
+            # Use previous phi to bracket search more tightly
+            center = np.clip(prev_phi, phi_min_default, phi_max_default)
+            delta = np.radians(1)  # initial half-width: ±1 degree
 
-            def safeResidual(x):
+            def safe_residual(x: float) -> float:
+                """Safely evaluate residual, returning NaN on exception."""
                 try:
-                    return self.residualFunction(x)
+                    return self.residual_function(x)
                 except Exception:
                     return np.nan
 
-            # Expand the bracket until we find a sign change or hit the defaults
+            # Expand bracket until sign change found or bounds reached
             while True:
-                lower = max(phiMinDefault, center - delta)
-                upper = min(phiMaxDefault, center + delta)
+                lower = max(phi_min_default, center - delta)
+                upper = min(phi_max_default, center + delta)
 
-                fLower = safeResidual(lower)
-                fUpper = safeResidual(upper)
+                f_lower = safe_residual(lower)
+                f_upper = safe_residual(upper)
 
-                if np.isfinite(fLower) and np.isfinite(fUpper) and fLower * fUpper < 0:
+                if (
+                    np.isfinite(f_lower)
+                    and np.isfinite(f_upper)
+                    and f_lower * f_upper < 0
+                ):
                     bracket = [lower, upper]
                     break
 
-                if lower <= phiMinDefault or upper >= phiMaxDefault:
-                    bracket = [phiMinDefault, phiMaxDefault]
+                if lower <= phi_min_default or upper >= phi_max_default:
+                    bracket = [phi_min_default, phi_max_default]
                     break
 
                 delta *= 2.0
 
+        # Root finding for inflow angle
         try:
             result = scipy.optimize.root_scalar(
-                self.residualFunction,
+                self.residual_function,
                 method="brentq",
                 xtol=1e-4,
                 bracket=bracket,
             )
         except ValueError:
+            # Fallback to Newton's method if brentq fails
             result = scipy.optimize.root_scalar(
-                self.residualFunction,
+                self.residual_function,
                 method="newton",
                 xtol=1e-4,
-                x0=np.mean(bracket)
+                x0=np.mean(bracket),
             )
+
         if not result.converged:
-            raise RuntimeError("Root finding did not converge")
+            raise RuntimeError("Root finding for inflow angle did not converge")
 
         phi = result.root
-        alpha, _, _, F, u, aPrime, W, cLPrime, cDPrime, _,_vT = self.sectionParameters(phi)
-        dT = self.sigma * np.pi * self.propellerParams.rho * W**2 * cLPrime * self.r * self.dr
-        dQ = self.sigma * np.pi * self.propellerParams.rho * W**2 * cDPrime * self.r**2 * self.dr
+        (
+            alpha,
+            _,
+            _,
+            loss_factor,
+            u,
+            a_prime,
+            w,
+            c_l_prime,
+            c_d_prime,
+            _,
+            _,
+        ) = self.section_parameters(phi)
 
-        full_output = asb.Airfoil.get_aero_from_neuralfoil(self.airfoil, alpha=alpha, Re=self.Re, mach=self.Ma, model_size='xxxlarge')
+        # Compute local thrust and torque
+        d_t = (
+            self.sigma
+            * np.pi
+            * self.params.rho
+            * w**2
+            * c_l_prime
+            * self.r
+            * self.dr
+        )
+        d_q = (
+            self.sigma
+            * np.pi
+            * self.params.rho
+            * w**2
+            * c_d_prime
+            * self.r**2
+            * self.dr
+        )
 
-        delta_star_upper, delta_star_lower = full_output['upper_bl_H_31']*full_output['upper_bl_theta_31']*self.chord, full_output['lower_bl_H_31']*full_output['lower_bl_theta_31']*self.chord
-
-        return phi, dT, dQ, alpha, u, aPrime, cLPrime, cDPrime, F, W, self.Re, self.Ma, delta_star_upper, delta_star_lower
+        return (
+            phi,
+            d_t,
+            d_q,
+            alpha,
+            u,
+            a_prime,
+            c_l_prime,
+            c_d_prime,
+            loss_factor,
+            w,
+            self.re,
+            self.ma,
+            self.delta_star_upper,
+            self.delta_star_lower,
+        )
