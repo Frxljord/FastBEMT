@@ -237,7 +237,7 @@ class Propeller:
         observer_positions: np.ndarray,
         local_dT: np.ndarray | None = None,
         local_dQ: np.ndarray | None = None,
-        use_gpu: bool = False,
+        device: str = 'cuda',
     ) -> None:
         """Initialize acoustic array and compute total pressure at observer locations.
         
@@ -254,7 +254,7 @@ class Propeller:
             use_gpu: Whether to use GPU acceleration via PyTorch CUDA.
         """
         self.observer_positions = observer_positions
-        self.device = 'cuda' if use_gpu else 'cpu'
+        self.device = device
 
         # Prepare local force distributions
         if local_dT is None or local_dQ is None:

@@ -5,7 +5,7 @@ import matplotlib.gridspec as gridspec
 import pyfar as pf
 from FastBEMT.Propeller import Propeller
 from FastBEMT.JobParameters import LowFidelityParameters
-from FastBEMT.BPM import BPM
+from FastBEMT.TorchBPM import BPM
 
 
 def main() -> None:

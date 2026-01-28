@@ -20,6 +20,7 @@ dependencies = [
     "scipy>=1.16.3",
     "shapely>=2.1.2",
     "snakeviz>=2.2.2",
+    "torch-tb-profiler>=0.4.3",
 ]
 
 [build-system]

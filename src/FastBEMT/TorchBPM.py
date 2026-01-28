@@ -244,7 +244,6 @@ def calculate_directivity(
     m: torch.Tensor,
     azimuths: torch.Tensor,
     blade_angles: torch.Tensor,
-    directivity_type: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Calculate acoustic directivity patterns.
     
@@ -254,7 +253,6 @@ def calculate_directivity(
         m: Mach number (radius,) as torch tensor
         azimuths: Azimuthal positions (azim,) as torch tensor
         blade_angles: Blade angles (blade,) as torch tensor
-        directivity_type: Type of directivity ("TE", "LE", or "low")
         
     Returns:
         Tuple of (distance, directivity) tensors
@@ -300,20 +298,17 @@ def calculate_directivity(
     # 5. Expand Mach number tensor
     m = m[None, None, None, :]
     
-    if directivity_type == "TE":
-        term1 = 2 * (sin_theta_2**2) * (sin_phi**2)
-        term2 = (1 + m * cos_theta) * (1 + 0.2 * m * cos_theta)**2
-        dh = term1 / term2
-    elif directivity_type == "LE":
-        term1 = 2 * (cos_theta_2**2) * (sin_phi**2)
-        term2 = (1 + m * cos_theta)**3
-        dh = term1 / term2
-    elif directivity_type == "low":
-        term1 = (torch.sin(theta)**2) * (sin_phi**2)
-        term2 = (1 + m * cos_theta)**4
-        dh = term1 / term2
+    term1 = 2 * (sin_theta_2**2) * (sin_phi**2)
+    term2 = (1 + m * cos_theta) * (1 + 0.2 * m * cos_theta)**2
+    dh_te = term1 / term2
+    term1 = 2 * (cos_theta_2**2) * (sin_phi**2)
+    term2 = (1 + m * cos_theta)**3
+    dh_le = term1 / term2
+    term1 = (torch.sin(theta)**2) * (sin_phi**2)
+    term2 = (1 + m * cos_theta)**4
+    dl = term1 / term2
 
-    return torch.squeeze(r_mag), dh
+    return torch.squeeze(r_mag), dh_te, dh_le, dl
 
 def st1_prime(re_c: torch.Tensor) -> torch.Tensor:
     """Compute st1_prime parameter."""
@@ -620,14 +615,9 @@ class BPM:
 
         # Compute directivity patterns
         obs_pos = torch.as_tensor(propeller.observer_positions, dtype=torch.float32, device=device)
-        self.r_dist, self.dh_te = calculate_directivity(
-            self.r_element, obs_pos, self.m, self.azimuth_positions, blade_angles_t, directivity_type="TE"
-        )
-        _, self.dh_le = calculate_directivity(
-            self.r_element, obs_pos, self.m, self.azimuth_positions, blade_angles_t, directivity_type="LE"
-        )
-        _, self.dl = calculate_directivity(
-            self.r_element, obs_pos, self.m, self.azimuth_positions, blade_angles_t, directivity_type="low"
+
+        self.r_dist, self.dh_te, self.dh_le, self.dl = calculate_directivity(
+            self.r_element, obs_pos, self.m, self.azimuth_positions, blade_angles_t
         )
 
         # Compute base directivity values
@@ -637,7 +627,6 @@ class BPM:
 
     def run_bpm(
         self,
-        device: Optional[str] = None,
         lt: float = 1e6,
         i: float = 0.005,
         alpha_stall: float = 15,
@@ -646,15 +635,11 @@ class BPM:
         """Run all BPM noise mechanisms on specified device.
         
         Args:
-            device: Torch device ('cpu' or 'cuda'). If None, uses initialized device.
             lt: Turbulence length scale (m).
             i: Turbulence intensity (fraction of flow velocity).
             alpha_stall: Stall angle of attack (degrees).
             h: Trailing edge thickness (m). If None, computed as 1% of chord.
         """
-        if device is not None:
-            self.device = device
-        
         self.ti_noise(lt, i)
         self.tbl_noise(alpha_stall)
         self.lbl_noise()
@@ -671,42 +656,39 @@ class BPM:
         f_co = 10 * self.u / np.pi / self.chord
         freq_5d = self.frequencies[:, None, None, None, None]
         f_co_4d = f_co[None, None, None, :]
-        dh_avg = (self.dh_te + self.dh_le) / 2
+        dh_avg = (self.dh_te + self.dh_le) * 0.5  # Fused: (a+b)/2 = (a+b)*0.5
         d = torch.where(freq_5d < f_co_4d, self.dl, dh_avg)
         k1_val = 2 * np.pi * self.frequencies[:, None] / self.u[None, :]
-        k1_bar = k1_val * self.chord / 2
+        k1_bar = k1_val * self.chord * 0.5  # Fused: k1_val * chord / 2
         ke = 3 / 4 / lt
         k1_hat = k1_val.to(torch.float64) / ke
         k1_hat = k1_hat[:, None, None, None, :]
-        base_val_ti = (self.m**5 * self.dr * d) / (self.r_dist[None, :, :, :, :]**2)
+        
+        # Fuse base_val_ti computation
+        m5_dr = self.m**5 * self.dr  # Cache
+        r_dist_sq = self.r_dist[None, :, :, :, :]**2
+        base_val_ti = (m5_dr * d) / r_dist_sq
+        
         beta = 1 - self.m**2
-        s_sq = 1 / (
-            2 * np.pi * k1_bar / beta**2 + 1 / (1 + 2.4 * k1_bar / beta**2)
-        )
-        lfc = 10 * s_sq * self.m * k1_bar**(-2) * beta**(-2)
+        beta_sq = beta**2  # Cache
+        k1_bar_inv_sq = k1_bar**(-2)  # Cache
+        
+        # Fuse s_sq calculation
+        denom = 2 * np.pi * k1_bar / beta_sq + 1 / (1 + 2.4 * k1_bar / beta_sq)
+        s_sq = 1 / denom
+        lfc = 10 * s_sq * self.m * k1_bar_inv_sq * beta_sq**(-1)
         lfc = lfc[:, None, None, None, :]
-        spl_ti = (
-            10
-            * torch.log10(
-                (
-                    self.aero_params.rho**2
-                    * self.aero_params.a_inf**4
-                    * lt
-                    / 2
-                    * i**2
-                    * k1_hat**3
-                    / (1 + k1_hat**2) ** (7 / 3)
-                    * base_val_ti
-                )
-                + 1e-12
-            )
-            + 78.4
-            + 10 * torch.log10(1 + 9 * self.alpha[None, None, None, None, :] ** 2)
-            + 10 * torch.log10(lfc / (1 + lfc))
-        )
-        spp_ti = torch.zeros_like(spl_ti)
-        spp_ti += 10 ** (spl_ti / 10)
-        self.spl_ti = 10 * torch.log10(spp_ti.sum(axis=(-1, -2)).mean(axis=-1))
+        
+        # Fuse log operations in SPL calculation
+        alpha_sq = self.alpha[None, None, None, None, :] ** 2
+        inner_log = (self.aero_params.rho**2 * self.aero_params.a_inf**4 * lt * 0.5 * i**2 
+                     * k1_hat**3 / (1 + k1_hat**2) ** (7 / 3) * base_val_ti) + 1e-12
+        spl_ti = (10 * torch.log10(inner_log) + 78.4 + 10 * torch.log10(1 + 9 * alpha_sq) 
+                  + 10 * torch.log10(lfc / (1 + lfc)))
+        
+        # Use in-place operation for accumulation
+        spp_ti = (10 ** (spl_ti / 10)).sum(axis=(-1, -2)).mean(axis=-1)
+        self.spl_ti = 10 * torch.log10(spp_ti)
 
     def teb_noise(self, h: Optional[float] = None) -> None:
         """Compute trailing edge bluntness (TEB) noise.
@@ -715,39 +697,46 @@ class BPM:
             h: Trailing edge thickness (m). If None, uses 1% of chord.
         """
         if h is None:
-            h = 1e-2 * self.chord
+            h = self.chord * 1e-2  # Fused: 1e-2 * chord
         else:
             h = torch.full_like(self.chord, h, device=self.device)
             
-        delta_avg = calc_delta_avg(self.delta_p, self.delta_s)
+        # Fuse delta_avg calculation
+        delta_avg = (self.delta_p + self.delta_s) * 0.5  # (a+b)/2 = (a+b)*0.5
         q = h / delta_avg
         st_3prime = st(self.frequencies, h, self.u)
         st_3prime_peak = st_peak_3prime(q, self.psi)
         eta = torch.log10(st_3prime / st_3prime_peak)
 
-        spl_teb = (
-            10 * torch.log10((h * self.base_val_te[None, :] * torch.pow(self.m, 0.5)) + 1e-12)
-            + g4(q, self.psi)[None, None, None, None, :]
-            + g5_tot(q, eta, self.psi)[:, None, None, None, :]
-        )
-        spp_teb = torch.zeros_like(spl_teb)
-        spp_teb += 10 ** (spl_teb / 10)
-        self.spl_teb = 10 * torch.log10(spp_teb.sum(dim=(2, 3)).mean(dim=-1))
+        # Cache g function results and fuse log calculation
+        m_05 = torch.pow(self.m, 0.5)
+        log_h_bv = 10 * torch.log10((h * self.base_val_te[None, :] * m_05) + 1e-12)
+        g4_q = g4(q, self.psi)[None, None, None, None, :]
+        g5_q = g5_tot(q, eta, self.psi)[:, None, None, None, :]
+        
+        spl_teb = log_h_bv + g4_q + g5_q
+        
+        # Direct summation without intermediate tensor
+        spp_teb = (10 ** (spl_teb / 10)).sum(dim=(2, 3)).mean(dim=-1)
+        self.spl_teb = 10 * torch.log10(spp_teb)
         
     def lbl_noise(self) -> None:
         """Compute laminar boundary layer (LBL) noise."""
         e = st(self.frequencies, self.delta_p, self.u) / st_peak_prime(self.re_c, self.alpha)
         d = self.re_c / re_c0(self.alpha)
-
-        spl_lbl = (
-            10 * torch.log10((self.delta_p * self.base_val_le[None, :]) + 1e-12)
-            + g1(e)[:, None, None, None, :]
-            + g2(d)[None, None, None, None, :]
-            + g3(self.alpha)[None, None, None, None, :]
-        )
-        spp_lbl = torch.zeros_like(spl_lbl)
-        spp_lbl += 10 ** (spl_lbl / 10)
-        self.spl_lbl = 10 * torch.log10(spp_lbl.sum(dim=(-1, -2)).mean(dim=-1))
+        
+        # Cache g function results to avoid recomputation
+        g1_e = g1(e)[:, None, None, None, :]
+        g2_d = g2(d)[None, None, None, None, :]
+        g3_a = g3(self.alpha)[None, None, None, None, :]
+        
+        # Fuse log calculation
+        log_dp_bv = 10 * torch.log10((self.delta_p * self.base_val_le[None, :]) + 1e-12)
+        spl_lbl = log_dp_bv + g1_e + g2_d + g3_a
+        
+        # Direct summation without intermediate tensor
+        spp_lbl = (10 ** (spl_lbl / 10)).sum(dim=(-1, -2)).mean(dim=-1)
+        self.spl_lbl = 10 * torch.log10(spp_lbl)
     
     def tbl_noise(self, alpha_stall: float) -> None:
         """Compute turbulent boundary layer (TBL) noise.
@@ -763,65 +752,77 @@ class BPM:
         st_p = st(self.frequencies, self.delta_p, self.u)
         st_s = st(self.frequencies, self.delta_s, self.u)
 
-        as_val = tbl_te_a(torch.abs(torch.log10(st_s / st_1)), self.re_c)
-        ap = tbl_te_a(torch.abs(torch.log10(st_p / st_1)), self.re_c)
-        b = tbl_te_b(torch.abs(torch.log10(st_s / st_2)), self.re_c)
-        a_prime = tbl_te_a(torch.abs(torch.log10(st_s / st_2)), 3 * self.re_c)
+        # Cache log calculations to avoid redundant computation
+        log_st_s_st1 = torch.abs(torch.log10(st_s / st_1))
+        log_st_p_st1 = torch.abs(torch.log10(st_p / st_1))
+        log_st_s_st2 = torch.abs(torch.log10(st_s / st_2))
+        
+        as_val = tbl_te_a(log_st_s_st1, self.re_c)
+        ap = tbl_te_a(log_st_p_st1, self.re_c)
+        b = tbl_te_b(log_st_s_st2, self.re_c)
+        a_prime = tbl_te_a(log_st_s_st2, 3 * self.re_c)
 
+        # Expand dimensions once and cache
         as_exp = as_val[:, None, None, None, :]
         ap_exp = ap[:, None, None, None, :]
         b_exp = b[:, None, None, None, :]
         a_prime_exp = a_prime[:, None, None, None, :]
+        k_1_exp = k_1[None, None, None, None, :]
+        k_2_exp = k_2[None, None, None, None, :]
+        alpha_mask = self.alpha < alpha_stall
+        
+        # Fuse log calculations and compute once
+        log_ds_bv_te = 10 * torch.log10((self.delta_s * self.base_val_te[None, :]) + 1e-12)
+        log_dp_bv_te = 10 * torch.log10((self.delta_p * self.base_val_te[None, :]) + 1e-12)
+        log_ds_bv_low = 10 * torch.log10((self.delta_s * self.base_val_low[None, :]) + 1e-12)
+        
+        # Combine torch.where operations to reduce kernel calls
         spl_s = torch.where(
-            self.alpha < alpha_stall,
-            10 * torch.log10((self.delta_s * self.base_val_te[None, :]) + 1e-12) + as_exp + k_1 - 3,
+            alpha_mask,
+            log_ds_bv_te + as_exp + k_1_exp - 3,
             torch.full_like(self.alpha, -torch.inf),
         )
         spl_p = torch.where(
-            self.alpha < alpha_stall,
-            (
-                10 * torch.log10((self.delta_p * self.base_val_te[None, :]) + 1e-12)
-                + ap_exp
-                + k_1
-                - 3
-                + delta_k1_val
-            ),
+            alpha_mask,
+            log_dp_bv_te + ap_exp + k_1_exp - 3 + delta_k1_val,
             torch.full_like(self.alpha, -torch.inf),
         )
         spl_a = torch.where(
-            self.alpha < alpha_stall,
-            10 * torch.log10((self.delta_s * self.base_val_te[None, :]) + 1e-12) + b_exp + k_2,
-            10 * torch.log10((self.delta_s * self.base_val_low[None, :]) + 1e-12) + a_prime_exp + k_2,
+            alpha_mask,
+            log_ds_bv_te + b_exp + k_2_exp,
+            log_ds_bv_low + a_prime_exp + k_2_exp,
         )
-        spp_tbl = torch.zeros_like(spl_a)
-        spp_tbl += 10 ** (spl_s / 10) + 10 ** (spl_p / 10) + 10 ** (spl_a / 10)
+        
+        # Fuse exponentiation and summation
+        spp_tbl = 10 ** (spl_s / 10) + 10 ** (spl_p / 10) + 10 ** (spl_a / 10)
         self.spl_tbl = 10 * torch.log10(spp_tbl.sum(dim=(-1, -2)).mean(dim=-1))
 
     def tv_noise(self) -> None:
         """Compute tip vortex (TV) noise."""
         l_tip = calc_l_tip(self.chord[-1], self.alpha[-1])
-        m_max = self.m[-1] * (1 + 0.036 * self.alpha[-1])
+        alpha_tip = self.alpha[-1]
+        m_tip = self.m[-1]
+        m_max = m_tip * (1 + 0.036 * alpha_tip)
         st_2prime = st(
             self.frequencies,
             l_tip,
             torch.atleast_1d(torch.tensor(self.acoustic_params.a_inf, dtype=torch.float32, device=self.device) * m_max),
         )
-
-        spl_tip = (
-            10
-            * torch.log10(
-                self.m[-1] ** 2
-                * m_max**3
-                * l_tip**2
-                * self.dh_te[..., -1]
-                / self.r_dist[..., -1] ** 2
-            )
-            - 30.5 * (torch.log10(st_2prime[:, :, None, None]) + 0.3) ** 2
-            + 126
-        )
-        spp_tip = torch.zeros_like(spl_tip)
-        spp_tip += 10 ** (spl_tip / 10)
-        self.spl_tip = 10 * torch.log10(spp_tip.sum(dim=-1).mean(dim=-1))
+        
+        # Cache intermediate calculations
+        m2_m3 = m_tip ** 2 * m_max**3  # Fused: m[-1]^2 * m_max^3
+        l_tip_sq = l_tip**2  # Cache
+        r_dist_sq = self.r_dist[..., -1] ** 2  # Cache
+        dh_te_tip = self.dh_te[..., -1]  # Cache
+        
+        # Fuse log calculation and avoid redundant log10
+        log_st = torch.log10(st_2prime[:, :, None, None] + 1e-12)  # Add epsilon for numerical stability
+        spl_tip = (10 * torch.log10(m2_m3 * l_tip_sq * dh_te_tip / r_dist_sq + 1e-12) 
+                   - 30.5 * (log_st + 0.3) ** 2 + 126)
+        
+        # Direct summation without intermediate tensor
+        spp_tip = (10 ** (spl_tip / 10)).sum(dim=-1).mean(dim=-1)
+        self.spl_tip = 10 * torch.log10(spp_tip)
 
     def bwi_noise(
         self,
@@ -838,42 +839,43 @@ class BPM:
             sigma_turb: Turbulence intensity as fraction of local velocity.
             l_scale: Integral length scale.
         """
-        v_t = torch.sqrt(self.u**2 - (self.v_inf + self.vi) ** 2)
+        # Fuse velocity calculations
+        v_t_sq = self.u**2 - (self.v_inf + self.vi) ** 2
+        v_t = torch.sqrt(torch.clamp(v_t_sq, min=0))  # Clamp for numerical stability
         blade_angles_t = torch.as_tensor(self.propeller.params.blade_angles, dtype=torch.float32, device=self.device)
-        y_vt = v_t[None, None, :] * torch.sin(
-            self.azimuth_positions[:, None, None]
-            + blade_angles_t[None, :, None]
-        )
-        z_vt = (
-            -v_t[None, None, :]
-            * torch.cos(
-                self.azimuth_positions[:, None, None]
-                + blade_angles_t[None, :, None]
-            )
-        )
+        
+        # Cache trigonometric calculations
+        angle_grid = self.azimuth_positions[:, None, None] + blade_angles_t[None, :, None]
+        sin_angle = torch.sin(angle_grid)
+        cos_angle = torch.cos(angle_grid)
+        
+        y_vt = v_t[None, None, :] * sin_angle
+        z_vt = -v_t[None, None, :] * cos_angle
         v_t_vec = torch.stack([torch.zeros_like(y_vt), y_vt, z_vt], dim=-1)
 
         obs_pos = torch.as_tensor(self.propeller.observer_positions, dtype=torch.float32, device=self.device)
-        r_vec = (
-            obs_pos[:, None, None, None, :]
-            - self.r_element[None, ...]
-        )
+        r_vec = obs_pos[:, None, None, None, :] - self.r_element[None, ...]
         r_mag = torch.linalg.norm(r_vec, dim=-1)
-        sigma = r_mag**2 * (1 - self.m * torch.sum(v_t_vec * r_vec, dim=-1))
+        
+        # Fuse sigma calculation
+        r_mag_sq = r_mag**2
+        m_expanded = self.m[None, None, None, :]
+        dot_product = torch.sum(v_t_vec * r_vec, dim=-1)
+        sigma = r_mag_sq * (1 - m_expanded * dot_product)
 
         f = self.frequencies[:, None, None, None]
         u = self.u[None, None, None, :]
-
+        
+        # Fuse constants
         omega = 2 * np.pi * f
         phi = phi_ww(f, u, sigma_turb, l_scale)
-        l_sq = amiet_l(
-            omega, u, self.dr, r_vec[..., 1], sigma, self.acoustic_params.a_inf, xi
-        )
-        spp_bwi = (
-            (omega * r_vec[..., 0] / 4 / np.pi / self.acoustic_params.a_inf / sigma**2) ** 2
-            * b
-            * self.chord
-            * phi
-            * l_sq
-        )
-        self.spl_bwi = 10 * torch.log10(spp_bwi.sum(dim=(2, 3)).mean(dim=-1))
+        l_sq = amiet_l(omega, u, self.dr, r_vec[..., 1], sigma, self.acoustic_params.a_inf, xi)
+        
+        # Fuse SPP calculation
+        sigma_sq_inv = 1 / (sigma**2 + 1e-12)  # Add epsilon for stability
+        coeff = b * self.chord[None, None, None, :]
+        spp_bwi = ((omega * r_vec[..., 0] / (4 * np.pi * self.acoustic_params.a_inf)) ** 2 
+                   * sigma_sq_inv * coeff * phi * l_sq)
+        
+        spl_bwi = 10 * torch.log10(spp_bwi.sum(dim=(2, 3)).mean(dim=-1) + 1e-12)
+        self.spl_bwi = spl_bwi
