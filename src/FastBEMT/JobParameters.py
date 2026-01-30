@@ -3,7 +3,7 @@ import torch
 
 
 class LowFidelityParameters:
-    """Global propeller parameters for BEMT analysis."""
+    """Global propeller parameters for low fidelity analysis."""
 
     def __init__(
         self,
