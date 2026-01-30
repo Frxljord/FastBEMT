@@ -92,7 +92,6 @@ class TorchCompactAcousticSourceArray:
         
         self._initialize_geometry_and_kinematics()
 
-    @torch.no_grad()
     def _initialize_geometry_and_kinematics(self) -> None:
         """Compute kinematic properties of rotating blade sections.
         
@@ -136,7 +135,6 @@ class TorchCompactAcousticSourceArray:
 
         # Compute force time derivatives using high-order finite differences
         dt = self.tau[1] - self.tau[0]
-        n = force_moving.shape[0]
         df_dt_moving = torch.zeros_like(force_moving)
 
         # Interior points: 4th-order central difference
@@ -245,7 +243,6 @@ class TorchCompactAcousticSourceArray:
         res.add_(self.a_inf * (m1 - m2) * m_r * rf_m1p1_m2)
         return res
 
-    @torch.no_grad()
     def calculate_f1a_pressure(self, observers: np.ndarray) -> torch.Tensor:
         """Compute F1A pressure at observer locations using compact source formulation.
         
@@ -356,22 +353,3 @@ class TorchCompactAcousticSourceArray:
         # Return both monopole and dipole contributions
         return torch.stack((p_m, p_d), dim=-1)
 
-    @torch.no_grad()
-    def get_observer_times(self, observers: np.ndarray) -> torch.Tensor:
-        """Compute retarded times for source-observer pairs.
-        
-        Calculates the time at which acoustic waves reach observers accounting for
-        wave propagation delay: t_obs = t_source + r / a_inf
-        
-        Args:
-            observers: Observer positions (num_obs, 3) with coordinates (x, y, z) in meters
-            
-        Returns:
-            Retarded times tensor of shape (time, 1, 1, num_obs) in seconds
-        """
-        # Convert observer positions to tensor and add batch dimensions
-        obs = torch.as_tensor(observers, dtype=self.dtype, device=self.device)[None, None, None, :, :]
-        # Compute distance from source to observer
-        dist = torch.linalg.norm(obs.sub(self.pos_fixed[..., None, :]), dim=-1)
-        # Compute retarded time: tau_obs = tau_source + distance / sound_speed
-        return self.tau[:, None, None, None].add(dist.mul(self.a_inf.reciprocal()))

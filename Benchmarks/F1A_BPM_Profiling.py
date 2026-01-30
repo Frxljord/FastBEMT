@@ -38,7 +38,7 @@ def measure():
     nvtx.range_pop()
     
     nvtx.range_push("F1A_Acoustics")
-    propeller.run_compact_f1a(observer_positions=r_observers, device='cuda')
+    propeller.run_aeroacoustics(observer_positions=r_observers, device='cuda')
     torch.cuda.synchronize()
     nvtx.range_pop()
     
