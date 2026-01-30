@@ -7,16 +7,16 @@ This module provides a faster version of the BEMT solver by:
 
 import numpy as np
 import scipy.optimize
-import pandas as pd
 import aerosandbox as asb
 import warnings
 from FastBEMT.JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+
 class SectionForces:
     """Blade Element Momentum Theory (BEMT) solver for a single radial section.
-    
+
     Handles aerodynamic calculations for a blade section including airfoil
     coefficient lookup, loss factor calculations, and iterative inflow angle
     solutions.
@@ -35,7 +35,7 @@ class SectionForces:
         n_blades: int,
     ) -> None:
         """Initialize per-section geometry, flow state, and cached data.
-        
+
         Args:
             airfoil: AeroSandbox Airfoil object for aerodynamic lookups.
             r: Radial distance from propeller hub (m).
@@ -62,19 +62,15 @@ class SectionForces:
     @property
     def sigma(self) -> float:
         """Local solidity (blade area ratio) for this section.
-        
+
         Returns:
             Solidity value (dimensionless).
         """
-        return (
-            self.n_blades
-            * self.chord
-            / (2 * np.pi * self.r)
-        )
+        return self.n_blades * self.chord / (2 * np.pi * self.r)
 
     def _build_prandtl_loss_table(self) -> None:
         """Precompute Prandtl tip-hub loss factor on inflow angle grid.
-        
+
         Pre-tabulates the loss factor on a phi (inflow angle) grid for fast
         interpolation during iterative BEMT solving. Avoids recomputation.
         """
@@ -84,16 +80,8 @@ class SectionForces:
         n_blades = self.n_blades
         r = self.r
 
-        f_tip = (
-            n_blades
-            * (self.prop_radius - r)
-            / (2 * r * sin_phi)
-        )
-        f_hub = (
-            n_blades
-            * (r - self.hub_radius)
-            / (2 * r * sin_phi)
-        )
+        f_tip = n_blades * (self.prop_radius - r) / (2 * r * sin_phi)
+        f_hub = n_blades * (r - self.hub_radius) / (2 * r * sin_phi)
 
         # Clip to avoid overflow in exponential
         f_tip = np.clip(f_tip, 0.0, 500.0)
@@ -107,10 +95,10 @@ class SectionForces:
 
     def prandtl_loss(self, phi: float) -> float:
         """Return Prandtl tip-hub loss factor for a given inflow angle.
-        
+
         Args:
             phi: Inflow angle (radians).
-            
+
         Returns:
             Prandtl loss factor (0 to 1), where 1 means no loss.
         """
@@ -126,16 +114,16 @@ class SectionForces:
         model_size: str = "xxxlarge",
     ) -> tuple[float, float]:
         """Return lift and drag coefficients for given angle and flow conditions.
-        
+
         Uses neural network predictions (NeuralFoil) with caching to maximize
         table reuse. Coefficients are binned by Reynolds and Mach for efficiency.
-        
+
         Args:
             alpha: Angle of attack (degrees).
             re: Reynolds number.
             ma: Mach number.
             model_size: NeuralFoil model size (default 'xxxlarge').
-            
+
         Returns:
             Tuple of (lift_coefficient, drag_coefficient).
         """
@@ -161,9 +149,25 @@ class SectionForces:
             H_l_te_grid = np.asarray(full_output["lower_bl_H_31"], dtype=float)
             theta_u_te_grid = np.asarray(full_output["upper_bl_theta_31"], dtype=float)
             theta_l_te_grid = np.asarray(full_output["lower_bl_theta_31"], dtype=float)
-            self._tables[key] = (alpha_grid, c_l_grid, c_d_grid, H_u_te_grid, H_l_te_grid, theta_u_te_grid, theta_l_te_grid)
+            self._tables[key] = (
+                alpha_grid,
+                c_l_grid,
+                c_d_grid,
+                H_u_te_grid,
+                H_l_te_grid,
+                theta_u_te_grid,
+                theta_l_te_grid,
+            )
 
-        alpha_grid, c_l_grid, c_d_grid, H_u_te_grid, H_l_te_grid, theta_u_te_grid, theta_l_te_grid = self._tables[key]
+        (
+            alpha_grid,
+            c_l_grid,
+            c_d_grid,
+            H_u_te_grid,
+            H_l_te_grid,
+            theta_u_te_grid,
+            theta_l_te_grid,
+        ) = self._tables[key]
         # Linear interpolation in alpha
         c_l = np.interp(alpha, alpha_grid, c_l_grid)
         c_d = np.interp(alpha, alpha_grid, c_d_grid)
@@ -191,10 +195,10 @@ class SectionForces:
 
     def section_parameters(self, phi: float) -> tuple:
         """Compute aerodynamic section parameters for a given inflow angle.
-        
+
         Args:
             phi: Inflow angle (radians).
-            
+
         Returns:
             Tuple of (alpha, c_l, c_d, loss_factor, u, a_prime, w, c_l_prime,
             c_d_prime, v_a, v_t) containing angle of attack, force coefficients,
@@ -218,24 +222,14 @@ class SectionForces:
         k_q = self.sigma * c_d_prime / (4 * loss_factor * sin_phi * cos_phi)
 
         # Compute velocity components
-        u = (
-            self.params.omega
-            * self.r
-            * k_t
-            / (1 + k_q)
-        )
+        u = self.params.omega * self.r * k_t / (1 + k_q)
         a_prime = k_q / (1 + k_q)
         v_a = self.v_inf + u
         v_t = self.params.omega * self.r * (1 - a_prime)
         w = np.sqrt(v_a**2 + v_t**2)
 
         # Update Reynolds and Mach numbers for next iteration
-        self.re = (
-            self.params.rho
-            * w
-            * self.chord
-            / self.params.mu
-        )
+        self.re = self.params.rho * w * self.chord / self.params.mu
         self.ma = w / self.params.a_inf
 
         return (
@@ -254,10 +248,10 @@ class SectionForces:
 
     def residual_function(self, phi: float) -> float:
         """Residual of the inflow angle equation for root finding.
-        
+
         Args:
             phi: Inflow angle to evaluate (radians).
-            
+
         Returns:
             Residual value; root is where this equals zero.
         """
@@ -282,31 +276,24 @@ class SectionForces:
         prev_phi: float | None = None,
     ) -> tuple:
         """Solve for inflow angle and return section forces and kinematics.
-        
+
         Uses iterative root finding to solve the momentum equation. If a previous
         inflow angle is provided, uses it to define a tighter bracket for faster
         convergence.
-        
+
         Args:
             v_inf: Freestream velocity (m/s).
             prev_phi: Previous section inflow angle (radians) for bracket initialization.
-            
+
         Returns:
             Tuple of (phi, d_t, d_q, alpha, u, a_prime, c_l, c_d, loss_factor,
             w, reynolds, mach, delta_star_upper, delta_star_lower) containing
             inflow angle, forces, and boundary layer displacement thicknesses.
         """
         self.v_inf = v_inf
-        v_local = np.sqrt(
-            self.v_inf**2 + (self.params.omega * self.r) ** 2
-        )
+        v_local = np.sqrt(self.v_inf**2 + (self.params.omega * self.r) ** 2)
         self.ma = v_local / self.params.a_inf
-        self.re = (
-            self.params.rho
-            * v_local
-            * self.chord
-            / self.params.mu
-        )
+        self.re = self.params.rho * v_local * self.chord / self.params.mu
 
         # Define bounds for inflow angle
         phi_min_default = np.radians(0.1)
@@ -384,15 +371,7 @@ class SectionForces:
         ) = self.section_parameters(phi)
 
         # Compute local thrust and torque
-        d_t = (
-            self.sigma
-            * np.pi
-            * self.params.rho
-            * w**2
-            * c_l_prime
-            * self.r
-            * self.dr
-        )
+        d_t = self.sigma * np.pi * self.params.rho * w**2 * c_l_prime * self.r * self.dr
         d_q = (
             self.sigma
             * np.pi
