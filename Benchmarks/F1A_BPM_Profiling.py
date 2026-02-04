@@ -2,8 +2,6 @@ import pickle
 import torch
 import pyfar as pf
 import numpy as np
-import os
-import sys
 
 # 1. Import NVTX for labeling the timeline
 import torch.cuda.nvtx as nvtx

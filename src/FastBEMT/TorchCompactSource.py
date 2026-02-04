@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Union, Tuple, Optional
+from typing import Union
 
 
 __all__ = ["F1A"]

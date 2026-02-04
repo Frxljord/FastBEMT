@@ -386,6 +386,7 @@ class Propeller:
                 boat_tail_angle=self.geometry["boat_tail_angle"],
                 src_times=self.params.src_times_one_rotation,
                 a_inf=self.params.a_inf,
+                rho=self.params.rho,
                 omega=self.params.omega,
                 blade_angles=self.params.blade_angles,
                 twist=self.geometry["twist"],
@@ -399,22 +400,12 @@ class Propeller:
             )
 
             # Compute retarded times for acoustic propagation
-            f1a_obs_times = self._time_cuda(
+            obs_times = self._time_cuda(
                 self.get_observer_times,
                 pos_fixed=acoustic_array.pos_fixed,
                 src_times=self.params.src_times,
                 observers=observer_positions,
-                label="get_observer_times (F1A)",
-            )
-
-            bpm_obs_times = self._time_cuda(
-                self.get_observer_times,
-                pos_fixed=acoustic_array.pos_fixed[
-                    : self.params.num_obs_times_per_rev, ...
-                ],
-                src_times=self.params.src_times_one_rotation,
-                observers=observer_positions,
-                label="get_observer_times (BPM)",
+                label="get_observer_times",
             )
 
             # Calculate F1A pressure contributions
@@ -425,19 +416,20 @@ class Propeller:
             )
 
             # Interpolate F1A pressures to uniform observer time grid
-            f1a_max_time = torch.max(f1a_obs_times[0, :, :], dim=0)[0]
+            latest_reception_start_time = torch.amax(obs_times[0, :, :, :], dim=(0, 1))
             f1a_output_times = (
-                f1a_max_time[None, :]
+                latest_reception_start_time[None, :]
                 + torch.linspace(
                     0,
                     self.params.observer_time_range,
                     self.params.num_obs_times,
                     device=self.device,
                 )[:, None]
+
             )
             self._time_cuda(
                 self.combine_sources,
-                obs_times=f1a_obs_times,
+                obs_times=obs_times,
                 output_times=f1a_output_times,
                 f1a_output=f1a_output,
                 label="combine_sources (F1A)",
@@ -449,27 +441,20 @@ class Propeller:
                 label="_perform_spectral_analysis_torch",
             )
 
+            bpm_obs_times = obs_times[:self.params.num_obs_times_per_rev]
+            bpm_output_times = f1a_output_times[:self.params.num_obs_times_per_rev]
+
             # Compute BPM noise contributions
             bpm_output = self._time_cuda(
                 bpm.run_forward_bpm,
                 self.observer_positions,
+                bpm_obs_times,
+                bpm_output_times,
                 label="BPM.run_forward_bpm",
             )
 
-            # Interpolate BPM pressures to uniform observer time grid
-            bpm_max_time = torch.max(bpm_obs_times[0, :, :], dim=0)[0]
-            bpm_output_times = (
-                bpm_max_time[None, :]
-                + torch.linspace(
-                    0,
-                    self.params.observer_time_range / self.params.revolutions,
-                    self.params.num_obs_times // self.params.revolutions,
-                    device=self.device,
-                )[:, None]
-            )
             self._time_cuda(
                 self.combine_sources_bpm,
-                obs_times=bpm_obs_times,
                 output_times=bpm_output_times,
                 bpm_output=bpm_output,
                 keep_components=keep_bpm_components,
@@ -478,59 +463,33 @@ class Propeller:
 
     def combine_sources_bpm(
         self,
-        obs_times: Union[torch.Tensor, np.ndarray],
         output_times: Union[torch.Tensor, np.ndarray],
         bpm_output: Dict[str, torch.Tensor],
         keep_components: bool = True,
     ) -> None:
-        nf, nt, ns, nb, no = bpm_output["tbl"].shape
         self.spl_breakdown: Dict[str, torch.Tensor] = {}
 
-        # Expand observer times to match frequency dimension
-        t_raw_expanded = obs_times.repeat(1, nf, 1)
-
-        # If the user requests to sum components before interpolation,
-        # perform the sum first and interpolate only the combined signal.
         if not keep_components:
             # Sum all BPM component tensors
-            combined: Optional[torch.Tensor] = None
+            spp_interp_total: Optional[torch.Tensor] = None
             for v in bpm_output.values():
-                if combined is None:
-                    combined = v.clone()
+                if spp_interp_total is None:
+                    spp_interp_total = v.clone()
                 else:
-                    combined = combined + v
-
-            # Reshape for interpolation: (nt, n_freq * ns * nb, no)
-            assert combined is not None
-            combined_flat = combined.permute(1, 0, 2, 3, 4).reshape(nt, -1, no)
-
-            # Interpolate only the summed signal
-            spp_interp_total = self._interp_bpm_vectorized(
-                output_times, t_raw_expanded, combined_flat, nf
-            )
-
+                    spp_interp_total = spp_interp_total + v
         else:
             # Interpolate each BPM component separately
             spp_interp_total = torch.zeros(
-                (nf, output_times.shape[0], no), device=self.device
+                (self.third_octave_freqs.shape[0], output_times.shape[0], self.observer_positions.shape[0]), device=self.device
             )
 
             for name, spp_raw in bpm_output.items():
-                # Reshape for interpolation: (nt, n_freq * ns * nb, no)
-                spp_raw_flat = spp_raw.permute(1, 0, 2, 3, 4).reshape(nt, -1, no)
-
-                # Vectorized interpolation
-                spp_interp = self._interp_bpm_vectorized(
-                    output_times, t_raw_expanded, spp_raw_flat, nf
-                )
-
                 # Accumulate for total
-                spp_interp_total += spp_interp
-
+                spp_interp_total += spp_raw
                 # Calculate and store individual component SPL
                 self.spl_breakdown[name] = 10 * torch.log10(
-                    spp_interp.mean(dim=1) + 1e-12
-                )
+                    spp_raw.mean(dim=1) + 1e-12
+                ).cpu().numpy()
 
         # Final Total SPL (acoustic pressure squared level)
         self.spl_total = 10 * torch.log10(spp_interp_total.mean(dim=1) + 1e-12)
@@ -555,17 +514,13 @@ class Propeller:
                 Shape: (n_times, n_sources, n_blades, n_observers, 2).
         """
 
-        nt, ns, nb, no, _ = f1a_output.shape
-
         # Extract monopole and dipole contributions and reshape
-        p_m_raw = f1a_output[..., 0].reshape(nt, -1, no)
-        p_d_raw = f1a_output[..., 1].reshape(nt, -1, no)
-
         # Interpolate monopole and dipole contributions to uniform time grid
-        self.p_m = self._interp_tensor_vectorized(output_times, obs_times, p_m_raw)
-        self.p_d = self._interp_tensor_vectorized(output_times, obs_times, p_d_raw)
+        self.p_m = self._interp_tensor_vectorized(output_times, obs_times, f1a_output[..., 0])
+        self.p_d = self._interp_tensor_vectorized(output_times, obs_times, f1a_output[..., 1])
 
         # Compute total pressure and remove mean (DC offset)
+        self.t = output_times
         self.p_tot = self.p_m + self.p_d
         self.p_tot -= torch.mean(self.p_tot, dim=0)
 
@@ -575,49 +530,52 @@ class Propeller:
         x_old: torch.Tensor,
         y_old: torch.Tensor,
     ) -> torch.Tensor:
-        """Perform full vectorized linear interpolation on GPU tensors.
-
-        Efficiently interpolates multi-dimensional data using PyTorch's
-        searchsorted and gather operations for GPU acceleration.
+        """Perform vectorized linear interpolation on 4D GPU tensors.
 
         Args:
-            x_new: New x-coordinates for interpolation.
-                Shape: (n_steps, n_observers).
-            x_old: Original x-coordinates.
-                Shape: (n_src_times, n_sources, n_observers).
-            y_old: Original y-values.
-                Shape: (n_src_times, n_sources, n_observers).
+            x_new: (n_steps, n_observers)
+            x_old: (n_src_times, n_sections, n_blades, n_observers)
+            y_old: (n_src_times, n_sections, n_blades, n_observers)
 
         Returns:
-            Interpolated values at x_new coordinates.
-            Shape: (n_steps, n_observers).
+            Shape: (n_steps, n_observers)
         """
-        nt, n_src, _ = x_old.shape
+        nt, n_sec, n_b, n_obs = x_old.shape
+        n_steps = x_new.shape[0]
 
-        # Permute for searchsorted (operates on last dimension)
-        # Permute from (nt, n_src, no) to (no, n_src, nt)
-        x_old_p = x_old.permute(2, 1, 0).contiguous()
-        y_old_p = y_old.permute(2, 1, 0).contiguous()
+        # 1. Permute to put time (interpolation dim) at the end
+        # From (nt, n_sec, n_b, no) -> (no, n_sec, n_b, nt)
+        x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
+        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()
 
-        # Prepare x_new for searchsorted: (no, n_src, n_steps)
-        x_new_p = x_new.T.unsqueeze(1).expand(-1, n_src, -1).contiguous()
+        # 2. Prepare x_new: (n_steps, no) -> (no, n_sec, n_b, n_steps)
+        # Transpose x_new to (no, n_steps), then expand to match dimensions
+        x_new_p = x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
 
-        # Find bracketing indices using searchsorted
+        # 3. Find bracketing indices
+        # searchsorted works on the last dimension (nt)
         idx = torch.searchsorted(x_old_p, x_new_p)
         idx = torch.clamp(idx, 1, nt - 1)
 
-        # Linear interpolation using gather operations
-        x0 = torch.gather(x_old_p, 2, idx - 1)
-        x1 = torch.gather(x_old_p, 2, idx)
-        y0 = torch.gather(y_old_p, 2, idx - 1)
-        y1 = torch.gather(y_old_p, 2, idx)
+        # 4. Gather bracketing points
+        # Dim 3 is the time dimension we are interpolating within
+        x0 = torch.gather(x_old_p, 3, idx - 1)
+        x1 = torch.gather(x_old_p, 3, idx)
+        y0 = torch.gather(y_old_p, 3, idx - 1)
+        y1 = torch.gather(y_old_p, 3, idx)
 
-        # Compute linear interpolation weights and values
+        # 5. Linear interpolation formula
+        # (y - y0) / (x - x0) = (y1 - y0) / (x1 - x0)
         weights = (x_new_p - x0) / (x1 - x0 + 1e-12)
         interp_vals = y0 + weights * (y1 - y0)
 
-        # Sum across sources (dim=1) and transpose to (n_steps, n_observers)
-        return torch.sum(interp_vals, dim=1).T
+        # 6. Reduction
+        # Sum across sections (dim 1) and blades (dim 2)
+        # Result shape: (no, n_steps)
+        summed = torch.sum(interp_vals, dim=(1, 2))
+
+        # Transpose back to (n_steps, n_observers)
+        return summed.T
 
     def _perform_spectral_analysis_torch(self) -> None:
         """Compute spectral analysis using GPU-accelerated PyTorch.
@@ -721,9 +679,7 @@ class Propeller:
         speed_of_sound = torch.as_tensor(
             self.params.a_inf, dtype=self.dtype, device=self.device
         ).reciprocal()
-
-        retarded_times = src_times_tensor.add(dist.mul(speed_of_sound))
-        return retarded_times.reshape(src_times.shape[0], -1, observers.shape[0])
+        return src_times_tensor.add(dist.mul(speed_of_sound))
 
     def _time_cuda(
         self,
@@ -767,64 +723,3 @@ class Propeller:
         t1 = time.perf_counter()
         print(f"[CPU TIMING] {name}: {(t1 - t0) * 1000.0:.3f} ms")
         return result
-
-    def _interp_bpm_vectorized(
-        self,
-        x_new: torch.Tensor,
-        x_old: torch.Tensor,
-        y_old: torch.Tensor,
-        n_freq: int,
-    ) -> torch.Tensor:
-        """Vectorized interpolation for BPM preserving frequency dimension.
-
-        Performs efficient linear interpolation on GPU for BPM sound power
-        spectral density while preserving frequency bins.
-
-        Args:
-            x_new: Uniform observer time grid.
-                Shape: (n_steps, n_obs).
-            x_old: Arrival times from source-observer pairs.
-                Shape: (nt, n_freq * ns * nb, n_obs).
-            y_old: Sound power spectral density (SPP) values.
-                Shape: (nt, n_freq * ns * nb, n_obs).
-            n_freq: Number of frequency bins to preserve.
-
-        Returns:
-            Interpolated SPP with frequency structure preserved.
-            Shape: (n_freq, n_steps, n_obs).
-        """
-        nt, n_total_sources, no = x_old.shape
-        n_steps = x_new.shape[0]
-
-        # 1. Permute to (n_obs, n_sources, nt) for searchsorted on last dimension
-        x_old_p = x_old.permute(2, 1, 0).contiguous()
-        y_old_p = y_old.permute(2, 1, 0).contiguous()
-
-        # 2. Prepare x_new for broadcasting: (n_obs, n_sources, n_steps)
-        x_new_p = x_new.T.unsqueeze(1).expand(-1, n_total_sources, -1).contiguous()
-
-        # 3. Find bracketing indices for time windows
-        idx = torch.searchsorted(x_old_p, x_new_p)
-        idx = torch.clamp(idx, 1, nt - 1)
-
-        # 4. Gather neighbor points for linear interpolation
-        x0 = torch.gather(x_old_p, 2, idx - 1)
-        x1 = torch.gather(x_old_p, 2, idx)
-        y0 = torch.gather(y_old_p, 2, idx - 1)
-        y1 = torch.gather(y_old_p, 2, idx)
-
-        # 5. Perform linear interpolation
-        weights = (x_new_p - x0) / (x1 - x0 + 1e-12)
-        interp_vals = y0 + weights * (y1 - y0)
-
-        # 6. Separate frequency and physical source dimensions
-        # Current shape: (n_obs, n_freq * ns * nb, n_steps)
-        ns_nb = n_total_sources // n_freq
-        reshaped = interp_vals.view(no, n_freq, ns_nb, n_steps)
-
-        # 7. Sum across physical sources (ns, nb), keeping frequency separate
-        # Result: (n_obs, n_freq, n_steps)
-        spp_summed = torch.sum(reshaped, dim=2)
-
-        # 8. Permute to output shape: (n_freq, n_steps, n_obs)
-        return spp_summed.permute(1, 2, 0)

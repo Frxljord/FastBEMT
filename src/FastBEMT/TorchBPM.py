@@ -749,6 +749,9 @@ def g5_tot(q: torch.Tensor, eta: torch.Tensor, psi: torch.Tensor) -> torch.Tenso
     correction = (
         0.0714 * psi * torch.where(delta_g5 < 0, delta_g5, torch.zeros_like(delta_g5))
     )
+    # correction = (
+    #     0.0714 * psi * delta_g5
+    # )
     return g5_0_val + correction
 
 
@@ -763,61 +766,6 @@ def calc_l_tip(chord: torch.Tensor, alpha_tip: torch.Tensor) -> torch.Tensor:
         Tip length scale tensor
     """
     return chord * 0.008 * alpha_tip
-
-
-def phi_ww(
-    f: torch.Tensor,
-    u: torch.Tensor,
-    sigma: torch.Tensor,
-    l: torch.Tensor,
-) -> torch.Tensor:
-    """Compute Wittenberg-White spectral density function for turbulence.
-
-    Args:
-        f: Frequency tensor (Hz)
-        u: Velocity tensor (m/s)
-        sigma: Turbulence intensity tensor
-        l: Turbulence length scale tensor (m)
-
-    Returns:
-        Spectral density tensor
-    """
-    k1 = 2 * np.pi * f / u
-    num = 2 * sigma**2 * l / np.pi
-    denom = (1 + (1.339 * l * k1) ** 2) ** (5 / 6)
-    return num / denom
-
-
-def amiet_l(
-    omega: torch.Tensor,
-    u: torch.Tensor,
-    l: torch.Tensor,
-    y: torch.Tensor,
-    sigma: torch.Tensor,
-    a_inf: float,
-    xi: float,
-) -> torch.Tensor:
-    """Compute Amiet spatial coherence length for turbulence-interaction noise.
-
-    Args:
-        omega: Angular frequency tensor (rad/s)
-        u: Velocity tensor (m/s)
-        l: Turbulence length scale tensor (m)
-        y: Spanwise separation tensor (m)
-        sigma: Turbulence intensity tensor
-        a_inf: Ambient sound speed (m/s)
-        xi: Coherence damping parameter (dimensionless)
-
-    Returns:
-        Coherence length tensor (m)
-    """
-    return (
-        2
-        * l
-        * (xi * omega / u)
-        / ((xi * omega / u) ** 2 + (omega * y / a_inf / sigma) ** 2)
-    )
-
 
 class BPM:
     """BPM broadband noise prediction model using PyTorch.
@@ -844,6 +792,7 @@ class BPM:
         boat_tail_angle: Union[np.ndarray, float],
         src_times: Union[np.ndarray, torch.Tensor],
         a_inf: float,
+        rho: float,
         omega: float,
         blade_angles: Union[np.ndarray, torch.Tensor],
         twist: Union[np.ndarray, torch.Tensor],
@@ -893,6 +842,7 @@ class BPM:
         # Acoustic & kinematic parameters
         self.tau = torch.as_tensor(src_times, dtype=self.dtype, device=self.device)
         self.a_inf = torch.tensor(a_inf, dtype=self.dtype, device=self.device)
+        self.rho = torch.tensor(rho, dtype=self.dtype, device=self.device)
         self.omega = torch.tensor(omega, dtype=self.dtype, device=self.device)
         self.blade_angles = torch.as_tensor(
             blade_angles, dtype=self.dtype, device=self.device
@@ -919,8 +869,6 @@ class BPM:
             self.r.shape[0],
             self.blade_angles.shape[0],
         )
-
-        self.generate_trajectory_and_basis()
 
     def generate_trajectory_and_basis(self) -> None:
         """Generate 4D blade element trajectory and time-varying local basis vectors.
@@ -1011,10 +959,10 @@ class BPM:
                 - r_mag: Distance from source to observer (m)
                 - dh_te: Trailing edge directivity factor (dimensionless)
                 - dh_le: Leading edge directivity factor (dimensionless)
-                - dl: Dipole/low-frequency directivity factor (dimensionless)
+                - dl: Low-frequency directivity factor (dimensionless)
         """
         # r_vec: (nt, ns, nb, n_obs, 3)
-        r_vec = r_obs[None, None, None, :, :] - self.pos_fixed[..., None, :]
+        r_vec = r_obs[None, None, None, :, :] - self.pos_fixed
         r_mag = torch.linalg.norm(r_vec, dim=-1)
         inv_r = 1.0 / r_mag
         unit_r = r_vec * inv_r[..., None]
@@ -1048,7 +996,9 @@ class BPM:
         return r_mag, dh_te, dh_le, dl
 
     def run_forward_bpm(
-        self, observer_positions: np.ndarray
+        self, observer_positions: np.ndarray,
+        bpm_obs_times,
+        bpm_output_times
     ) -> dict[str, torch.Tensor]:
         """Run full BPM suite and return individual SPL component tensors.
 
@@ -1073,6 +1023,9 @@ class BPM:
             observer_positions, dtype=self.dtype, device=self.device
         )
 
+        self.generate_trajectory_and_basis()
+        self.pos_fixed = self.interpolate_positions(bpm_output_times, bpm_obs_times, self.pos_fixed)
+
         # 1. Geometry and Base Values at Emission Time
         r_mag, dh_te, dh_le, dl = self.get_emission_geometry(r_obs)
 
@@ -1084,11 +1037,11 @@ class BPM:
 
         # 2. Compute Raw SPP Tensors (5D: n_freq, nt, ns, nb, n_obs)
         components_raw = {
-            "tbl": self.tbl_noise(alpha_stall=15.0),
-            "lbl": self.lbl_noise(),
-            "teb": self.teb_noise(),
-            "ti": self.ti_noise(lt=1e6, i=0.01),
-            "tv": self.tv_noise(),
+            "tbl": self.tbl_noise(alpha_stall=15.0).sum(dim=(2,3)),
+            "lbl": self.lbl_noise().sum(dim=(2,3)),
+            "teb": self.teb_noise().sum(dim=(2,3)),
+            "ti": self.ti_noise(lt=1e4, i=0.001).sum(dim=(2,3)),
+            "tv": self.tv_noise().sum(dim=(2,3)),
         }
         return components_raw
 
@@ -1118,8 +1071,9 @@ class BPM:
             2.0
             * np.pi
             * self.frequencies[:, None]
-            / torch.clamp(self.u[None, :], min=0.1)
+            / self.u[None, :]
         )  # (nf, ns)
+        
         k1_bar = k1_val * self.chord[None, :] * 0.5  # (nf, ns)
 
         # Reshape for 5D: (nf, 1, ns, 1, 1)
@@ -1136,22 +1090,21 @@ class BPM:
         k1_beta = k1_bar / beta_sq[None, :]  # (nf, ns)
         denom = 2.0 * np.pi * k1_beta + 1.0 / (1.0 + 2.4 * k1_beta)
         s_sq = 1.0 / denom
-        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar**-2) / beta_sq[None, :]
+        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar**(-2)) / beta_sq[None, :]
         lfc_term = torch.clamp(lfc / (1.0 + lfc), min=1e-15)  # (nf, ns)
         lfc_5d = lfc_term[:, None, :, None, None]
 
         # Spectral power density
         k1_hat = k1_val / (3.0 / (4.0 * lt))  # (nf, ns)
         phi_term = (k1_hat**3) / ((1.0 + k1_hat**2) ** (7.0 / 3.0))  # (nf, ns)
-        phi_5d = phi_term[:, None, :, None, None]
 
         # Alpha term
-        alpha_sq = (torch.deg2rad(self.alpha) ** 2)[
+        alpha_sq = (self.alpha ** 2)[
             None, None, :, None, None
         ]  # (1, 1, ns, 1, 1)
 
-        # Compute SPL and return SPP
-        inner_val = (self.a_inf**4) * lt * 0.5 * (i**2) * phi_5d * bv_ti
+        inner_val = (self.rho**2) * (self.a_inf**4) * lt * 0.5 * (i**2) * phi_term.view(30, 1, 36, 1, 1) * bv_ti
+
         spl_ti = (
             10.0 * torch.log10(torch.clamp(inner_val, min=1e-20))
             + 78.4
@@ -1174,7 +1127,7 @@ class BPM:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
         h_val = (
-            (self.chord * 1e-2) if h is None else torch.full_like(self.chord, h)
+            (self.chord * 1e-5) if h is None else torch.full_like(self.chord, h)
         )  # (ns,)
 
         delta_avg = (self.delta_p + self.delta_s) * 0.5  # (ns,)
@@ -1352,3 +1305,111 @@ class BPM:
         spp_full[:, :, -1:, :, :] = 10 ** (spl_tip / 10)
 
         return spp_full
+
+    def _interp_tensor_vectorized(
+        self,
+        x_new: torch.Tensor,
+        x_old: torch.Tensor,
+        y_old: torch.Tensor,
+    ) -> torch.Tensor:
+        """Perform vectorized linear interpolation on 4D GPU tensors.
+
+        Args:
+            x_new: (n_steps, n_observers)
+            x_old: (n_src_times, n_sections, n_blades, n_observers)
+            y_old: (n_src_times, n_sections, n_blades, n_observers)
+
+        Returns:
+            Shape: (n_steps, n_observers)
+        """
+        nt, n_sec, n_b, n_obs = x_old.shape
+        n_steps = x_new.shape[0]
+
+        # 1. Permute to put time (interpolation dim) at the end
+        # From (nt, n_sec, n_b, no) -> (no, n_sec, n_b, nt)
+        x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
+        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()
+
+        # 2. Prepare x_new: (n_steps, no) -> (no, n_sec, n_b, n_steps)
+        # Transpose x_new to (no, n_steps), then expand to match dimensions
+        x_new_p = x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+
+        # 3. Find bracketing indices
+        # searchsorted works on the last dimension (nt)
+        idx = torch.searchsorted(x_old_p, x_new_p)
+        idx = torch.clamp(idx, 1, nt - 1)
+
+        # 4. Gather bracketing points
+        # Dim 3 is the time dimension we are interpolating within
+        x0 = torch.gather(x_old_p, 3, idx - 1)
+        x1 = torch.gather(x_old_p, 3, idx)
+        y0 = torch.gather(y_old_p, 3, idx - 1)
+        y1 = torch.gather(y_old_p, 3, idx)
+
+        # 5. Linear interpolation formula
+        # (y - y0) / (x - x0) = (y1 - y0) / (x1 - x0)
+        weights = (x_new_p - x0) / (x1 - x0 + 1e-12)
+        interp_vals = y0 + weights * (y1 - y0)
+
+        # 6. Reduction
+        # Sum across sections (dim 1) and blades (dim 2)
+        # Result shape: (no, n_steps)
+        summed = torch.sum(interp_vals, dim=(1, 2))
+
+        # Transpose back to (n_steps, n_observers)
+        return summed.T
+    
+    def interpolate_positions(self, x_new, x_old, y_old):
+        """
+        x_new: (n_steps, n_obs)
+        x_old: (nt, n_sec, n_b, n_obs)
+        y_old: (nt, n_sec, n_b, 3)  <-- These are (x, y, z)
+        
+        Desired Output: (n_steps, n_sec, n_b, n_obs, 3)
+        """
+        nt, n_sec, n_b, _ = x_old.shape
+        n_steps, n_obs = x_new.shape
+
+        # 1. Prepare x_old: (n_obs, n_sec, n_b, nt)
+        x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
+
+        # 2. Prepare x_new: (n_obs, n_sec, n_b, n_steps)
+        x_new_p = x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+
+        # 3. Find bracketing indices: (n_obs, n_sec, n_b, n_steps)
+        idx = torch.searchsorted(x_old_p, x_new_p)
+        idx = torch.clamp(idx, 1, nt - 1)
+
+        # 4. Prepare y_old for broadcasting:
+        # Current y_old: (nt, n_sec, n_b, 3)
+        # We want it to be: (3, n_sec, n_b, nt) to match the logic of x_old_p
+        # Then we will need to handle the fact that y_old doesn't have an 'n_obs' dim.
+        y_old_p = y_old.permute(3, 1, 2, 0).contiguous() # (3, n_sec, n_b, nt)
+
+        # 5. Gather bracketing points
+        # Since y doesn't depend on n_obs, but x_new does, we expand y_old_p
+        # to (3, n_obs, n_sec, n_b, nt)
+        y_old_exp = y_old_p.unsqueeze(1).expand(-1, n_obs, -1, -1, -1)
+        
+        # We need to expand idx to match y_old_exp's coordinate dimension
+        # idx: (n_obs, n_sec, n_b, n_steps) -> (3, n_obs, n_sec, n_b, n_steps)
+        idx_exp = idx.unsqueeze(0).expand(3, -1, -1, -1, -1)
+
+        y0 = torch.gather(y_old_exp, 4, idx_exp - 1)
+        y1 = torch.gather(y_old_exp, 4, idx_exp)
+
+        # 6. Gather x values (already have n_obs dimension)
+        x0 = torch.gather(x_old_p, 3, idx - 1)
+        x1 = torch.gather(x_old_p, 3, idx)
+
+        # 7. Calculate weights and interpolate
+        # x0, x1, x_new_p are (n_obs, n_sec, n_b, n_steps)
+        # y0, y1 are (3, n_obs, n_sec, n_b, n_steps)
+        t = (x_new_p - x0) / (x1 - x0 + 1e-12)
+        
+        # Use broadcasting: (3, n_obs, n_sec, n_b, n_steps)
+        interp_vals = y0 + t.unsqueeze(0) * (y1 - y0)
+
+        # 8. Permute to final shape: (n_steps, n_sec, n_b, n_obs, 3)
+        # Current: (3, n_obs, n_sec, n_b, n_steps)
+        return interp_vals.permute(4, 2, 3, 1, 0)

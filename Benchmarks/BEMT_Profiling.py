@@ -4,7 +4,6 @@ import pstats
 import subprocess
 from FastBEMT.Propeller import Propeller
 from FastBEMT.JobParameters import LowFidelityParameters
-from FastBEMT.TorchBPM import BPM
 
 with open("Datasets/Propellers/10x7E.pkl", "rb") as f:
     blade_dict = pickle.load(f)

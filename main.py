@@ -1,12 +1,9 @@
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import pyfar as pf
 import torch
 from FastBEMT.Propeller import Propeller
 from FastBEMT.JobParameters import LowFidelityParameters
-from FastBEMT.TorchBPM import BPM
 
 
 def main() -> None:
