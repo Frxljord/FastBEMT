@@ -294,6 +294,9 @@ class Propeller:
         observer_positions: np.ndarray,
         local_dT: Optional[np.ndarray] = None,
         local_dQ: Optional[np.ndarray] = None,
+        lt=1,
+        i=0.01,
+        alpha_stall=15,
         keep_bpm_components: bool = True,
     ) -> None:
         """Initialize acoustic array and compute total pressure at observer locations.
@@ -449,6 +452,9 @@ class Propeller:
                 self.observer_positions,
                 bpm_obs_times,
                 bpm_output_times,
+                lt,
+                i,
+                alpha_stall,
                 label="BPM.run_forward_bpm",
             )
 

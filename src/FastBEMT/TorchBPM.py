@@ -970,22 +970,20 @@ class BPM:
 
         # Projections onto local basis
         # obs_xl is cos(theta)
-        obs_xl = torch.sum(unit_r * self.e_xl[:, None, :, None, :], dim=-1)
-        obs_yl = torch.sum(unit_r * self.e_yl[:, None, :, None, :], dim=-1)
-        obs_zl = torch.sum(unit_r * self.e_zl[:, None, :, None, :], dim=-1)
+        obs_xl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_xl)
+        obs_yl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_yl)
+        obs_zl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_zl)
 
-        # sin^2(phi) = zl^2 / (yl^2 + zl^2)
-        sin_phi_sq = (obs_zl**2) / (obs_yl**2 + obs_zl**2 + 1e-12)
+        phi = torch.atan2(obs_xl, obs_yl)
+        theta = torch.atan2(obs_yl * torch.cos(phi) + obs_xl * torch.sin(phi), obs_zl)
 
-        # Directivity Identities
-        # 2 * sin^2(theta/2) = 1 - cos(theta)
-        # 2 * cos^2(theta/2) = 1 + cos(theta)
-        two_sin_theta_2_sq = 1.0 - obs_xl
-        two_cos_theta_2_sq = 1.0 + obs_xl
-        sin_theta_sq = 1.0 - obs_xl**2
+        sin_phi_sq = torch.sin(phi) ** 2
+        two_sin_theta_2_sq = 2 * torch.sin(theta / 2) ** 2
+        two_cos_theta_2_sq = 2 * torch.cos(theta / 2) ** 2
+        sin_theta_sq = torch.sin(theta) ** 2
 
         m = self.m[None, :, None, None]
-        doppler = 1.0 + m * obs_xl
+        doppler = 1.0 + m * torch.cos(theta)
 
         # Doppler-corrected Directivity Factors
         dh_te = (two_sin_theta_2_sq * sin_phi_sq) / (
@@ -994,10 +992,30 @@ class BPM:
         dh_le = (two_cos_theta_2_sq * sin_phi_sq) / (doppler**3)
         dl = (sin_theta_sq * sin_phi_sq) / (doppler**4)
 
+        # sin^2(phi) = zl^2 / (yl^2 + zl^2)
+        # sin_phi_sq = (obs_zl**2) / (obs_yl**2 + obs_zl**2 + 1e-12)
+
+        # # Directivity Identities
+        # # 2 * sin^2(theta/2) = 1 - cos(theta)
+        # # 2 * cos^2(theta/2) = 1 + cos(theta)
+        # two_sin_theta_2_sq = 1.0 - obs_xl
+        # two_cos_theta_2_sq = 1.0 + obs_xl
+        # sin_theta_sq = 1.0 - obs_xl**2
+
+        # m = self.m[None, :, None, None]
+        # doppler = 1.0 + m * obs_xl
+
+        # # Doppler-corrected Directivity Factors
+        # dh_te = (two_sin_theta_2_sq * sin_phi_sq) / (
+        #     doppler * (1.0 + 0.2 * m * obs_xl) ** 2
+        # )
+        # dh_le = (two_cos_theta_2_sq * sin_phi_sq) / (doppler**3)
+        # dl = (sin_theta_sq * sin_phi_sq) / (doppler**4)
+
         return r_mag, dh_te, dh_le, dl
 
     def run_forward_bpm(
-        self, observer_positions: np.ndarray, bpm_obs_times, bpm_output_times
+        self, observer_positions: np.ndarray, bpm_obs_times, bpm_output_times, lt, i, alpha_stall
     ) -> dict[str, torch.Tensor]:
         """Run full BPM suite and return individual SPL component tensors.
 
@@ -1038,15 +1056,15 @@ class BPM:
 
         # 2. Compute Raw SPP Tensors (5D: n_freq, nt, ns, nb, n_obs)
         components_raw = {
-            "tbl": self.tbl_noise(alpha_stall=15.0).sum(dim=(2, 3)),
+            "tbl": self.tbl_noise(alpha_stall=alpha_stall).sum(dim=(2, 3)),
             "lbl": self.lbl_noise().sum(dim=(2, 3)),
             "teb": self.teb_noise().sum(dim=(2, 3)),
-            "ti": self.ti_noise(lt=1e4, i=0.001).sum(dim=(2, 3)),
+            "ti": self.ti_noise(lt=lt, i=i).sum(dim=(2, 3)),
             "tv": self.tv_noise().sum(dim=(2, 3)),
         }
         return components_raw
 
-    def ti_noise(self, lt: float = 1e6, i: float = 0.01) -> torch.Tensor:
+    def ti_noise(self, lt: float, i: float) -> torch.Tensor:
         """Compute turbulence ingestion (TI) broadband noise.
 
         Models the interaction of ingested turbulence with the blade surfaces,
@@ -1086,7 +1104,7 @@ class BPM:
         k1_beta = k1_bar / beta_sq[None, :]  # (nf, ns)
         denom = 2.0 * np.pi * k1_beta + 1.0 / (1.0 + 2.4 * k1_beta)
         s_sq = 1.0 / denom
-        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar ** (-2)) / beta_sq[None, :]
+        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar ** 2) / beta_sq[None, :]
         lfc_term = torch.clamp(lfc / (1.0 + lfc), min=1e-15)  # (nf, ns)
         lfc_5d = lfc_term[:, None, :, None, None]
 
@@ -1103,7 +1121,7 @@ class BPM:
             * lt
             * 0.5
             * (i**2)
-            * phi_term.view(30, 1, 36, 1, 1)
+            * phi_term.view(self.frequencies.shape[0], 1, self.ns, 1, 1)
             * bv_ti
         )
 
