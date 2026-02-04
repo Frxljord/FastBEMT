@@ -425,7 +425,6 @@ class Propeller:
                     self.params.num_obs_times,
                     device=self.device,
                 )[:, None]
-
             )
             self._time_cuda(
                 self.combine_sources,
@@ -441,8 +440,8 @@ class Propeller:
                 label="_perform_spectral_analysis_torch",
             )
 
-            bpm_obs_times = obs_times[:self.params.num_obs_times_per_rev]
-            bpm_output_times = f1a_output_times[:self.params.num_obs_times_per_rev]
+            bpm_obs_times = obs_times[: self.params.num_obs_times_per_rev]
+            bpm_output_times = f1a_output_times[: self.params.num_obs_times_per_rev]
 
             # Compute BPM noise contributions
             bpm_output = self._time_cuda(
@@ -480,16 +479,21 @@ class Propeller:
         else:
             # Interpolate each BPM component separately
             spp_interp_total = torch.zeros(
-                (self.third_octave_freqs.shape[0], output_times.shape[0], self.observer_positions.shape[0]), device=self.device
+                (
+                    self.third_octave_freqs.shape[0],
+                    output_times.shape[0],
+                    self.observer_positions.shape[0],
+                ),
+                device=self.device,
             )
 
             for name, spp_raw in bpm_output.items():
                 # Accumulate for total
                 spp_interp_total += spp_raw
                 # Calculate and store individual component SPL
-                self.spl_breakdown[name] = 10 * torch.log10(
-                    spp_raw.mean(dim=1) + 1e-12
-                ).cpu().numpy()
+                self.spl_breakdown[name] = (
+                    10 * torch.log10(spp_raw.mean(dim=1) + 1e-12).cpu().numpy()
+                )
 
         # Final Total SPL (acoustic pressure squared level)
         self.spl_total = 10 * torch.log10(spp_interp_total.mean(dim=1) + 1e-12)
@@ -516,8 +520,12 @@ class Propeller:
 
         # Extract monopole and dipole contributions and reshape
         # Interpolate monopole and dipole contributions to uniform time grid
-        self.p_m = self._interp_tensor_vectorized(output_times, obs_times, f1a_output[..., 0])
-        self.p_d = self._interp_tensor_vectorized(output_times, obs_times, f1a_output[..., 1])
+        self.p_m = self._interp_tensor_vectorized(
+            output_times, obs_times, f1a_output[..., 0]
+        )
+        self.p_d = self._interp_tensor_vectorized(
+            output_times, obs_times, f1a_output[..., 1]
+        )
 
         # Compute total pressure and remove mean (DC offset)
         self.t = output_times
@@ -550,7 +558,9 @@ class Propeller:
 
         # 2. Prepare x_new: (n_steps, no) -> (no, n_sec, n_b, n_steps)
         # Transpose x_new to (no, n_steps), then expand to match dimensions
-        x_new_p = x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+        x_new_p = (
+            x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+        )
 
         # 3. Find bracketing indices
         # searchsorted works on the last dimension (nt)

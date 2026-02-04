@@ -767,6 +767,7 @@ def calc_l_tip(chord: torch.Tensor, alpha_tip: torch.Tensor) -> torch.Tensor:
     """
     return chord * 0.008 * alpha_tip
 
+
 class BPM:
     """BPM broadband noise prediction model using PyTorch.
 
@@ -996,9 +997,7 @@ class BPM:
         return r_mag, dh_te, dh_le, dl
 
     def run_forward_bpm(
-        self, observer_positions: np.ndarray,
-        bpm_obs_times,
-        bpm_output_times
+        self, observer_positions: np.ndarray, bpm_obs_times, bpm_output_times
     ) -> dict[str, torch.Tensor]:
         """Run full BPM suite and return individual SPL component tensors.
 
@@ -1024,7 +1023,9 @@ class BPM:
         )
 
         self.generate_trajectory_and_basis()
-        self.pos_fixed = self.interpolate_positions(bpm_output_times, bpm_obs_times, self.pos_fixed)
+        self.pos_fixed = self.interpolate_positions(
+            bpm_output_times, bpm_obs_times, self.pos_fixed
+        )
 
         # 1. Geometry and Base Values at Emission Time
         r_mag, dh_te, dh_le, dl = self.get_emission_geometry(r_obs)
@@ -1037,11 +1038,11 @@ class BPM:
 
         # 2. Compute Raw SPP Tensors (5D: n_freq, nt, ns, nb, n_obs)
         components_raw = {
-            "tbl": self.tbl_noise(alpha_stall=15.0).sum(dim=(2,3)),
-            "lbl": self.lbl_noise().sum(dim=(2,3)),
-            "teb": self.teb_noise().sum(dim=(2,3)),
-            "ti": self.ti_noise(lt=1e4, i=0.001).sum(dim=(2,3)),
-            "tv": self.tv_noise().sum(dim=(2,3)),
+            "tbl": self.tbl_noise(alpha_stall=15.0).sum(dim=(2, 3)),
+            "lbl": self.lbl_noise().sum(dim=(2, 3)),
+            "teb": self.teb_noise().sum(dim=(2, 3)),
+            "ti": self.ti_noise(lt=1e4, i=0.001).sum(dim=(2, 3)),
+            "tv": self.tv_noise().sum(dim=(2, 3)),
         }
         return components_raw
 
@@ -1067,13 +1068,8 @@ class BPM:
 
         # Frequency-dependent parameters
         f_co = 10.0 * self.u / (np.pi * self.chord)  # (ns,)
-        k1_val = (
-            2.0
-            * np.pi
-            * self.frequencies[:, None]
-            / self.u[None, :]
-        )  # (nf, ns)
-        
+        k1_val = 2.0 * np.pi * self.frequencies[:, None] / self.u[None, :]  # (nf, ns)
+
         k1_bar = k1_val * self.chord[None, :] * 0.5  # (nf, ns)
 
         # Reshape for 5D: (nf, 1, ns, 1, 1)
@@ -1090,7 +1086,7 @@ class BPM:
         k1_beta = k1_bar / beta_sq[None, :]  # (nf, ns)
         denom = 2.0 * np.pi * k1_beta + 1.0 / (1.0 + 2.4 * k1_beta)
         s_sq = 1.0 / denom
-        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar**(-2)) / beta_sq[None, :]
+        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar ** (-2)) / beta_sq[None, :]
         lfc_term = torch.clamp(lfc / (1.0 + lfc), min=1e-15)  # (nf, ns)
         lfc_5d = lfc_term[:, None, :, None, None]
 
@@ -1099,11 +1095,17 @@ class BPM:
         phi_term = (k1_hat**3) / ((1.0 + k1_hat**2) ** (7.0 / 3.0))  # (nf, ns)
 
         # Alpha term
-        alpha_sq = (self.alpha ** 2)[
-            None, None, :, None, None
-        ]  # (1, 1, ns, 1, 1)
+        alpha_sq = (self.alpha**2)[None, None, :, None, None]  # (1, 1, ns, 1, 1)
 
-        inner_val = (self.rho**2) * (self.a_inf**4) * lt * 0.5 * (i**2) * phi_term.view(30, 1, 36, 1, 1) * bv_ti
+        inner_val = (
+            (self.rho**2)
+            * (self.a_inf**4)
+            * lt
+            * 0.5
+            * (i**2)
+            * phi_term.view(30, 1, 36, 1, 1)
+            * bv_ti
+        )
 
         spl_ti = (
             10.0 * torch.log10(torch.clamp(inner_val, min=1e-20))
@@ -1332,7 +1334,9 @@ class BPM:
 
         # 2. Prepare x_new: (n_steps, no) -> (no, n_sec, n_b, n_steps)
         # Transpose x_new to (no, n_steps), then expand to match dimensions
-        x_new_p = x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+        x_new_p = (
+            x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+        )
 
         # 3. Find bracketing indices
         # searchsorted works on the last dimension (nt)
@@ -1358,13 +1362,13 @@ class BPM:
 
         # Transpose back to (n_steps, n_observers)
         return summed.T
-    
+
     def interpolate_positions(self, x_new, x_old, y_old):
         """
         x_new: (n_steps, n_obs)
         x_old: (nt, n_sec, n_b, n_obs)
         y_old: (nt, n_sec, n_b, 3)  <-- These are (x, y, z)
-        
+
         Desired Output: (n_steps, n_sec, n_b, n_obs, 3)
         """
         nt, n_sec, n_b, _ = x_old.shape
@@ -1374,7 +1378,9 @@ class BPM:
         x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
 
         # 2. Prepare x_new: (n_obs, n_sec, n_b, n_steps)
-        x_new_p = x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+        x_new_p = (
+            x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
+        )
 
         # 3. Find bracketing indices: (n_obs, n_sec, n_b, n_steps)
         idx = torch.searchsorted(x_old_p, x_new_p)
@@ -1384,13 +1390,13 @@ class BPM:
         # Current y_old: (nt, n_sec, n_b, 3)
         # We want it to be: (3, n_sec, n_b, nt) to match the logic of x_old_p
         # Then we will need to handle the fact that y_old doesn't have an 'n_obs' dim.
-        y_old_p = y_old.permute(3, 1, 2, 0).contiguous() # (3, n_sec, n_b, nt)
+        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()  # (3, n_sec, n_b, nt)
 
         # 5. Gather bracketing points
         # Since y doesn't depend on n_obs, but x_new does, we expand y_old_p
         # to (3, n_obs, n_sec, n_b, nt)
         y_old_exp = y_old_p.unsqueeze(1).expand(-1, n_obs, -1, -1, -1)
-        
+
         # We need to expand idx to match y_old_exp's coordinate dimension
         # idx: (n_obs, n_sec, n_b, n_steps) -> (3, n_obs, n_sec, n_b, n_steps)
         idx_exp = idx.unsqueeze(0).expand(3, -1, -1, -1, -1)
@@ -1406,7 +1412,7 @@ class BPM:
         # x0, x1, x_new_p are (n_obs, n_sec, n_b, n_steps)
         # y0, y1 are (3, n_obs, n_sec, n_b, n_steps)
         t = (x_new_p - x0) / (x1 - x0 + 1e-12)
-        
+
         # Use broadcasting: (3, n_obs, n_sec, n_b, n_steps)
         interp_vals = y0 + t.unsqueeze(0) * (y1 - y0)
 
