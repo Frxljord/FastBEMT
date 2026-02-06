@@ -46,6 +46,8 @@ class Propeller:
         octave_freqs = pf.dsp.filter.fractional_octave_frequencies(
             num_fractions=3, frequency_range=(20, 20000)
         )[0]
+        self.f_low = octave_freqs / (2 ** (1 / 6))
+        self.f_high = octave_freqs * (2 ** (1 / 6))
         self.third_octave_freqs = torch.as_tensor(
             octave_freqs, dtype=self.dtype, device=self.device
         )
@@ -793,13 +795,18 @@ class Propeller:
 
         p_raw = 10 ** (self.spl / 10.0)
         p_band = torch.matmul(mask.float(), p_raw)
-        f1a_spl_3oct = 10.0 * torch.log10(p_band.clamp(min=1e-12))
-        f1a_spl_3oct[p_band == 0] = float("-inf")
+        third_octave_f1a_spl = 10.0 * torch.log10(p_band.clamp(min=1e-12))
+        third_octave_f1a_spl[p_band == 0] = float("-inf")
+        self.third_octave_f1a_spl = third_octave_f1a_spl
 
-        l_total = 10.0 * torch.log10(
-            10 ** (f1a_spl_3oct / 10.0)
+        self.third_octave_total_spl = 10.0 * torch.log10(
+            10 ** (third_octave_f1a_spl / 10.0)
             + 10 ** (self.spl_total / 10.0)
         )
-        self.third_octave_oaspl = self.calc_oaspl(
-            l_total, self.third_octave_freqs, weighted=True
-        ).cpu().numpy()
+
+        self.third_octave_f1a_oaspl = self.calc_oaspl(
+            self.third_octave_f1a_spl, self.third_octave_freqs, weighted=True
+        ).cpu().numpy().item()
+        self.third_octave_total_oaspl = self.calc_oaspl(
+            self.third_octave_total_spl, self.third_octave_freqs, weighted=True
+        ).cpu().numpy().item()
