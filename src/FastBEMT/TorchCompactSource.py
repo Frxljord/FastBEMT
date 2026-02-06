@@ -192,68 +192,9 @@ class F1A:
             "tbik,tbsk->tsbi", rot, force_moving
         ).contiguous()
 
-        # Compute force time derivatives using high-order finite differences
-        dt: float = (self.tau[1] - self.tau[0]).item()
-        df_dt_moving: torch.Tensor = torch.zeros_like(force_moving)
-
-        # Interior points: 4th-order central difference
-        # f'(i) = [-f(i+2) + 8*f(i+1) - 8*f(i-1) + f(i-2)] / (12*dt)
-        df_dt_moving[2:-2] = (
-            -force_moving[4:]
-            + 8.0 * force_moving[3:-1]
-            - 8.0 * force_moving[1:-3]
-            + force_moving[:-4]
-        ) / (12.0 * dt)
-
-        # Boundary: 4th-order forward difference at t=0
-        # f'(t0) = [-25/12*f0 + 4*f1 - 3*f2 + 4/3*f3 - 1/4*f4] / dt
-        df_dt_moving[0] = (
-            -25 / 12 * force_moving[0]
-            + 4.0 * force_moving[1]
-            - 3.0 * force_moving[2]
-            + 4 / 3 * force_moving[3]
-            - 0.25 * force_moving[4]
-        ) / dt
-
-        # Boundary: 4th-order forward difference at t=t1
-        # f'(t1) = [-1/4*f0 - 5/6*f1 + 3/2*f2 - 1/2*f3 + 1/12*f4] / dt
-        df_dt_moving[1] = (
-            -0.25 * force_moving[0]
-            - 5 / 6 * force_moving[1]
-            + 1.5 * force_moving[2]
-            - 0.5 * force_moving[3]
-            + 1 / 12 * force_moving[4]
-        ) / dt
-
-        # Boundary: 4th-order backward difference at t=tn
-        # f'(tn) = [25/12*fn - 4*fn-1 + 3*fn-2 - 4/3*fn-3 + 1/4*fn-4] / dt
-        df_dt_moving[-1] = (
-            25 / 12 * force_moving[-1]
-            - 4.0 * force_moving[-2]
-            + 3.0 * force_moving[-3]
-            - 4 / 3 * force_moving[-4]
-            + 0.25 * force_moving[-5]
-        ) / dt
-
-        # Boundary: 4th-order backward difference at t=tn-1
-        # f'(tn-1) = [1/4*fn + 5/6*fn-1 - 3/2*fn-2 + 1/2*fn-3 - 1/12*fn-4] / dt
-        df_dt_moving[-2] = (
-            0.25 * force_moving[-1]
-            + 5 / 6 * force_moving[-2]
-            - 1.5 * force_moving[-3]
-            + 0.5 * force_moving[-4]
-            - 1 / 12 * force_moving[-5]
-        ) / dt
-
-        # Rotate force derivatives to fixed frame and add kinematic contribution
-        # Total derivative: d(F_fixed)/dt = dF_rot/dt + ω × F_fixed
-        df_dt_fixed: torch.Tensor = torch.einsum(
-            "tbik,tbsk->tsbi", rot, df_dt_moving
-        ).contiguous()
         self.force_der_fixed: torch.Tensor = torch.linalg.cross(
             self.omega_vec, self.force_fixed
         )
-        self.force_der_fixed.add_(df_dt_fixed)
 
     def get_rf(
         self,

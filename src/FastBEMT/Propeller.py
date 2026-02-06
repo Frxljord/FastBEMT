@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import aerosandbox as asb
 import torch
-from typing import Tuple, Dict, List, Optional, Union
+from typing import Any, Tuple, Dict, List, Optional, Union
 import pyfar as pf
 
 from .Section import SectionForces
@@ -113,7 +113,7 @@ class Propeller:
         self.fft_amp: Optional[torch.Tensor] = None
         self.v_inf: Optional[np.ndarray] = None
         self.observer_positions: Optional[np.ndarray] = None
-        self.spl_breakdown: Dict[str, torch.Tensor] = {}
+        self.spl_breakdown: Dict[str, np.ndarray] = {}
 
     def process_section(
         self,
@@ -132,7 +132,7 @@ class Propeller:
         Returns:
             List containing 18 elements:
             [r, dr, chord, twist, phi, alpha, c_l, c_d, u, a_prime,
-            d_t, d_q, f_factor, w, reynolds, mach, d_s, d_p]
+            d_t, d_q, f_factor, w, reynolds, mach, delta_star_upper, delta_star_lower]
             Returns list of NaN values if solver fails.
         """
         try:
@@ -292,11 +292,11 @@ class Propeller:
     def run_aeroacoustics(
         self,
         observer_positions: np.ndarray,
-        local_dT: Optional[np.ndarray] = None,
-        local_dQ: Optional[np.ndarray] = None,
-        lt=1,
-        i=0.01,
-        alpha_stall=15,
+        local_dt: Optional[np.ndarray] = None,
+        local_dq: Optional[np.ndarray] = None,
+        lt: int = 1,
+        i: float = 0.01,
+        alpha_stall: float = 15.0,
         keep_bpm_components: bool = True,
     ) -> None:
         """Initialize acoustic array and compute total pressure at observer locations.
@@ -307,39 +307,42 @@ class Propeller:
         Args:
             observer_positions: Observer location coordinates in Cartesian space.
                 Shape: (num_observers, 3) in meters.
-            local_dT: Local thrust distribution (override computed values).
+            local_dt: Local thrust distribution (override computed values).
                 If None, uses solution_data['d_t']. Shape: (n_times, n_blades, n_sections).
-            local_dQ: Local torque distribution (override computed values).
+            local_dq: Local torque distribution (override computed values).
                 If None, uses solution_data['d_q']. Shape: (n_times, n_blades, n_sections).
+            lt: Trailing edge noise model switch (BPM parameter).
+            i: Turbulence intensity (BPM parameter).
+            alpha_stall: Stall angle in degrees for BPM modeling.
             keep_bpm_components: If True, preserve individual BPM component SPL.
                 If False, sum components before interpolation (faster).
         """
         self.observer_positions = observer_positions
 
         # Prepare local force distributions per unit span and per blade
-        if local_dT is None or local_dQ is None:
-            local_dT = (
+        if local_dt is None or local_dq is None:
+            local_dt = (
                 self.solution_data["d_t"].values
                 / self.geometry["dr"]
                 / self.geometry["n_blades"]
             )
-            local_dQ = (
+            local_dq = (
                 self.solution_data["d_q"].values
                 / self.geometry["dr"]
                 / self.geometry["r"]
                 / self.geometry["n_blades"]
             )
             # Broadcast to source time and blade dimensions
-            local_dT = np.broadcast_to(
-                local_dT[None, None, :],
+            local_dt = np.broadcast_to(
+                local_dt[None, None, :],
                 (
                     self.params.num_src_times,
                     self.geometry["n_blades"],
                     len(self.geometry["r"]),
                 ),
             )
-            local_dQ = np.broadcast_to(
-                local_dQ[None, None, :],
+            local_dq = np.broadcast_to(
+                local_dq[None, None, :],
                 (
                     self.params.num_src_times,
                     self.geometry["n_blades"],
@@ -347,8 +350,8 @@ class Propeller:
                 ),
             )
         else:
-            local_dT = local_dT / self.geometry["dr"]
-            local_dQ = local_dQ / self.geometry["dr"] / self.geometry["r"]
+            local_dt = local_dt / self.geometry["dr"]
+            local_dq = local_dq / self.geometry["dr"] / self.geometry["r"]
 
         with torch.inference_mode():
             # Initialize F1A compact source acoustic array
@@ -365,8 +368,8 @@ class Propeller:
                 com_shift_up=self.com_shift_up,
                 source_times=self.params.src_times,
                 omega=self.params.omega,
-                d_t=local_dT,
-                d_q=local_dQ,
+                d_t=local_dt,
+                d_q=local_dq,
                 blade_angles=self.params.blade_angles,
                 device=self.device,
                 label="TorchCompactAcousticSourceArray.__init__",
@@ -472,7 +475,7 @@ class Propeller:
         bpm_output: Dict[str, torch.Tensor],
         keep_components: bool = True,
     ) -> None:
-        self.spl_breakdown: Dict[str, torch.Tensor] = {}
+        self.spl_breakdown: Dict[str, np.ndarray] = {}
 
         if not keep_components:
             # Sum all BPM component tensors
@@ -524,7 +527,6 @@ class Propeller:
                 Shape: (n_times, n_sources, n_blades, n_observers, 2).
         """
 
-        # Extract monopole and dipole contributions and reshape
         # Interpolate monopole and dipole contributions to uniform time grid
         self.p_m = self._interp_tensor_vectorized(
             output_times, obs_times, f1a_output[..., 0]
@@ -703,7 +705,7 @@ class Propeller:
         *args,
         label: Optional[str] = None,
         **kwargs,
-    ):
+    ) -> Any:
         """Time a callable using CUDA events when available, otherwise wall-clock.
 
         Args:
@@ -739,3 +741,65 @@ class Propeller:
         t1 = time.perf_counter()
         print(f"[CPU TIMING] {name}: {(t1 - t0) * 1000.0:.3f} ms")
         return result
+
+    def get_a_weighting(self, f: Union[torch.Tensor, float]) -> torch.Tensor:
+        """Calculate A-weighting offset in dB for frequency values."""
+
+        def ra_calc(freq: torch.Tensor) -> torch.Tensor:
+            return (12194.0**2 * freq**4) / (
+                (freq**2 + 20.6**2)
+                * ((freq**2 + 107.7**2) * (freq**2 + 737.9**2)).sqrt()
+                * (freq**2 + 12194.0**2)
+            )
+
+        f_tensor = torch.as_tensor(f, dtype=self.dtype, device=self.device)
+        ra = ra_calc(f_tensor)
+        ra_1000 = ra_calc(torch.tensor(1000.0, dtype=self.dtype, device=self.device))
+
+        return 20.0 * torch.log10(ra) - 20.0 * torch.log10(ra_1000)
+
+    def calc_oaspl(
+        self,
+        spl_tensor: torch.Tensor,
+        freqs: torch.Tensor,
+        weighted: bool = False,
+    ) -> torch.Tensor:
+        """Calculate OASPL for an arbitrary grid shape.
+
+        Args:
+            spl_tensor: SPL tensor with shape (F, ...) where F is the frequency bins.
+            freqs: Frequency grid with shape (F,).
+            weighted: Apply A-weighting if True.
+        """
+        if weighted:
+            a_offsets = self.get_a_weighting(freqs).to(spl_tensor.device)
+
+            # Align A-weighting to the frequency dimension.
+            dims_to_add = spl_tensor.ndim - 1
+            view_shape = (-1,) + (1,) * dims_to_add
+            spl_tensor = spl_tensor + a_offsets.view(view_shape)
+
+        power_ratio = 10 ** (spl_tensor / 10.0)
+        summed_power = torch.sum(power_ratio, dim=0)
+        return 10.0 * torch.log10(summed_power)
+
+    def postprocess(self) -> None:
+        """Aggregate third-octave bands and compute third-octave OASPL."""
+        f_low = self.third_octave_freqs / (2 ** (1 / 6))
+        f_high = self.third_octave_freqs * (2 ** (1 / 6))
+        mask = (self.freq[:, 0:1].T >= f_low.unsqueeze(1)) & (
+            self.freq[:, 0:1].T < f_high.unsqueeze(1)
+        )
+
+        p_raw = 10 ** (self.spl / 10.0)
+        p_band = torch.matmul(mask.float(), p_raw)
+        f1a_spl_3oct = 10.0 * torch.log10(p_band.clamp(min=1e-12))
+        f1a_spl_3oct[p_band == 0] = float("-inf")
+
+        l_total = 10.0 * torch.log10(
+            10 ** (f1a_spl_3oct / 10.0)
+            + 10 ** (self.spl_total / 10.0)
+        )
+        self.third_octave_oaspl = self.calc_oaspl(
+            l_total, self.third_octave_freqs, weighted=True
+        ).cpu().numpy()

@@ -913,35 +913,36 @@ class BPM:
         # y_local: radial position (r)
         # z_local: chordwise offset
 
-        x_local = self.chord * self.com_shift_up * torch.sin(self.twist_rad)
-        y_local = self.r
-        z_local = self.chord * self.com_shift_forward * torch.sin(self.twist_rad)
-
-        # 5. Transform Moving Positions to Global Fixed Frame
-        # We apply the rotation matrix to the local coordinates.
-        # For a rotation around the X-axis:
-        # X_global = x_local
-        # Y_global = y_local * cos(theta) - z_local * sin(theta)
-        # Z_global = y_local * sin(theta) + z_local * cos(theta)
-
-        # Expand coordinates for broadcasting: (1, ns, 1)
-        xl = x_local[None, :, None]
-        yl = y_local[None, :, None]
-        zl = z_local[None, :, None]
-
-        # Expand angles for broadcasting: (nt, 1, nb)
-        cos_t = c[:, None, :]
-        sin_t = s[:, None, :]
-
-        # Final Global Position Shape: (nt, ns, nb, 3)
-        self.pos_fixed = torch.stack(
+        pos_moving: torch.Tensor = torch.stack(
             [
-                xl.expand(self.nt, self.ns, self.nb),  # X (Axial)
-                yl * cos_t - zl * sin_t,  # Y
-                yl * sin_t + zl * cos_t,  # Z
+                self.chord * self.com_shift_up * torch.sin(self.twist_rad),
+                self.r,
+                self.chord * self.com_shift_forward * torch.sin(self.twist_rad),
             ],
             dim=-1,
         )
+
+        # Compute rotation angles at each time step and blade
+        angles: torch.Tensor = (
+            self.omega * self.tau[:, None] + self.blade_angles[None, :]
+        )
+        c: torch.Tensor = torch.cos(angles)
+        s: torch.Tensor = torch.sin(angles)
+
+        # Build rotation matrices (rotation around x-axis)
+        # Format: (time, blade, 3x3)
+        rot: torch.Tensor = torch.zeros(
+            (self.nt, self.nb, 3, 3), dtype=self.dtype, device=self.device
+        )
+        rot[..., 0, 0] = 1.0
+        rot[..., 1, 1], rot[..., 1, 2] = c, -s
+        rot[..., 2, 1], rot[..., 2, 2] = s, c
+
+        # Transform positions from blade frame to fixed frame using rotation matrices
+        # Shape: (time, section, blade, xyz)
+        self.pos_fixed: torch.Tensor = torch.einsum(
+            "tbik,sk->tsbi", rot, pos_moving
+        ).contiguous()
 
     def get_emission_geometry(
         self, r_obs: torch.Tensor
@@ -969,15 +970,22 @@ class BPM:
         unit_r = r_vec * inv_r[..., None]
 
         # Projections onto local basis
-        # obs_xl is cos(theta)
         obs_xl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_xl)
         obs_yl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_yl)
         obs_zl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_zl)
 
-        phi = torch.atan2(obs_xl, obs_yl)
-        theta = torch.atan2(obs_yl * torch.cos(phi) + obs_xl * torch.sin(phi), obs_zl)
+        # Elevation between propeller plane and observer
+        phi = torch.asin(obs_xl)
+
+        # print(phi)
+
+        # Azimuth between propeller plane and observer
+        theta = torch.atan2(obs_zl, obs_yl) + torch.pi / 2
 
         sin_phi_sq = torch.sin(phi) ** 2
+        # k = 0.5
+        # sin_phi_sq = k*torch.sin(phi) ** 2 / (k**2 * torch.cos(phi)**2 + torch.sin(phi)**2)**(3/2)
+
         two_sin_theta_2_sq = 2 * torch.sin(theta / 2) ** 2
         two_cos_theta_2_sq = 2 * torch.cos(theta / 2) ** 2
         sin_theta_sq = torch.sin(theta) ** 2
@@ -987,30 +995,10 @@ class BPM:
 
         # Doppler-corrected Directivity Factors
         dh_te = (two_sin_theta_2_sq * sin_phi_sq) / (
-            doppler * (1.0 + 0.2 * m * obs_xl) ** 2
+            doppler * (1.0 + 0.2 * m * torch.cos(theta)) ** 2
         )
         dh_le = (two_cos_theta_2_sq * sin_phi_sq) / (doppler**3)
         dl = (sin_theta_sq * sin_phi_sq) / (doppler**4)
-
-        # sin^2(phi) = zl^2 / (yl^2 + zl^2)
-        # sin_phi_sq = (obs_zl**2) / (obs_yl**2 + obs_zl**2 + 1e-12)
-
-        # # Directivity Identities
-        # # 2 * sin^2(theta/2) = 1 - cos(theta)
-        # # 2 * cos^2(theta/2) = 1 + cos(theta)
-        # two_sin_theta_2_sq = 1.0 - obs_xl
-        # two_cos_theta_2_sq = 1.0 + obs_xl
-        # sin_theta_sq = 1.0 - obs_xl**2
-
-        # m = self.m[None, :, None, None]
-        # doppler = 1.0 + m * obs_xl
-
-        # # Doppler-corrected Directivity Factors
-        # dh_te = (two_sin_theta_2_sq * sin_phi_sq) / (
-        #     doppler * (1.0 + 0.2 * m * obs_xl) ** 2
-        # )
-        # dh_le = (two_cos_theta_2_sq * sin_phi_sq) / (doppler**3)
-        # dl = (sin_theta_sq * sin_phi_sq) / (doppler**4)
 
         return r_mag, dh_te, dh_le, dl
 
@@ -1079,10 +1067,8 @@ class BPM:
         """
         # Use consistent shape: (nf, 1, ns, 1, 1) for all per-section parameters
         # Base values: (nt, ns, nb, n_obs) -> (1, nt, ns, nb, n_obs)
-        bv_te = self.base_val_te[None, :, :, :, :]
         bv_le = self.base_val_le[None, :, :, :, :]
         bv_low = self.base_val_low[None, :, :, :, :]
-        dh_avg = (bv_te + bv_le) * 0.5
 
         # Frequency-dependent parameters
         f_co = 10.0 * self.u / (np.pi * self.chord)  # (ns,)
@@ -1095,7 +1081,7 @@ class BPM:
         freq_2d = self.frequencies[:, None, None, None, None]
 
         # Selectivity based on frequency
-        bv_ti = torch.where(freq_2d < f_co_5d, bv_low, dh_avg)
+        bv_ti = torch.where(freq_2d < f_co_5d, bv_low, bv_le)
 
         # Mach and compressibility: (ns,) -> (nf, 1, ns, 1, 1)
         beta_sq = 1.0 - self.m**2  # (ns,)
