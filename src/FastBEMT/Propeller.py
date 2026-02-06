@@ -319,6 +319,7 @@ class Propeller:
                 If False, sum components before interpolation (faster).
         """
         self.observer_positions = observer_positions
+        self.third_octave_total_oaspl = None
 
         # Prepare local force distributions per unit span and per blade
         if local_dt is None or local_dq is None:
@@ -469,6 +470,8 @@ class Propeller:
                 keep_components=keep_bpm_components,
                 label="combine_sources_bpm",
             )
+            
+            torch.cuda.empty_cache()
 
     def combine_sources_bpm(
         self,
