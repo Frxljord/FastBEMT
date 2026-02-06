@@ -22,7 +22,6 @@ class Propeller:
         self,
         propeller_geometry: Dict[str, Union[np.ndarray, int, float, list]],
         params: LowFidelityParameters,
-        dtype: torch.dtype,
     ) -> None:
         """Initialize propeller analysis with geometry and parameter objects.
 
@@ -37,7 +36,7 @@ class Propeller:
         """
         self.geometry = propeller_geometry
         self.params = params
-        self.dtype = dtype
+        self.dtype = torch.float32
         self.device = params.device
         self.section_areas()
         self.calculate_boat_tail_angle()
@@ -806,7 +805,7 @@ class Propeller:
 
         self.third_octave_f1a_oaspl = self.calc_oaspl(
             self.third_octave_f1a_spl, self.third_octave_freqs, weighted=True
-        ).cpu().numpy().item()
+        ).cpu().numpy()
         self.third_octave_total_oaspl = self.calc_oaspl(
             self.third_octave_total_spl, self.third_octave_freqs, weighted=True
-        ).cpu().numpy().item()
+        ).cpu().numpy()
