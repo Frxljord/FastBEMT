@@ -1257,6 +1257,7 @@ class BPM:
         chord_tip = self.chord[-1]
         alpha_tip = self.alpha[-1]
         m_tip = self.m[-1]
+
         l_tip = calc_l_tip(chord_tip, alpha_tip)
         m_max = m_tip * (1 + 0.036 * alpha_tip)
 
@@ -1269,7 +1270,7 @@ class BPM:
 
         # Mach and geometry factor.
         m_factor = m_tip**2 * m_max**3 * l_tip**2
-        log_st = torch.log10(st_2p + 1e-12)
+        log_st = torch.log10(torch.abs(st_2p) + 1e-12)
 
         # spl_tip: (nf, 1, nt, 1, nb, n_obs) broadcasts to (nf, nt, 1, nb, n_obs).
         spl_tip = (
