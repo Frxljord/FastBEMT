@@ -9,7 +9,7 @@ import numpy as np
 import scipy.optimize
 import aerosandbox as asb
 import warnings
-from FastBEMT.JobParameters import LowFidelityParameters
+from .JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
