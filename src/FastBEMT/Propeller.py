@@ -22,6 +22,7 @@ class Propeller:
         self,
         propeller_geometry: Dict[str, Union[np.ndarray, int, float, list]],
         params: LowFidelityParameters,
+        use_cuda_timing: bool = True,
     ) -> None:
         """Initialize propeller analysis with geometry and parameter objects.
 
@@ -33,11 +34,14 @@ class Propeller:
             params: Aerodynamic and acoustic parameters including RPM, diameter,
                 density, and reference pressure.
             dtype: PyTorch data type for tensor operations (e.g., torch.float32).
+            use_cuda_timing: If True, print CUDA/CPU timing reports from
+                `_time_cuda`; if False, skip timing output.
         """
         self.geometry = propeller_geometry
         self.params = params
         self.dtype = torch.float32
         self.device = params.device
+        self.use_cuda_timing = use_cuda_timing
         self.section_areas()
         self.calculate_boat_tail_angle()
 
@@ -721,6 +725,9 @@ class Propeller:
         Returns:
             Result from func(*args, **kwargs).
         """
+        if not self.use_cuda_timing:
+            return func(*args, **kwargs)
+
         name = label or getattr(func, "__name__", "call")
         use_cuda = torch.cuda.is_available() and ("cuda" in str(self.device))
 
