@@ -32,23 +32,22 @@ class BladeStressCalculator:
         Returns:
             Array of centrifugal stress values (Pa) per section.
         """
-        r = self.geometry["r"]
-        cross_section = self.geometry["cross_section"]
-        stresses = [0.0] * len(cross_section)
+        r = np.asarray(self.geometry["r"])
+        cross_section = np.asarray(self.geometry["cross_section"])
 
-        for i in reversed(range(len(self.geometry["r"]) - 1)):
-            r1 = r[i]
-            r2 = r[i + 1]
-            dr = r2 - r1
-            r_mean = (r1 + r2) / 2
+        dr = r[1:] - r[:-1]
+        r_mean = 0.5 * (r[1:] + r[:-1])
+        a1 = cross_section[:-1]
+        a2 = cross_section[1:]
+        a_avg = 0.5 * (a1 + a2)
 
-            a1 = cross_section[i]
-            a2 = cross_section[i + 1]
+        fc = rho * omega**2 * r_mean * a_avg * dr
+        load_per_area = np.divide(fc, a1, out=np.zeros_like(fc), where=a1 != 0)
 
-            fc = rho * omega**2 * r_mean * a2 * dr
-            stresses[i] = fc / a1 + stresses[i + 1]
+        stresses = np.zeros_like(cross_section)
+        stresses[:-1] = np.cumsum(load_per_area[::-1])[::-1]
 
-        return np.array(stresses)
+        return stresses
 
     def compute_bending_stress(
         self,
@@ -71,13 +70,23 @@ class BladeStressCalculator:
 
         d_d_list = np.divide(d_q_list, r, out=np.zeros_like(d_q_list), where=r != 0)
 
-        bending_moments_x = np.zeros(n_sections)
-        bending_moments_z = np.zeros(n_sections)
+        sum_t = np.cumsum(d_t_list[::-1])[::-1]
+        sum_tr = np.cumsum((d_t_list * r)[::-1])[::-1]
+        sum_d = np.cumsum(d_d_list[::-1])[::-1]
+        sum_dr = np.cumsum((d_d_list * r)[::-1])[::-1]
 
-        for i in range(n_sections - 1):
-            moment_arms = r[i + 1 :] - r[i]
-            bending_moments_x[i] = np.sum(d_t_list[i + 1 :] * moment_arms)
-            bending_moments_z[i] = np.sum(d_d_list[i + 1 :] * moment_arms)
+        sum_t_next = np.zeros_like(sum_t)
+        sum_tr_next = np.zeros_like(sum_tr)
+        sum_d_next = np.zeros_like(sum_d)
+        sum_dr_next = np.zeros_like(sum_dr)
+
+        sum_t_next[:-1] = sum_t[1:]
+        sum_tr_next[:-1] = sum_tr[1:]
+        sum_d_next[:-1] = sum_d[1:]
+        sum_dr_next[:-1] = sum_dr[1:]
+
+        bending_moments_x = sum_tr_next - r * sum_t_next
+        bending_moments_z = sum_dr_next - r * sum_d_next
 
         stresses = []
 
@@ -90,7 +99,7 @@ class BladeStressCalculator:
 
             i_xx, i_zz, i_xz = self._compute_moment_of_inertia(x_coords, z_coords)
 
-            m_x = bending_moments_x[i]
+            m_x = -bending_moments_x[i]
             m_z = bending_moments_z[i]
 
             denominator = i_xx * i_zz - i_xz**2
@@ -98,8 +107,8 @@ class BladeStressCalculator:
                 -(m_z * i_xx + m_x * i_xz) / denominator * x_coords
                 + (m_x * i_zz + m_z * i_xz) / denominator * z_coords
             )
-            stresses.append(np.max(np.abs(sigma_total)))
-
+            # stresses.append(np.max(np.abs(sigma_total)))
+            stresses.append(sigma_total)
         return np.array(stresses)
 
     def blade_stress_report(

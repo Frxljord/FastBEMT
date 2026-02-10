@@ -9,6 +9,7 @@ dependencies = [
     "ipython>=9.9.0",
     "line-profiler>=5.0.0",
     "matplotlib>=3.10.8",
+    "nbformat>=5.10.4",
     "numpy>=2.4.0",
     "opt-einsum>=3.4.0",
     "pandas>=2.3.3",
