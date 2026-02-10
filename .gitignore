@@ -9,7 +9,7 @@ wheels/
 
 # Virtual environments
 .FastBEMT
-
+.github
 .vscode
 
 Datasets/Measurements/
