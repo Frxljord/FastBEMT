@@ -9,10 +9,17 @@ import numpy as np
 import scipy.optimize
 import aerosandbox as asb
 import warnings
+from dataclasses import dataclass
 from .JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+
+@dataclass
+class RootResult:
+    """Lightweight result object with a `root` attribute for fallback use."""
+
+    root: float
 
 class SectionForces:
     """Blade Element Momentum Theory (BEMT) solver for a single radial section.
@@ -74,14 +81,14 @@ class SectionForces:
         Pre-tabulates the loss factor on a phi (inflow angle) grid for fast
         interpolation during iterative BEMT solving. Avoids recomputation.
         """
-        self._phi_grid = np.linspace(np.radians(0.1), np.radians(89.9), 100)
+        self._phi_grid = np.linspace(np.radians(-89.9), np.radians(89.9), 401)
 
         sin_phi = np.sin(self._phi_grid)
         n_blades = self.n_blades
         r = self.r
 
-        f_tip = n_blades * (self.prop_radius - r) / (2 * r * sin_phi)
-        f_hub = n_blades * (r - self.hub_radius) / (2 * r * sin_phi)
+        f_tip = n_blades * (self.prop_radius - r) / (2 * r * np.abs(sin_phi))
+        f_hub = n_blades * (r - self.hub_radius) / (2 * r * np.abs(sin_phi))
 
         # Clip to avoid overflow in exponential
         f_tip = np.clip(f_tip, 0.0, 500.0)
@@ -102,8 +109,6 @@ class SectionForces:
         Returns:
             Prandtl loss factor (0 to 1), where 1 means no loss.
         """
-        if phi <= 0:
-            return 1.0
         return np.interp(phi, self._phi_grid, self._f_grid)
 
     def airfoil_coefficients(
@@ -295,7 +300,12 @@ class SectionForces:
         self.ma = v_local / self.params.a_inf
         self.re = self.params.rho * v_local * self.chord / self.params.mu
 
-        # Define bounds for inflow angle
+        # Define bounds for inflow angle based on residual sign at phi=0.
+        # residual_at_zero = self.residual_function(1e-6)
+        # if residual_at_zero > 0:
+        #     phi_min_default = np.radians(-89.9)
+        #     phi_max_default = np.radians(-0.1)
+        # else:
         phi_min_default = np.radians(0.1)
         phi_max_default = np.radians(89.9)
 
@@ -353,7 +363,31 @@ class SectionForces:
             )
 
         if not result.converged:
-            raise RuntimeError("Root finding for inflow angle did not converge")
+            # Plot residual vs phi to aid debugging.
+            # import matplotlib.pyplot as plt
+
+            # phi_grid = np.linspace(phi_min_default, phi_max_default, 200)
+            # residuals = []
+            # for phi_val in phi_grid:
+            #     try:
+            #         residuals.append(self.residual_function(phi_val))
+            #     except Exception:
+            #         residuals.append(np.nan)
+
+            # plt.figure(figsize=(8, 4))
+            # plt.plot(np.degrees(phi_grid), residuals, label="Residual")
+            # plt.axhline(0.0, color="k", linewidth=0.8, linestyle="--")
+            # plt.xlabel("Phi [deg]")
+            # plt.ylabel("Residual")
+            # plt.title("BEMT Residual vs Phi (Non-Converged)")
+            # plt.grid(True, alpha=0.3)
+            # plt.tight_layout()
+            # plt.show()
+            warnings.warn(f"Root finding did not converge at r = {self.r}")
+            result = RootResult(
+                root=prev_phi,
+            )
+            
 
         phi = result.root
         (

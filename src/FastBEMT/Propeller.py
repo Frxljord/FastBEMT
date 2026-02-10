@@ -201,15 +201,7 @@ class Propeller:
             v_inf = np.full(len(self.geometry["r"]), v_inf)
 
         # Process each radial section
-        for i, (r, dr, chord, twist, airfoil_asb) in enumerate(
-            zip(
-                self.geometry["r"],
-                self.geometry["dr"],
-                self.geometry["chord"],
-                self.geometry["twist"],
-                self._section_airfoils,
-            )
-        ):
+        for i in range(len(self.geometry["r"])):
             res = self.process_section(i, v_inf[i], prev_phi=prev_phi)
             if not np.isnan(res[4]):  # Index 4 is phi in degrees
                 prev_phi = np.radians(res[4])

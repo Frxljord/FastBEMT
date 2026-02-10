@@ -831,7 +831,7 @@ class BPM:
         self.r = torch.as_tensor(r, dtype=self.dtype, device=self.device)
         self.dr = torch.as_tensor(dr, dtype=self.dtype, device=self.device)
         self.chord = torch.as_tensor(chord, dtype=self.dtype, device=self.device)
-        self.alpha = torch.as_tensor(alpha, dtype=self.dtype, device=self.device)
+        self.alpha = torch.as_tensor(alpha.copy(), dtype=self.dtype, device=self.device)
         self.vi = torch.as_tensor(vi, dtype=self.dtype, device=self.device)
         self.u = torch.as_tensor(u, dtype=self.dtype, device=self.device)
         self.re_c = torch.as_tensor(re_c, dtype=self.dtype, device=self.device)
