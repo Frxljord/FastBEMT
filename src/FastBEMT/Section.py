@@ -331,7 +331,7 @@ class SectionForces:
                 if (
                     np.isfinite(f_lower)
                     and np.isfinite(f_upper)
-                    f_lower * f_upper < 0
+                    and f_lower * f_upper < 0
                 ):
                     bracket = [lower, upper]
                     break
