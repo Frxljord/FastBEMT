@@ -233,10 +233,6 @@ class SectionForces:
         v_t = self.params.omega * self.r * (1 - a_prime)
         w = np.sqrt(v_a**2 + v_t**2)
 
-        # Update Reynolds and Mach numbers for next iteration
-        self.re = self.params.rho * w * self.chord / self.params.mu
-        self.ma = w / self.params.a_inf
-
         return (
             alpha,
             c_l,
@@ -296,9 +292,10 @@ class SectionForces:
             inflow angle, forces, and boundary layer displacement thicknesses.
         """
         self.v_inf = v_inf
-        v_local = np.sqrt(self.v_inf**2 + (self.params.omega * self.r) ** 2)
-        self.ma = v_local / self.params.a_inf
-        self.re = self.params.rho * v_local * self.chord / self.params.mu
+        if self.re is None or self.ma is None:
+            v_local = np.sqrt(self.v_inf**2 + (self.params.omega * self.r) ** 2)
+            self.ma = v_local / self.params.a_inf
+            self.re = self.params.rho * v_local * self.chord / self.params.mu
 
         # Define bounds for inflow angle based on residual sign at phi=0.
         # residual_at_zero = self.residual_function(1e-6)
@@ -334,7 +331,7 @@ class SectionForces:
                 if (
                     np.isfinite(f_lower)
                     and np.isfinite(f_upper)
-                    and f_lower * f_upper < 0
+                    f_lower * f_upper < 0
                 ):
                     bracket = [lower, upper]
                     break
@@ -344,6 +341,7 @@ class SectionForces:
                     break
 
                 delta *= 2.0
+                
 
         # Root finding for inflow angle
         try:
@@ -354,6 +352,7 @@ class SectionForces:
                 bracket=bracket,
             )
         except ValueError:
+            # print('used newton')
             # Fallback to Newton's method if brentq fails
             result = scipy.optimize.root_scalar(
                 self.residual_function,
@@ -361,7 +360,6 @@ class SectionForces:
                 xtol=1e-4,
                 x0=np.mean(bracket),
             )
-
         if not result.converged:
             # Plot residual vs phi to aid debugging.
             # import matplotlib.pyplot as plt
@@ -403,6 +401,10 @@ class SectionForces:
             _,
             _,
         ) = self.section_parameters(phi)
+
+        # Update Reynolds and Mach numbers
+        self.re = self.params.rho * w * self.chord / self.params.mu
+        self.ma = w / self.params.a_inf
 
         # Compute local thrust and torque
         d_t = self.sigma * np.pi * self.params.rho * w**2 * c_l_prime * self.r * self.dr
