@@ -20,7 +20,7 @@ class Propeller:
 
     def __init__(
         self,
-        propeller_geometry: Dict[str, Union[np.ndarray, int, float, list]],
+        geometry: Dict[str, Union[np.ndarray, int, float, list]],
         params: LowFidelityParameters,
         use_cuda_timing: bool = True,
     ) -> None:
@@ -37,7 +37,7 @@ class Propeller:
             use_cuda_timing: If True, print CUDA/CPU timing reports from
                 `_time_cuda`; if False, skip timing output.
         """
-        self.geometry = propeller_geometry
+        self.geometry = geometry
         self.params = params
         self.dtype = torch.float32
         self.device = params.device
@@ -505,7 +505,7 @@ class Propeller:
                 )
 
         # Final Total SPL (acoustic pressure squared level)
-        self.spl_total = 10 * torch.log10(spp_interp_total.mean(dim=1) + 1e-12)
+        self.third_octave_bpm_spl = 10 * torch.log10(spp_interp_total.mean(dim=1) + 1e-12)
 
     def combine_sources(
         self,
@@ -801,8 +801,8 @@ class Propeller:
         self.third_octave_f1a_spl = third_octave_f1a_spl
 
         self.third_octave_total_spl = 10.0 * torch.log10(
-            10 ** (third_octave_f1a_spl / 10.0)
-            + 10 ** (self.spl_total / 10.0)
+            10 ** (self.third_octave_f1a_spl / 10.0)
+            + 10 ** (self.third_octave_bpm_spl / 10.0)
         )
 
         self.third_octave_f1a_oaspl = self.calc_oaspl(
