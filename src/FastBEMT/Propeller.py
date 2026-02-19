@@ -15,7 +15,7 @@ class Propeller:
     '''Propeller aeroacoustic analysis using BEMT, F1A, and BPM.
 
     Performs blade element momentum theory aerodynamic analysis followed by
-    Farassat 1A acoustic propagation and Brooks-Pope-Marcolini noise prediction.
+    Farassat 1A tonal noise calculation and Brooks-Pope-Marcolini broadband noise calculation.
     '''
 
     def __init__(
@@ -213,11 +213,11 @@ class Propeller:
         '''Compute integrated thrust, torque, and coefficients.
 
         Returns:
-            Tuple of (thrust, torque, c_t, c_p) where:
+            Tuple of (thrust, torque, c_t, c_q) where:
             thrust: total thrust force (N)
             torque: total torque (N·m)
             c_t: thrust coefficient (dimensionless)
-            c_p: power coefficient (dimensionless)
+            c_q: torque coefficient (dimensionless)
         '''
         total_thrust: float = self.solution_data["d_t"].sum()
         total_torque: float = self.solution_data["d_q"].sum()
@@ -227,9 +227,9 @@ class Propeller:
         rho: float = self.params.rho
 
         c_t = total_thrust / (rho * n_rev_s**2 * d**4)
-        c_p = (2 * np.pi * total_torque) / (rho * n_rev_s**2 * d**5)
+        c_q = total_torque / (rho * n_rev_s**2 * d**5)
 
-        return total_thrust, total_torque, c_t, c_p
+        return total_thrust, total_torque, c_t, c_q
 
     def section_areas(self) -> None:
         '''Calculate cross-sectional areas using Shoelace formula.
