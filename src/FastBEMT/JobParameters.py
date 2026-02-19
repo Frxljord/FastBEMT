@@ -3,7 +3,11 @@ import torch
 
 
 class LowFidelityParameters:
-    """Global propeller parameters for low fidelity analysis."""
+    '''Aeroacoustic simulation parameters for propeller analysis.
+    
+    Stores operational and environmental parameters including RPM, fluid properties,
+    and time discretization for BEMT and acoustic calculations.
+    '''
 
     def __init__(
         self,
@@ -16,7 +20,20 @@ class LowFidelityParameters:
         revolutions: int,
         num_obs_times_per_rev: int,
         device: str,
-    ):
+    ) -> None:
+        '''Initialize simulation parameters.
+        
+        Args:
+            rpm: Rotational speed (revolutions per minute).
+            a_inf: Speed of sound (m/s).
+            rho: Fluid density (kg/m³).
+            mu: Dynamic viscosity (Pa·s).
+            n_blades: Number of propeller blades.
+            p_ref: Reference acoustic pressure (Pa), typically 2e-5.
+            revolutions: Number of propeller revolutions to simulate.
+            num_obs_times_per_rev: Time steps per revolution.
+            device: PyTorch device ('cuda' or 'cpu').
+        '''
         self.device = torch.device(device)
         self.rpm = rpm
         self.omega = 2.0 * np.pi * rpm / 60.0

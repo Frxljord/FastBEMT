@@ -12,11 +12,11 @@ from .TorchBPM import BPM
 
 
 class Propeller:
-    """High-level propeller BEMT and F1A acoustic analysis controller.
+    '''Propeller aeroacoustic analysis using BEMT, F1A, and BPM.
 
-    Handles blade element momentum theory (BEMT) aerodynamic analysis and
-    Farassat 1A (F1A) acoustic source computation for propeller noise prediction.
-    """
+    Performs blade element momentum theory aerodynamic analysis followed by
+    Farassat 1A acoustic propagation and Brooks-Pope-Marcolini noise prediction.
+    '''
 
     def __init__(
         self,
@@ -24,19 +24,22 @@ class Propeller:
         params: LowFidelityParameters,
         use_cuda_timing: bool = True,
     ) -> None:
-        """Initialize propeller analysis with geometry and parameter objects.
+        '''Initialize propeller analysis.
 
         Args:
-            propeller_geometry: Dictionary containing propeller geometry data including
-                airfoil coordinates, radial stations, chord, twist, and COM shift.
-                Expected keys: 'r', 'dr', 'chord', 'twist', 'airfoil', 'COM_shift',
-                'tip_radius', 'hub_radius', 'n_blades'.
-            params: Aerodynamic and acoustic parameters including RPM, diameter,
-                density, and reference pressure.
-            dtype: PyTorch data type for tensor operations (e.g., torch.float32).
-            use_cuda_timing: If True, print CUDA/CPU timing reports from
-                `_time_cuda`; if False, skip timing output.
-        """
+            geometry: Propeller geometry dictionary with keys:
+                'r': radial stations (m), shape (n_sections,)
+                'dr': radial widths (m), shape (n_sections,)
+                'chord': chord lengths (m), shape (n_sections,)
+                'twist': twist angles (deg), shape (n_sections,)
+                'airfoil': airfoil coordinates, list of shape (n_points, 2)
+                'COM_shift': center of mass shift, list of (x, z) tuples
+                'tip_radius': propeller tip radius (m)
+                'hub_radius': propeller hub radius (m)
+                'n_blades': number of blades
+            params: Simulation parameters.
+            use_cuda_timing: Print GPU/CPU timing diagnostics if True.
+        '''
         self.geometry = geometry
         self.params = params
         self.dtype = torch.float32
@@ -126,20 +129,18 @@ class Propeller:
         v_inf: float,
         prev_phi: Optional[float] = None,
     ) -> List[float]:
-        """Run BEMT solver for a single radial section.
+        '''Solve BEMT for a single radial section.
 
         Args:
-            section_index: Index of the radial station to process.
-            v_inf: Freestream velocity at this section (m/s).
-            prev_phi: Flow angle from previous section for convergence (radians).
-                Defaults to None for the first section.
+            section_index: Radial station index.
+            v_inf: Freestream velocity (m/s).
+            prev_phi: Previous section inflow angle for warm start (radians).
 
         Returns:
-            List containing 18 elements:
-            [r, dr, chord, twist, phi, alpha, c_l, c_d, u, a_prime,
-            d_t, d_q, f_factor, w, reynolds, mach, delta_star_upper, delta_star_lower]
-            Returns list of NaN values if solver fails.
-        """
+            List of 18 elements: [r, dr, chord, twist, phi, alpha, c_l, c_d, u,
+            a_prime, d_t, d_q, f_factor, w, reynolds, mach, delta_star_upper,
+            delta_star_lower]. Returns NaN values if solver fails.
+        '''
         try:
             (
                 phi,
@@ -183,15 +184,14 @@ class Propeller:
             return [np.nan] * 18
 
     def run_bemt(self, v_inf: Union[float, np.ndarray]) -> None:
-        """Execute the BEMT radial sweep sequentially.
+        '''Execute radial BEMT sweep.
 
-        Solves blade element momentum theory equations at each radial station
-        in order, using the flow angle from the previous station for convergence.
+        Solves momentum and blade element equations at each radial station
+        sequentially, using previous station's solution for faster convergence.
 
         Args:
-            v_inf: Freestream velocity (m/s). Can be a scalar applied to all sections
-                or an array of shape (n_radial_stations,) with velocity at each station.
-        """
+            v_inf: Freestream velocity (m/s). Scalar or array of shape (n_sections,).
+        '''
         self.v_inf = v_inf
         prev_phi: Optional[float] = None
         rows: List[List[float]] = []
@@ -210,19 +210,15 @@ class Propeller:
         self.solution_data = pd.DataFrame(rows, columns=self.solution_data.columns)
 
     def compute_total_forces(self) -> Tuple[float, float, float, float]:
-        """Compute total thrust, torque, and nondimensional force coefficients.
-
-        Integrates local blade element forces across all radial stations and
-        computes dimensionless performance coefficients.
+        '''Compute integrated thrust, torque, and coefficients.
 
         Returns:
-            Tuple of (total_thrust, total_torque, thrust_coefficient, power_coefficient)
-            where:
-            - total_thrust: Total thrust force (N)
-            - total_torque: Total torque (N·m)
-            - thrust_coefficient: Dimensionless thrust coefficient
-            - power_coefficient: Dimensionless power coefficient
-        """
+            Tuple of (thrust, torque, c_t, c_p) where:
+            thrust: total thrust force (N)
+            torque: total torque (N·m)
+            c_t: thrust coefficient (dimensionless)
+            c_p: power coefficient (dimensionless)
+        '''
         total_thrust: float = self.solution_data["d_t"].sum()
         total_torque: float = self.solution_data["d_q"].sum()
 
@@ -236,11 +232,11 @@ class Propeller:
         return total_thrust, total_torque, c_t, c_p
 
     def section_areas(self) -> None:
-        """Calculate cross-sectional areas (m²) using the Shoelace formula.
+        '''Calculate cross-sectional areas using Shoelace formula.
 
-        Computes the area of each airfoil section scaled by chord length squared.
-        Updates self.geometry["cross_section"] with computed areas.
-        """
+        Computes area of each airfoil section scaled by chord squared.
+        Updates geometry['cross_section'] with areas in m².
+        '''
         areas: List[float] = []
         for idx, coords in enumerate(self.geometry["airfoil"]):
             x = coords[:, 0]
@@ -252,14 +248,12 @@ class Propeller:
         self.geometry["cross_section"] = np.array(areas)
 
     def calculate_boat_tail_angle(self) -> None:
-        """Calculate boat tail angle for each airfoil section.
+        '''Calculate trailing edge boat tail angle.
 
-        Computes the trailing edge boat tail angle by fitting linear regressions
-        to the upper and lower surface trailing edge regions (x > 0.95 chord).
-        The boat tail angle is the angle between the fitted upper and lower slopes.
-
-        Updates self.geometry["boat_tail_angle"] with angles in degrees for each section.
-        """
+        Fits linear regressions to upper and lower surfaces in trailing edge
+        region (x > 0.95) and computes angle between slopes.
+        Updates geometry['boat_tail_angle'] with angles in degrees.
+        '''
         angles: List[float] = []
         for idx, coords in enumerate(self.geometry["airfoil"]):
             # Find leading edge index
@@ -296,24 +290,22 @@ class Propeller:
         alpha_stall: float = 15.0,
         keep_bpm_components: bool = True,
     ) -> None:
-        """Initialize acoustic array and compute total pressure at observer locations.
+        '''Compute F1A and BPM acoustic predictions.
 
-        Performs Farassat 1A (F1A) and BPM acoustic predictions for sources on
-        the propeller blade surface. Utilizes GPU acceleration via PyTorch.
+        Performs Farassat 1A thickness and loading noise propagation followed by
+        Brooks-Pope-Marcolini broadband noise prediction using GPU acceleration.
 
         Args:
-            observer_positions: Observer location coordinates in Cartesian space.
-                Shape: (num_observers, 3) in meters.
-            local_dt: Local thrust distribution (override computed values).
-                If None, uses solution_data['d_t']. Shape: (n_times, n_blades, n_sections).
-            local_dq: Local torque distribution (override computed values).
-                If None, uses solution_data['d_q']. Shape: (n_times, n_blades, n_sections).
-            lt: Trailing edge noise model switch (BPM parameter).
-            i: Turbulence intensity (BPM parameter).
-            alpha_stall: Stall angle in degrees for BPM modeling.
-            keep_bpm_components: If True, preserve individual BPM component SPL.
-                If False, sum components before interpolation (faster).
-        """
+            observer_positions: Observer coordinates, shape (n_observers, 3) in meters.
+            local_dt: Thrust distribution override, shape (n_times, n_blades, n_sections).
+                Uses solution_data['d_t'] if None.
+            local_dq: Torque distribution override, shape (n_times, n_blades, n_sections).
+                Uses solution_data['d_q'] if None.
+            lt: BPM trailing edge noise switch (1=turbulent, 0=laminar).
+            i: Turbulence intensity for BPM (dimensionless).
+            alpha_stall: Stall angle for BPM separation noise (degrees).
+            keep_bpm_components: Store individual BPM component SPL if True.
+        '''
         self.observer_positions = observer_positions
         self.third_octave_total_oaspl = None
 
@@ -513,19 +505,16 @@ class Propeller:
         output_times: Union[torch.Tensor, np.ndarray],
         f1a_output: Union[torch.Tensor, np.ndarray],
     ) -> None:
-        """Interpolate F1A source signals using GPU-accelerated PyTorch.
+        '''Interpolate F1A sources to uniform observer time grid.
 
         Combines monopole and dipole contributions from all blade elements
-        and interpolates to a uniform observer time grid.
+        via GPU-accelerated interpolation.
 
         Args:
-            obs_times: Retarded times at observer locations.
-                Shape: (n_source_times, n_sources, n_observers).
-            output_times: Uniform observer time grid for interpolation.
-                Shape: (n_steps, n_observers).
-            f1a_output: Pressure contributions from F1A sources.
-                Shape: (n_times, n_sources, n_blades, n_observers, 2).
-        """
+            obs_times: Retarded times, shape (n_src_times, n_sections, n_blades, n_observers).
+            output_times: Uniform time grid, shape (n_steps, n_observers).
+            f1a_output: Pressure contributions, shape (n_times, n_sections, n_blades, n_observers, 2).
+        '''
 
         # Interpolate monopole and dipole contributions to uniform time grid
         self.p_m = self._interp_tensor_vectorized(
@@ -546,16 +535,16 @@ class Propeller:
         x_old: torch.Tensor,
         y_old: torch.Tensor,
     ) -> torch.Tensor:
-        """Perform vectorized linear interpolation on 4D GPU tensors.
+        '''Vectorized linear interpolation for 4D GPU tensors.
 
         Args:
-            x_new: (n_steps, n_observers)
-            x_old: (n_src_times, n_sections, n_blades, n_observers)
-            y_old: (n_src_times, n_sections, n_blades, n_observers)
+            x_new: Target coordinates, shape (n_steps, n_observers).
+            x_old: Source coordinates, shape (n_src_times, n_sections, n_blades, n_observers).
+            y_old: Source values, shape (n_src_times, n_sections, n_blades, n_observers).
 
         Returns:
-            Shape: (n_steps, n_observers)
-        """
+            Interpolated values, shape (n_steps, n_observers).
+        '''
         nt, n_sec, n_b, n_obs = x_old.shape
         n_steps = x_new.shape[0]
 
@@ -596,11 +585,11 @@ class Propeller:
         return summed.T
 
     def _perform_spectral_analysis_torch(self) -> None:
-        """Compute spectral analysis using GPU-accelerated PyTorch.
+        '''Compute FFT, SPL, A-weighted SPL, and OASPL using PyTorch.
 
-        Computes FFT, SPL, A-weighted SPL, OASPL, and OASPL-A metrics
-        using GPU-accelerated PyTorch operations.
-        """
+        Performs spectral analysis on total pressure signal with GPU acceleration.
+        Computes SPL in dB, A-weighted SPL, overall SPL, and overall A-weighted SPL.
+        '''
         n: int = self.params.num_obs_times
         no: int = self.observer_positions.shape[0]
 
@@ -665,23 +654,18 @@ class Propeller:
         observers: np.ndarray,
         src_times: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute retarded times for source-observer pairs.
+        '''Compute acoustic retarded times for source-observer pairs.
 
-        Calculates the time at which acoustic waves reach observers
-        accounting for propagation delay: t_retarded = t_source + r / a_inf.
+        Calculates arrival times accounting for propagation delay.
 
         Args:
-            pos_fixed: Source positions on blade surface.
-                Shape: (n_src_times, n_sections, n_blades, 3).
-            observers: Observer positions in Cartesian coordinates.
-                Shape: (n_observers, 3) in meters.
-            src_times: Source time instants.
-                Shape: (n_src_times,) in seconds.
+            pos_fixed: Source positions, shape (n_src_times, n_sections, n_blades, 3).
+            observers: Observer positions, shape (n_observers, 3) in meters.
+            src_times: Source emission times, shape (n_src_times,) in seconds.
 
         Returns:
-            Retarded times tensor of shape (n_src_times, n_sources, n_observers)
-            in seconds.
-        """
+            Retarded times, shape (n_src_times, n_sections, n_blades, n_observers) in seconds.
+        '''
         # Convert observer positions to tensor with batch dimensions
         obs = torch.as_tensor(observers, dtype=self.dtype, device=self.device)[
             None, None, None, :, :
@@ -706,17 +690,17 @@ class Propeller:
         label: Optional[str] = None,
         **kwargs,
     ) -> Any:
-        """Time a callable using CUDA events when available, otherwise wall-clock.
+        '''Execute function with GPU/CPU timing diagnostics.
 
         Args:
-            func: Callable to time.
-            *args: Positional arguments to pass to func.
+            func: Callable to execute and time.
+            *args: Positional arguments for func.
             label: Optional label for timing output.
-            **kwargs: Keyword arguments to pass to func.
+            **kwargs: Keyword arguments for func.
 
         Returns:
             Result from func(*args, **kwargs).
-        """
+        '''
         if not self.use_cuda_timing:
             return func(*args, **kwargs)
 
@@ -746,7 +730,14 @@ class Propeller:
         return result
 
     def get_a_weighting(self, f: Union[torch.Tensor, float]) -> torch.Tensor:
-        """Calculate A-weighting offset in dB for frequency values."""
+        '''Calculate A-weighting offset per ISO 61672-1.
+        
+        Args:
+            f: Frequency or frequencies (Hz).
+            
+        Returns:
+            A-weighting offset in dB.
+        '''
 
         def ra_calc(freq: torch.Tensor) -> torch.Tensor:
             return (12194.0**2 * freq**4) / (
@@ -767,13 +758,16 @@ class Propeller:
         freqs: torch.Tensor,
         weighted: bool = False,
     ) -> torch.Tensor:
-        """Calculate OASPL for an arbitrary grid shape.
+        '''Calculate overall sound pressure level.
 
         Args:
-            spl_tensor: SPL tensor with shape (F, ...) where F is the frequency bins.
-            freqs: Frequency grid with shape (F,).
+            spl_tensor: SPL values, shape (n_freqs, ...).
+            freqs: Frequency values, shape (n_freqs,).
             weighted: Apply A-weighting if True.
-        """
+            
+        Returns:
+            OASPL or OASPL-A, shape (...).
+        '''
         if weighted:
             a_offsets = self.get_a_weighting(freqs).to(spl_tensor.device)
 
@@ -787,7 +781,11 @@ class Propeller:
         return 10.0 * torch.log10(summed_power)
 
     def postprocess(self) -> None:
-        """Aggregate third-octave bands and compute third-octave OASPL."""
+        '''Aggregate to third-octave bands and compute OASPL.
+        
+        Converts narrowband F1A and BPM spectra to third-octave bands and
+        computes overall A-weighted sound pressure levels.
+        '''
         f_low = self.third_octave_freqs / (2 ** (1 / 6))
         f_high = self.third_octave_freqs * (2 ** (1 / 6))
         mask = (self.freq[:, 0:1].T >= f_low.unsqueeze(1)) & (

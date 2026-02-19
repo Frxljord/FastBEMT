@@ -9,29 +9,26 @@ from .Propeller import Propeller
 
 
 class BladeStressCalculator:
-    """Compute centrifugal and bending stresses along a propeller blade.
+    '''Propeller blade stress analysis.
 
-    Uses geometry and solution data from a `Propeller` instance.
-    """
+    Computes centrifugal and bending stresses along blade span using
+    geometry and BEMT solution data from Propeller instance.
+    '''
 
     def __init__(self, propeller: Propeller) -> None:
         self.propeller = propeller
         self.geometry = propeller.geometry
 
-        # Reuse areas computed in Propeller when available.
-        if "cross_section" not in self.geometry:
-            self.propeller.section_areas()
-
     def compute_centrifugal_stress(self, rho: float, omega: float) -> np.ndarray:
-        """Compute centrifugal stress at each radial section.
+        '''Compute centrifugal stress distribution.
 
         Args:
-            rho: Material density (kg/m^3).
+            rho: Material density (kg/m³).
             omega: Angular velocity (rad/s).
 
         Returns:
-            Array of centrifugal stress values (Pa) per section.
-        """
+            Centrifugal stress at each section (Pa), shape (n_sections,).
+        '''
         r = np.asarray(self.geometry["r"])
         cross_section = np.asarray(self.geometry["cross_section"])
 
@@ -54,15 +51,15 @@ class BladeStressCalculator:
         d_t_list: Iterable[float],
         d_q_list: Iterable[float],
     ) -> np.ndarray:
-        """Compute bending stress at each radial section.
+        '''Compute bending stress distribution.
 
         Args:
-            d_t_list: Sectional thrust distribution (N).
-            d_q_list: Sectional torque distribution (N m).
+            d_t_list: Thrust per section (N), shape (n_sections,).
+            d_q_list: Torque per section (N·m), shape (n_sections,).
 
         Returns:
-            Array of bending stress values (Pa) per section.
-        """
+            Bending stress field at each section (Pa), shape (n_sections, n_airfoil_points).
+        '''
         r = np.asarray(self.geometry["r"])
         d_t_list = np.asarray(d_t_list)
         d_q_list = np.asarray(d_q_list)
@@ -116,19 +113,20 @@ class BladeStressCalculator:
         material_rho: float,
         show: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute centrifugal and bending stresses, with optional plot.
+        '''Compute and optionally plot stress distributions.
 
         Args:
-            material_rho: Material density (kg/m^3).
-            show: If True, plot the stress distribution.
+            material_rho: Material density (kg/m³).
+            show: Plot stress distributions if True.
 
         Returns:
-            Tuple of (centrifugal_stress, bending_stress).
-
-        Notes:
-            Uses `propeller.params.omega` and `propeller.solution_data`.
-            Ensure `propeller.run_bemt()` has been called before this method.
-        """
+            Tuple of (sigma_c, sigma_b) where:
+            sigma_c: centrifugal stress (Pa), shape (n_sections,)
+            sigma_b: bending stress (Pa), shape (n_sections, n_airfoil_points)
+            
+        Note:
+            Requires propeller.run_bemt() to have been called first.
+        '''
         sigma_c = self.compute_centrifugal_stress(material_rho, self.propeller.params.omega)
         sigma_b = self.compute_bending_stress(self.propeller.solution_data["d_t"].values / self.geometry["n_blades"], self.propeller.solution_data["d_q"].values / self.geometry["n_blades"])
 
@@ -159,7 +157,15 @@ class BladeStressCalculator:
     def _compute_moment_of_inertia(
         x: np.ndarray, y: np.ndarray
     ) -> Tuple[float, float, float]:
-        """Compute centroidal second moments of area for a polygon."""
+        '''Compute second moments of area for polygon.
+        
+        Args:
+            x: X coordinates, shape (n_points,).
+            y: Y coordinates, shape (n_points,).
+            
+        Returns:
+            Tuple of (I_xx, I_zz, I_xz) in m^4.
+        '''
         n = len(x)
         c_x, c_y = BladeStressCalculator._compute_com(x, y)
         x = x - c_x
@@ -189,7 +195,15 @@ class BladeStressCalculator:
 
     @staticmethod
     def _compute_com(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
-        """Compute polygon centroid (x, y) using the shoelace formula."""
+        '''Compute polygon centroid using Shoelace formula.
+        
+        Args:
+            x: X coordinates, shape (n_points,).
+            y: Y coordinates, shape (n_points,).
+            
+        Returns:
+            Tuple of (x_centroid, y_centroid).
+        '''
         xi = x[:-1]
         yi = y[:-1]
         xi1 = x[1:]

@@ -7,13 +7,11 @@ __all__ = ["F1A"]
 
 
 class F1A:
-    """Compact F1A formulation for acoustic source modeling.
+    '''Farassat 1A acoustic source formulation.
 
-    Computes acoustic pressure from a rotating blade using a torch-optimized
-    compact source formulation. Handles thickness (monopole) and loading (dipole)
-    noise through F1A pressure contributions on moving blade surfaces.
-    All computations are GPU-accelerated via PyTorch.
-    """
+    Computes thickness (monopole) and loading (dipole) noise from rotating
+    propeller blades using compact source approximation. GPU-accelerated via PyTorch.
+    '''
 
     def __init__(
         self,
@@ -33,25 +31,25 @@ class F1A:
         blade_angles: Union[np.ndarray, torch.Tensor],
         device: str,
     ) -> None:
-        """Initialize the compact acoustic source array.
+        '''Initialize F1A acoustic source array.
 
         Args:
-            rho: Ambient fluid density (kg/m³).
-            a_inf: Ambient sound speed (m/s).
-            r: Radial positions of blade sections (m). Shape: (n_sections,).
-            dr: Radial spacing of blade sections (m). Shape: (n_sections,).
-            area: Surface area of blade sections (m²). Shape: (n_sections,).
-            chord: Chord length of blade sections (m). Shape: (n_sections,).
-            twist: Twist angle of blade sections (degrees). Shape: (n_sections,).
-            com_shift_forward: Forward center-of-mass shift (m). Shape: (n_sections,).
-            com_shift_up: Upward center-of-mass shift (m). Shape: (n_sections,).
-            source_times: Time array for source evaluation (s). Shape: (n_times,).
-            omega: Blade angular velocity (rad/s).
-            d_t: Thrust distribution (N). Shape: (n_times, n_blades, n_sections).
-            d_q: Torque distribution (N·m). Shape: (n_times, n_blades, n_sections).
-            blade_angles: Initial blade angles (radians). Shape: (n_blades,).
-            device: PyTorch device for computation ('cpu' or 'cuda').
-        """
+            rho: Fluid density (kg/m³).
+            a_inf: Speed of sound (m/s).
+            r: Radial positions (m), shape (n_sections,).
+            dr: Radial widths (m), shape (n_sections,).
+            area: Section areas (m²), shape (n_sections,).
+            chord: Chord lengths (m), shape (n_sections,).
+            twist: Twist angles (deg), shape (n_sections,).
+            com_shift_forward: Chordwise center offset (m), shape (n_sections,).
+            com_shift_up: Normal center offset (m), shape (n_sections,).
+            source_times: Emission times (s), shape (n_times,).
+            omega: Angular velocity (rad/s).
+            d_t: Thrust distribution (N), shape (n_times, n_blades, n_sections).
+            d_q: Torque distribution (N·m), shape (n_times, n_blades, n_sections).
+            blade_angles: Blade phase offsets (rad), shape (n_blades,).
+            device: PyTorch device ('cpu' or 'cuda').
+        '''
         torch.backends.opt_einsum.strategy = "branch-all"
         self.device: torch.device = torch.device(device)
         self.dtype: torch.dtype = torch.float32
@@ -124,20 +122,15 @@ class F1A:
         self._initialize_geometry_and_kinematics()
 
     def _initialize_geometry_and_kinematics(self) -> None:
-        """Compute kinematic properties of rotating blade sections.
+        '''Compute kinematic properties of rotating blade sources.
 
-        Calculates position, velocity, acceleration, jerk, and force derivatives in the
-        fixed reference frame by rotating sections from the blade-fixed moving frame.
-        Also computes temporal derivatives of forces using 4th-order finite differences.
-
-        Stores the following as instance attributes:
-            - pos_fixed: Source positions in fixed frame
-            - vel_fixed: Velocity of sources
-            - acc_fixed: Acceleration of sources
-            - jerk_fixed: Jerk (time derivative of acceleration)
-            - force_fixed: Forces in fixed frame
-            - force_der_fixed: Time derivative of forces in fixed frame
-        """
+        Calculates position, velocity, acceleration, jerk, and force derivatives
+        in the fixed reference frame. Uses 4th-order finite differences for
+        time derivatives of forces.
+        
+        Stores pos_fixed, vel_fixed, acc_fixed, jerk_fixed, force_fixed,
+        and force_der_fixed as instance attributes.
+        '''
         # Blade section positions in blade-fixed (rotating) frame
         pos_moving: torch.Tensor = torch.stack(
             [

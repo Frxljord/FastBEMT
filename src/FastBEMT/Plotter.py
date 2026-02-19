@@ -1,13 +1,31 @@
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .Propeller import Propeller
 
 
 class Plotter:
-    def __init__(self, propeller):
+    '''Visualization utilities for propeller acoustic results.'''
+    
+    def __init__(self, propeller: 'Propeller') -> None:
+        '''Initialize plotter with propeller instance.
+        
+        Args:
+            propeller: Propeller object with computed acoustic results.
+        '''
         self.propeller = propeller
 
-    def plot_observer_report(self):
+    def plot_observer_report(self) -> None:
+        '''Plot time histories and frequency spectra for all observers.
+        
+        Creates multi-panel figure showing:
+        - Time history of monopole, dipole, and total pressure
+        - Frequency spectrum (SPL) with blade passing frequency harmonics
+        - Overall A-weighted SPL for each observer
+        '''
         n_obs = self.propeller.observer_positions.shape[0]
         fig = plt.figure(figsize=(15, 3.5 * n_obs))
         gs = gridspec.GridSpec(n_obs, 2, figure=fig)

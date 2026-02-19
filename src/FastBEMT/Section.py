@@ -1,9 +1,10 @@
-"""Fast Blade Element Momentum Theory (BEMT) solver.
+'''Blade Element Momentum Theory (BEMT) section solver.
 
-This module provides a faster version of the BEMT solver by:
-- Reusing pre-built `aerosandbox.Airfoil` objects per section
-- Caching / pre-tabulating airfoil coefficients
-"""
+Provides aerodynamic analysis for propeller blade sections with:
+- Pre-built aerosandbox.Airfoil objects per section
+- Cached airfoil coefficient tables for performance
+- Prandtl tip and hub loss corrections
+'''
 
 import numpy as np
 import scipy.optimize
@@ -17,17 +18,19 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 @dataclass
 class RootResult:
-    """Lightweight result object with a `root` attribute for fallback use."""
-
+    '''Fallback root finding result with root attribute.
+    
+    Attributes:
+        root: Solution value (radians).
+    '''
     root: float
 
 class SectionForces:
-    """Blade Element Momentum Theory (BEMT) solver for a single radial section.
+    '''BEMT solver for a single propeller blade radial section.
 
-    Handles aerodynamic calculations for a blade section including airfoil
-    coefficient lookup, loss factor calculations, and iterative inflow angle
-    solutions.
-    """
+    Solves momentum and blade element equations iteratively to determine
+    inflow angle, forces, and aerodynamic coefficients at one radial station.
+    '''
 
     def __init__(
         self,
@@ -41,16 +44,19 @@ class SectionForces:
         hub_radius: float,
         n_blades: int,
     ) -> None:
-        """Initialize per-section geometry, flow state, and cached data.
+        '''Initialize blade section geometry and flow parameters.
 
         Args:
-            airfoil: AeroSandbox Airfoil object for aerodynamic lookups.
-            r: Radial distance from propeller hub (m).
-            dr: Radial element thickness (m).
+            airfoil: AeroSandbox Airfoil object for coefficient lookups.
+            r: Radial position from hub center (m).
+            dr: Radial element width (m).
             chord: Section chord length (m).
-            theta: Section geometric twist angle (radians).
-            propeller_params: Global aerodynamic parameters object.
-        """
+            theta: Geometric twist angle (radians).
+            params: Simulation parameters.
+            prop_radius: Propeller tip radius (m).
+            hub_radius: Propeller hub radius (m).
+            n_blades: Number of blades.
+        '''
         self.airfoil = airfoil
         self.r = r
         self.dr = dr
@@ -68,19 +74,19 @@ class SectionForces:
 
     @property
     def sigma(self) -> float:
-        """Local solidity (blade area ratio) for this section.
+        '''Local solidity ratio.
 
         Returns:
-            Solidity value (dimensionless).
-        """
+            Blade area ratio at this radial station (dimensionless).
+        '''
         return self.n_blades * self.chord / (2 * np.pi * self.r)
 
     def _build_prandtl_loss_table(self) -> None:
-        """Precompute Prandtl tip-hub loss factor on inflow angle grid.
+        '''Precompute Prandtl tip and hub loss factors.
 
-        Pre-tabulates the loss factor on a phi (inflow angle) grid for fast
-        interpolation during iterative BEMT solving. Avoids recomputation.
-        """
+        Tabulates loss factor vs inflow angle for fast interpolation during
+        iterative BEMT solution, avoiding repeated computation.
+        '''
         self._phi_grid = np.linspace(np.radians(-89.9), np.radians(89.9), 401)
 
         sin_phi = np.sin(self._phi_grid)
@@ -101,14 +107,14 @@ class SectionForces:
         self._f_grid = f_tip_loss * f_hub_loss
 
     def prandtl_loss(self, phi: float) -> float:
-        """Return Prandtl tip-hub loss factor for a given inflow angle.
+        '''Get Prandtl combined tip-hub loss factor.
 
         Args:
             phi: Inflow angle (radians).
 
         Returns:
-            Prandtl loss factor (0 to 1), where 1 means no loss.
-        """
+            Loss factor from 0 to 1, where 1 indicates no loss.
+        '''
         return np.interp(phi, self._phi_grid, self._f_grid)
 
     def airfoil_coefficients(
@@ -116,22 +122,22 @@ class SectionForces:
         alpha: float,
         re: float,
         ma: float,
-        model_size: str = "xxxlarge",
+        model_size: str = 'xxxlarge',
     ) -> tuple[float, float]:
-        """Return lift and drag coefficients for given angle and flow conditions.
+        '''Compute lift and drag coefficients using NeuralFoil.
 
-        Uses neural network predictions (NeuralFoil) with caching to maximize
-        table reuse. Coefficients are binned by Reynolds and Mach for efficiency.
+        Caches coefficient tables binned by Reynolds and Mach numbers for
+        fast interpolation. Also computes boundary layer displacement thickness.
 
         Args:
             alpha: Angle of attack (degrees).
-            re: Reynolds number.
-            ma: Mach number.
-            model_size: NeuralFoil model size (default 'xxxlarge').
+            re: Reynolds number (dimensionless).
+            ma: Mach number (dimensionless).
+            model_size: NeuralFoil model size, default 'xxxlarge'.
 
         Returns:
-            Tuple of (lift_coefficient, drag_coefficient).
-        """
+            Tuple of (Cl, Cd).
+        '''
         # Bin Reynolds and Mach to coarse grid for table reuse
         re_bin = round(re, -4)
         ma_bin = round(ma, 0)
@@ -199,16 +205,17 @@ class SectionForces:
         return c_l, c_d
 
     def section_parameters(self, phi: float) -> tuple:
-        """Compute aerodynamic section parameters for a given inflow angle.
+        '''Compute section aerodynamic state for given inflow angle.
 
         Args:
             phi: Inflow angle (radians).
 
         Returns:
             Tuple of (alpha, c_l, c_d, loss_factor, u, a_prime, w, c_l_prime,
-            c_d_prime, v_a, v_t) containing angle of attack, force coefficients,
-            loss factor, and velocity components.
-        """
+            c_d_prime, v_a, v_t) containing angle of attack (deg), coefficients,
+            loss factor, induced velocity (m/s), tangential induction factor,
+            relative velocity (m/s), rotated coefficients, and velocity components.
+        '''
         # Compute angle of attack
         alpha = np.degrees(self.theta - phi)
 
@@ -248,14 +255,14 @@ class SectionForces:
         )
 
     def residual_function(self, phi: float) -> float:
-        """Residual of the inflow angle equation for root finding.
+        '''Momentum equation residual for iterative solution.
 
         Args:
-            phi: Inflow angle to evaluate (radians).
+            phi: Inflow angle (radians).
 
         Returns:
-            Residual value; root is where this equals zero.
-        """
+            Residual value, zero at solution.
+        '''
         (
             _,
             _,
@@ -274,23 +281,32 @@ class SectionForces:
     def solve(
         self,
         v_inf: float,
-        prev_phi: float | None = None,
+        prev_phi: Optional[float] = None,
     ) -> tuple:
-        """Solve for inflow angle and return section forces and kinematics.
+        '''Solve BEMT equations for this section.
 
-        Uses iterative root finding to solve the momentum equation. If a previous
-        inflow angle is provided, uses it to define a tighter bracket for faster
-        convergence.
+        Iteratively finds inflow angle satisfying momentum balance. Uses previous
+        solution for faster convergence when available.
 
         Args:
             v_inf: Freestream velocity (m/s).
-            prev_phi: Previous section inflow angle (radians) for bracket initialization.
+            prev_phi: Previous inflow angle for warm start (radians).
 
         Returns:
             Tuple of (phi, d_t, d_q, alpha, u, a_prime, c_l, c_d, loss_factor,
-            w, reynolds, mach, delta_star_upper, delta_star_lower) containing
-            inflow angle, forces, and boundary layer displacement thicknesses.
-        """
+            w, reynolds, mach, delta_star_upper, delta_star_lower) where:
+            phi: inflow angle (radians)
+            d_t: thrust contribution (N)
+            d_q: torque contribution (N·m)
+            alpha: angle of attack (deg)
+            u: induced velocity (m/s)
+            a_prime: tangential induction factor
+            c_l, c_d: rotated coefficients
+            loss_factor: Prandtl factor
+            w: relative velocity (m/s)
+            reynolds, mach: flow conditions
+            delta_star_upper, delta_star_lower: displacement thickness (m)
+        '''
         self.v_inf = v_inf
         if self.re is None or self.ma is None:
             v_local = np.sqrt(self.v_inf**2 + (self.params.omega * self.r) ** 2)

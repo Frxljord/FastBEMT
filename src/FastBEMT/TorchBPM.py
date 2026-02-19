@@ -8,18 +8,16 @@ def _torch_select(
     choices: Sequence[Union[torch.Tensor, float]],
     default_value: float = 0.0,
 ) -> torch.Tensor:
-    """Convert np.select-like logic to torch.where() without type conversion overhead.
-
-    Assumes all condition and choice tensors are already on the correct device.
+    '''Torch-based conditional selection similar to np.select.
 
     Args:
-        conditions: List of boolean tensors
-        choices: List of tensors/scalars corresponding to each condition
-        default_value: Default value when no condition is met
+        conditions: List of boolean tensors.
+        choices: List of tensors/scalars for each condition.
+        default_value: Default value when no condition is met.
 
     Returns:
-        Tensor with selected values based on conditions
-    """
+        Selected values based on conditions.
+    '''
     result = torch.full_like(conditions[0], default_value, dtype=conditions[0].dtype)
     for cond, choice in zip(reversed(conditions), reversed(choices)):
         if not isinstance(choice, torch.Tensor):
@@ -29,16 +27,16 @@ def _torch_select(
 
 
 def st(f: torch.Tensor, l: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-    """Compute Strouhal number: f * l / u (expects torch tensors).
+    '''Compute Strouhal number: St = f * l / u.
 
     Args:
-        f: Frequency tensor
-        l: Length scale tensor
-        u: Velocity tensor
+        f: Frequency, shape (n_freqs,).
+        l: Length scale, shape (n_sections,).
+        u: Velocity, shape (n_sections,).
 
     Returns:
-        Strouhal number tensor
-    """
+        Strouhal number, shape (n_freqs, n_sections).
+    '''
     return f[:, None] * l / u[None, :]
 
 
@@ -771,13 +769,12 @@ def calc_l_tip(chord: torch.Tensor, alpha_tip: torch.Tensor) -> torch.Tensor:
 
 
 class BPM:
-    """BPM broadband noise prediction model using PyTorch.
+    '''Brooks-Pope-Marcolini broadband noise model.
 
-    Implements the BPM model for computing broadband noise sources from propeller
-    blades including turbulent boundary layer (TBL), laminar boundary layer (LBL),
-    trailing edge (TE), tip vortex (TV), and blade-wake interaction (BWI) noise.
-    All computations are device-agnostic (CPU/GPU).
-    """
+    Implements BPM noise prediction for turbulent boundary layer (TBL),
+    laminar boundary layer (LBL), trailing edge (TE), tip vortex (TV),
+    and blade-wake interaction (BWI) noise sources. GPU-accelerated via PyTorch.
+    '''
 
     def __init__(
         self,
@@ -805,22 +802,33 @@ class BPM:
         num_obs_times: int,
         device: str,
     ) -> None:
-        """Initialize BPM model with explicit geometry and acoustic parameters.
+        '''Initialize BPM model.
 
         Args:
-            frequencies: Frequency array for acoustic analysis (Hz).
-            r, dr, chord, alpha, vi, u, re_c, m, delta_p, delta_s: per-section arrays.
-            boat_tail_angle: per-section or scalar boat tail angle.
-            src_times: Source emission times array.
-            a_inf: Ambient sound speed (m/s).
-            omega: Propeller rotation speed (rad/s).
-            blade_angles: Blade phase offsets (rad).
-            twist: Per-section twist (degrees).
-            com_shift_forward, com_shift_up: chord offset scalars.
-            observer_time_range: duration for uniform observer time grid.
-            num_obs_times: number of uniform observer time steps.
-            device: Torch device ('cpu' or 'cuda').
-        """
+            frequencies: Frequency array (Hz), shape (n_freqs,).
+            r: Radial positions (m), shape (n_sections,).
+            dr: Radial widths (m), shape (n_sections,).
+            chord: Chord lengths (m), shape (n_sections,).
+            alpha: Angle of attack (deg), shape (n_sections,).
+            vi: Induced velocity (m/s), shape (n_sections,).
+            u: Relative velocity (m/s), shape (n_sections,).
+            re_c: Reynolds number, shape (n_sections,).
+            m: Mach number, shape (n_sections,).
+            delta_p: Pressure side displacement thickness (m), shape (n_sections,).
+            delta_s: Suction side displacement thickness (m), shape (n_sections,).
+            boat_tail_angle: Trailing edge angle (deg), scalar or shape (n_sections,).
+            src_times: Source emission times (s), shape (n_times,).
+            a_inf: Speed of sound (m/s).
+            rho: Density (kg/m³).
+            omega: Angular velocity (rad/s).
+            blade_angles: Blade phase offsets (rad), shape (n_blades,).
+            twist: Twist angles (deg), shape (n_sections,).
+            com_shift_forward: Chordwise center offset, scalar or shape (n_sections,).
+            com_shift_up: Normal center offset, scalar or shape (n_sections,).
+            observer_time_range: Duration for observer time grid (s).
+            num_obs_times: Number of observer time steps.
+            device: PyTorch device ('cpu' or 'cuda').
+        '''
         self.device = torch.device(device)
         self.dtype = torch.float32
 
@@ -874,14 +882,12 @@ class BPM:
         )
 
     def generate_trajectory_and_basis(self) -> None:
-        """Generate 4D blade element trajectory and time-varying local basis vectors.
+        '''Generate blade element trajectories and local basis vectors.
 
-        Calculates the spatial position of all blade elements at each emission time
-        and computes the time-varying local basis vectors (thrust, radial, tangential)
-        in the fixed global coordinate frame. Results are stored as instance attributes:
-        - pos_fixed: Global positions of shape (time, section, blade, 3)
-        - e_xl, e_yl, e_zl: Local basis vectors of shape (time, blade, 3)
-        """
+        Computes global positions of all blade elements at each emission time
+        and time-varying local basis vectors (thrust, radial, tangential).
+        Stores pos_fixed and e_xl, e_yl, e_zl as instance attributes.
+        '''
         # Blade section positions in blade-fixed (rotating) frame.
         pos_moving: torch.Tensor = torch.stack(
             [
