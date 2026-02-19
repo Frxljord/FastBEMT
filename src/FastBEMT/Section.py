@@ -11,6 +11,7 @@ import scipy.optimize
 import aerosandbox as asb
 import warnings
 from dataclasses import dataclass
+from typing import Optional
 from .JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
