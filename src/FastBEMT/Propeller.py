@@ -6,9 +6,9 @@ from typing import Any, Tuple, Dict, List, Optional, Union
 import pyfar as pf
 
 from .Section import SectionForces
-from .TorchCompactSource import F1A
+from .F1A import F1A
 from .JobParameters import LowFidelityParameters
-from .TorchBPM import BPM
+from .BPM import BPM
 
 
 class Propeller:
