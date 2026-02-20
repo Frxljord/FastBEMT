@@ -91,5 +91,6 @@ Blade structural analysis tools computing:
 ## Installation
 
 ```bash
+uv sync
 pip install -e .
 ```
