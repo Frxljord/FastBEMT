@@ -104,7 +104,6 @@ class BladeStressCalculator:
                 -(m_z * i_xx + m_x * i_xz) / denominator * x_coords
                 + (m_x * i_zz + m_z * i_xz) / denominator * z_coords
             )
-            # stresses.append(np.max(np.abs(sigma_total)))
             stresses.append(sigma_total)
         return np.array(stresses)
 
