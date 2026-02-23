@@ -122,6 +122,7 @@ class Propeller:
         self.v_inf: Optional[np.ndarray] = None
         self.observer_positions: Optional[np.ndarray] = None
         self.spl_breakdown: Dict[str, np.ndarray] = {}
+        self.third_octave_total_oaspl_full: Optional[np.ndarray] = None
 
     def process_section(
         self,

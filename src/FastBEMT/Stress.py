@@ -135,16 +135,16 @@ class BladeStressCalculator:
             import matplotlib.pyplot as plt
 
             plt.figure(figsize=(8, 5))
-            plt.plot(self.geometry["r"], sigma_c, label="Centrifugal Stress")
-            plt.plot(self.geometry["r"], sigma_b, label="Bending Stress")
+            plt.plot(self.geometry["r"], sigma_c/1e6, label="Centrifugal Stress")
+            plt.plot(self.geometry["r"], sigma_b.max(axis=1)/1e6, label="Bending Stress")
             plt.plot(
                 self.geometry["r"],
-                sigma_c + sigma_b,
+                (sigma_c + sigma_b.max(axis=1))/1e6,
                 label="Total Stress",
                 linestyle="--",
             )
             plt.xlabel("Radius [m]")
-            plt.ylabel("Stress [Pa]")
+            plt.ylabel("Stress [MPa]")
             plt.title("Blade Stresses vs Radius")
             plt.legend()
             plt.grid(True)
