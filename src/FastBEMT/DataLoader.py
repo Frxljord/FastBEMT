@@ -32,19 +32,40 @@ def _repo_root() -> Path:
     return _find_repo_root(Path.cwd())
 
 
-def load_propeller_dict(name: str) -> Dict[str, Any]:
-    '''Load propeller geometry dictionary from pickle file.
+def load_propeller_dict(name: str) -> list[tuple[str, Dict[str, Any]]]:
+    '''Load propeller geometry dictionary from pickle file or directory.
     
     Args:
-        name: Propeller name (filename without .pkl extension).
+        name: Propeller name (filename without .pkl extension) or directory path
+              relative to Datasets/Propellers/. If a directory is provided,
+              all .pkl files in that directory will be loaded.
         
     Returns:
-        Dictionary containing propeller geometry with keys: 'r', 'dr', 'chord',
-        'twist', 'airfoil', 'COM_shift', 'tip_radius', 'hub_radius', 'n_blades'.
+        List of tuples (propeller_name, geometry_dict) containing propeller
+        geometry with keys: 'r', 'dr', 'chord', 'twist', 'airfoil', 'COM_shift',
+        'tip_radius', 'hub_radius', 'n_blades'. Returns a single-item list if
+        loading a single file.
     '''
-    path = _repo_root() / 'Datasets' / 'Propellers' / f'{name}.pkl'
+    base_path = _repo_root() / 'Datasets' / 'Propellers'
+    path = base_path / name
+    
+    # Check if it's a directory
+    if path.is_dir():
+        propellers = []
+        for pkl_file in sorted(path.glob('*.pkl')):
+            propeller_name = pkl_file.stem
+            with pkl_file.open('rb') as f:
+                propellers.append((propeller_name, pickle.load(f)))
+        return propellers
+    
+    # Otherwise treat as file
+    if not path.suffix:
+        path = path.with_suffix('.pkl')
+    
+    # Extract name without path and extension
+    propeller_name = path.stem
     with path.open('rb') as f:
-        return pickle.load(f)
+        return [(propeller_name, pickle.load(f))]
 
 
 def figures_dir() -> Path:
