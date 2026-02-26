@@ -147,7 +147,7 @@ class SectionForces:
         # Lazily build lookup table for this (Re_bin, Ma_bin)
         if key not in self._tables:
             # Alpha grid in degrees for tabulation
-            alpha_grid = np.linspace(0.0, 30.0, 61)
+            alpha_grid = np.linspace(-20.0, 40.0, 121)
             full_output = asb.Airfoil.get_aero_from_neuralfoil(
                 self.airfoil,
                 alpha=alpha_grid,
@@ -315,13 +315,13 @@ class SectionForces:
             self.re = self.params.rho * v_local * self.chord / self.params.mu
 
         # Define bounds for inflow angle based on residual sign at phi=0.
-        # residual_at_zero = self.residual_function(1e-6)
-        # if residual_at_zero > 0:
-        #     phi_min_default = np.radians(-89.9)
-        #     phi_max_default = np.radians(-0.1)
-        # else:
-        phi_min_default = np.radians(0.1)
-        phi_max_default = np.radians(89.9)
+        residual_at_zero = self.residual_function(1e-6)
+        if residual_at_zero > 0:
+            phi_min_default = np.radians(-89.9)
+            phi_max_default = np.radians(-0.1)
+        else:
+            phi_min_default = np.radians(0.1)
+            phi_max_default = np.radians(89.9)
 
         if prev_phi is None:
             bracket = [phi_min_default, phi_max_default]
