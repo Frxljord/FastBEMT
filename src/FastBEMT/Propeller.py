@@ -302,7 +302,7 @@ class Propeller:
                 Uses solution_data['d_t'] if None.
             local_dq: Torque distribution override, shape (n_times, n_blades, n_sections).
                 Uses solution_data['d_q'] if None.
-            lt: BPM trailing edge noise switch (1=turbulent, 0=laminar).
+            lt: Turbulent length scale
             i: Turbulence intensity for BPM (dimensionless).
             alpha_stall: Stall angle for BPM separation noise (degrees).
             keep_bpm_components: Store individual BPM component SPL if True.
