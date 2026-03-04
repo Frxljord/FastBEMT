@@ -46,7 +46,7 @@ def load_propeller_dict(name: str) -> list[tuple[str, Dict[str, Any]]]:
         'tip_radius', 'hub_radius', 'n_blades'. Returns a single-item list if
         loading a single file.
     '''
-    base_path = _repo_root() / 'Datasets' / 'Propellers'
+    base_path = _repo_root() / 'Datasets'
     path = base_path / name
     
     # Check if it's a directory
