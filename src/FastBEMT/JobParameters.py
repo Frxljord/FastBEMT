@@ -40,6 +40,7 @@ class LowFidelityParameters:
         self.a_inf = a_inf
         self.rho = rho
         self.mu = mu
+        self.n_blades = n_blades
         self.p_ref = p_ref
         self.revolutions = revolutions
         self.num_obs_times_per_rev = num_obs_times_per_rev
