@@ -11,10 +11,32 @@ import scipy.optimize
 import aerosandbox as asb
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 from .JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+def compute_com(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    '''Compute polygon centroid using Shoelace formula.
+    
+    Args:
+        x: X coordinates, shape (n_points,).
+        y: Y coordinates, shape (n_points,).
+        
+    Returns:
+        Tuple of (x_centroid, y_centroid).
+    '''
+    xi = x[:-1]
+    yi = y[:-1]
+    xi1 = x[1:]
+    yi1 = y[1:]
+
+    a = xi * yi1 - xi1 * yi
+    area = 0.5 * np.sum(a)
+
+    c_x = (1.0 / (6.0 * area)) * np.sum((xi + xi1) * a)
+    c_y = (1.0 / (6.0 * area)) * np.sum((yi + yi1) * a)
+    return c_x, c_y
 
 
 @dataclass
