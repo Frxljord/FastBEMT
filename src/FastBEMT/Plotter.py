@@ -115,7 +115,7 @@ class Plotter:
         domain_size: float = 5.0,
         figsize: Tuple[float, float] = (4.5, 2),
         cmap: str = 'magma',
-        show_contours: bool = True,
+        show_contours: Optional[Tuple[float]] = None,
         save_path: Optional[str] = None,
     ) -> None:
         '''Plot 2D acoustic radiation pattern as contour map.
@@ -175,10 +175,9 @@ class Plotter:
         
         # Add contour lines if requested
         if show_contours:
-            line_levels = [60]
             label_coords = [(2.0, 2.0), (2.0, 1.0), (2.0, 3.0), (2.0, 3.0), (2.0, 3.0), (2.0, 3.0)]
             
-            for level, coord in zip(line_levels, label_coords):
+            for level, coord in zip(show_contours, label_coords):
                 cntr = ax.contour(
                     Y_plot, X_plot, third_octave_oaspl_full,
                     levels=[level], colors='white',
