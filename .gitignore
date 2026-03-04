@@ -12,6 +12,6 @@ wheels/
 .github
 .vscode
 
-Datasets/Measurements/
-Datasets/Background/
+Datasets
+Figures
 VD
