@@ -34,7 +34,7 @@ class Plotter:
 
         fontsize = 10
         colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-        blade_passing_freq = 1 / self.propeller.acoustic_params.blade_passing_period
+        blade_passing_freq = 1 / self.propeller.params.blade_passing_period
 
         ax_spl = fig.add_subplot(gs[:, 1])
 
