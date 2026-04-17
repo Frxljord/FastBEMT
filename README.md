@@ -1,6 +1,6 @@
 # FastBEMT
 
-A fast approximate BEMT (Blade Element Momentum Theory) solver for propeller aeroacoustic analysis.
+A fast approximate BEMT (Blade Element Momentum Theory) solver for propeller aerodynamic/aeroacoustic analysis.
 
 ## Overview
 
