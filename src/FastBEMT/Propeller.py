@@ -310,39 +310,93 @@ class Propeller:
         self.observer_positions = observer_positions
         self.third_octave_total_oaspl = None
 
+        # Exclude malformed sections so NaN BEMT outputs cannot pollute acoustics.
+        geom_r = np.asarray(self.geometry['r'])
+        geom_dr = np.asarray(self.geometry['dr'])
+        geom_chord = np.asarray(self.geometry['chord'])
+        geom_twist = np.asarray(self.geometry['twist'])
+        geom_area = np.asarray(self.geometry['cross_section'])
+        geom_boat_tail = np.asarray(self.geometry['boat_tail_angle'])
+        n_blades = int(self.geometry['n_blades'])
+
+        sol_d_t = np.asarray(self.solution_data['d_t'].values)
+        sol_d_q = np.asarray(self.solution_data['d_q'].values)
+        sol_alpha = np.asarray(self.solution_data['alpha'].values)
+        sol_u = np.asarray(self.solution_data['u'].values)
+        sol_w = np.asarray(self.solution_data['W'].values)
+        sol_re = np.asarray(self.solution_data['Re'].values)
+        sol_ma = np.asarray(self.solution_data['Ma'].values)
+        sol_dp = np.asarray(self.solution_data['dp'].values)
+        sol_ds = np.asarray(self.solution_data['ds'].values)
+
+        section_mask = (
+            np.isfinite(geom_r)
+            & (np.abs(geom_r) > 1e-12)
+            & np.isfinite(geom_dr)
+            & np.isfinite(geom_chord)
+            & np.isfinite(geom_twist)
+            & np.isfinite(geom_area)
+            & np.isfinite(geom_boat_tail)
+            & np.isfinite(sol_d_t)
+            & np.isfinite(sol_d_q)
+            & np.isfinite(sol_alpha)
+            & np.isfinite(sol_u)
+            & np.isfinite(sol_w)
+            & np.isfinite(sol_re)
+            & np.isfinite(sol_ma)
+            & np.isfinite(sol_dp)
+            & np.isfinite(sol_ds)
+        )
+        if not np.any(section_mask):
+            raise ValueError('No valid blade sections available for aeroacoustics.')
+        if not np.all(section_mask):
+            n_invalid = int((~section_mask).sum())
+            print(
+                f'[WARN] run_aeroacoustics dropped {n_invalid} invalid section(s) '
+                'with non-finite aerodynamic/geometry data.'
+            )
+
+        r = geom_r[section_mask]
+        dr = geom_dr[section_mask]
+        chord = geom_chord[section_mask]
+        twist = geom_twist[section_mask]
+        area = geom_area[section_mask]
+        boat_tail_angle = geom_boat_tail[section_mask]
+        com_shift_forward = np.asarray(self.com_shift_forward)[section_mask]
+        com_shift_up = np.asarray(self.com_shift_up)[section_mask]
+
+        alpha = sol_alpha[section_mask]
+        vi = sol_u[section_mask]
+        u = sol_w[section_mask]
+        re_c = sol_re[section_mask]
+        m = sol_ma[section_mask]
+        delta_p = sol_dp[section_mask]
+        delta_s = sol_ds[section_mask]
+
         # Prepare local force distributions per unit span and per blade
         if local_dt is None or local_dq is None:
-            local_dt = (
-                self.solution_data["d_t"].values
-                / self.geometry["dr"]
-                / self.geometry["n_blades"]
-            )
-            local_dq = (
-                self.solution_data["d_q"].values
-                / self.geometry["dr"]
-                / self.geometry["r"]
-                / self.geometry["n_blades"]
-            )
+            local_dt = sol_d_t[section_mask] / dr / n_blades
+            local_dq = sol_d_q[section_mask] / dr / r / n_blades
             # Broadcast to source time and blade dimensions
             local_dt = np.broadcast_to(
                 local_dt[None, None, :],
                 (
                     self.params.num_src_times,
-                    self.geometry["n_blades"],
-                    len(self.geometry["r"]),
+                    n_blades,
+                    len(r),
                 ),
             )
             local_dq = np.broadcast_to(
                 local_dq[None, None, :],
                 (
                     self.params.num_src_times,
-                    self.geometry["n_blades"],
-                    len(self.geometry["r"]),
+                    n_blades,
+                    len(r),
                 ),
             )
         else:
-            local_dt = local_dt / self.geometry["dr"]
-            local_dq = local_dq / self.geometry["dr"] / self.geometry["r"]
+            local_dt = np.asarray(local_dt)[..., section_mask] / dr
+            local_dq = np.asarray(local_dq)[..., section_mask] / dr / r
 
         with torch.inference_mode():
             # Initialize F1A compact source acoustic array
@@ -350,13 +404,13 @@ class Propeller:
                 F1A,
                 rho=self.params.rho,
                 a_inf=self.params.a_inf,
-                r=self.geometry["r"],
-                dr=self.geometry["dr"],
-                area=self.geometry["cross_section"],
-                chord=self.geometry["chord"],
-                twist=self.geometry["twist"],
-                com_shift_forward=self.com_shift_forward,
-                com_shift_up=self.com_shift_up,
+                r=r,
+                dr=dr,
+                area=area,
+                chord=chord,
+                twist=twist,
+                com_shift_forward=com_shift_forward,
+                com_shift_up=com_shift_up,
                 source_times=self.params.src_times,
                 omega=self.params.omega,
                 d_t=local_dt,
@@ -370,25 +424,25 @@ class Propeller:
             bpm = self._time_cuda(
                 BPM,
                 frequencies=self.third_octave_freqs,
-                r=self.geometry["r"],
-                dr=self.geometry["dr"],
-                chord=self.geometry["chord"],
-                alpha=self.solution_data["alpha"].values,
-                vi=self.solution_data["u"].values,
-                u=self.solution_data["W"].values,
-                re_c=self.solution_data["Re"].values,
-                m=self.solution_data["Ma"].values,
-                delta_p=self.solution_data["dp"].values,
-                delta_s=self.solution_data["ds"].values,
-                boat_tail_angle=self.geometry["boat_tail_angle"],
+                r=r,
+                dr=dr,
+                chord=chord,
+                alpha=alpha,
+                vi=vi,
+                u=u,
+                re_c=re_c,
+                m=m,
+                delta_p=delta_p,
+                delta_s=delta_s,
+                boat_tail_angle=boat_tail_angle,
                 src_times=self.params.src_times_one_rotation,
                 a_inf=self.params.a_inf,
                 rho=self.params.rho,
                 omega=self.params.omega,
                 blade_angles=self.params.blade_angles,
-                twist=self.geometry["twist"],
-                com_shift_forward=self.com_shift_forward,
-                com_shift_up=self.com_shift_up,
+                twist=twist,
+                com_shift_forward=com_shift_forward,
+                com_shift_up=com_shift_up,
                 observer_time_range=self.params.observer_time_range
                 / self.params.revolutions,
                 num_obs_times=self.params.num_obs_times // self.params.revolutions,
