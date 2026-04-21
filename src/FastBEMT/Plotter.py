@@ -4,6 +4,7 @@ import matplotlib as mpl
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from typing import TYPE_CHECKING, Optional, Tuple
+from FastBEMT.Stress import BladeStressCalculator
 
 if TYPE_CHECKING:
     from .Propeller import Propeller
@@ -201,7 +202,7 @@ class Plotter:
         self,
         sigma_c: np.ndarray,
         sigma_b: np.ndarray,
-        stress_calculator: 'BladeStressCalculator',
+        stress_calculator: BladeStressCalculator,
         figsize: Tuple[float, float] = (4.5, 3),
         cmap: str = 'viridis',
         save_path: Optional[str] = None,
