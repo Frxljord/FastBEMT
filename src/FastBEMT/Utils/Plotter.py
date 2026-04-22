@@ -4,10 +4,10 @@ import matplotlib as mpl
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from typing import TYPE_CHECKING, Optional, Tuple
-from FastBEMT.Stress import BladeStressCalculator
+from .Stress import BladeStressCalculator
 
 if TYPE_CHECKING:
-    from .Propeller import Propeller
+    from ..Propeller import Propeller
 
 
 class Plotter:
@@ -116,7 +116,8 @@ class Plotter:
         domain_size: float = 5.0,
         figsize: Tuple[float, float] = (4.5, 2),
         cmap: str = 'magma',
-        show_contours: Optional[Tuple[float]] = None,
+        contour_levels: Optional[Tuple[float]] = None,
+        mirror: Optional[bool] = True,
         save_path: Optional[str] = None,
     ) -> None:
         '''Plot 2D acoustic radiation pattern as contour map.
@@ -134,11 +135,14 @@ class Plotter:
         '''
         # Reshape and mirror pre-calculated data
         third_octave_oaspl = self.propeller.third_octave_total_oaspl.reshape(grid_size, grid_size)
-        third_octave_oaspl_full = np.vstack([
-            third_octave_oaspl[::-1, :],     # Flip for negative y
-            third_octave_oaspl[1:, :],       # Original positive y, skip y=0 to avoid duplication
-        ])
-        
+        if mirror:
+            third_octave_oaspl_full = np.vstack([
+                third_octave_oaspl[::-1, :],     # Flip for negative y
+                third_octave_oaspl[1:, :],       # Original positive y, skip y=0 to avoid duplication
+            ])
+        else:
+            third_octave_oaspl_full = third_octave_oaspl
+
         # Create figure
         fig, ax = plt.subplots(figsize=figsize)
         
@@ -149,7 +153,7 @@ class Plotter:
         x_range_plot = np.linspace(-domain_size, domain_size, grid_size)
         y_range_plot = np.linspace(-domain_size, domain_size, 2 * grid_size - 1)
         X_plot, Y_plot = np.meshgrid(x_range_plot, y_range_plot)
-        
+
         # Plot with smooth coloring
         smooth_levels = np.linspace(vmin, vmax, 1000)
         ax.contourf(Y_plot, X_plot, third_octave_oaspl_full, levels=smooth_levels, cmap=cmap)
@@ -175,10 +179,10 @@ class Plotter:
         ax.plot(r_disk * np.cos(angles), r_disk * np.sin(angles), '--', c='g', linewidth=1)
         
         # Add contour lines if requested
-        if show_contours:
+        if contour_levels:
             label_coords = [(2.0, 2.0), (2.0, 1.0), (2.0, 3.0), (2.0, 3.0), (2.0, 3.0), (2.0, 3.0)]
             
-            for level, coord in zip(show_contours, label_coords):
+            for level, coord in zip(contour_levels, label_coords):
                 cntr = ax.contour(
                     Y_plot, X_plot, third_octave_oaspl_full,
                     levels=[level], colors='white',

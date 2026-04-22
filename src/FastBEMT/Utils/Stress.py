@@ -5,7 +5,7 @@ from typing import Iterable, Tuple
 import numpy as np
 from scipy.interpolate import interp1d
 
-from .Propeller import Propeller
+from ..Propeller import Propeller
 
 
 class BladeStressCalculator:

@@ -1303,61 +1303,6 @@ class BPM:
 
         return spp_full
 
-    def _interp_tensor_vectorized(
-        self,
-        x_new: torch.Tensor,
-        x_old: torch.Tensor,
-        y_old: torch.Tensor,
-    ) -> torch.Tensor:
-        """Perform vectorized linear interpolation on 4D GPU tensors.
-
-        Args:
-            x_new: (n_steps, n_observers)
-            x_old: (n_src_times, n_sections, n_blades, n_observers)
-            y_old: (n_src_times, n_sections, n_blades, n_observers)
-
-        Returns:
-            Shape: (n_steps, n_observers)
-        """
-        nt, n_sec, n_b, n_obs = x_old.shape
-        n_steps = x_new.shape[0]
-
-        # 1. Permute to put time (interpolation dim) at the end.
-        # From (nt, n_sec, n_b, no) -> (no, n_sec, n_b, nt)
-        x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
-        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()
-
-        # 2. Prepare x_new: (n_steps, no) -> (no, n_sec, n_b, n_steps).
-        # Transpose x_new to (no, n_steps), then expand to match dimensions
-        x_new_p = (
-            x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
-        )
-
-        # 3. Find bracketing indices.
-        # searchsorted works on the last dimension (nt)
-        idx = torch.searchsorted(x_old_p, x_new_p)
-        idx = torch.clamp(idx, 1, nt - 1)
-
-        # 4. Gather bracketing points.
-        # Dim 3 is the time dimension we are interpolating within
-        x0 = torch.gather(x_old_p, 3, idx - 1)
-        x1 = torch.gather(x_old_p, 3, idx)
-        y0 = torch.gather(y_old_p, 3, idx - 1)
-        y1 = torch.gather(y_old_p, 3, idx)
-
-        # 5. Linear interpolation formula.
-        # (y - y0) / (x - x0) = (y1 - y0) / (x1 - x0)
-        weights = (x_new_p - x0) / (x1 - x0 + 1e-12)
-        interp_vals = y0 + weights * (y1 - y0)
-
-        # 6. Reduction.
-        # Sum across sections (dim 1) and blades (dim 2)
-        # Result shape: (no, n_steps)
-        summed = torch.sum(interp_vals, dim=(1, 2))
-
-        # Transpose back to (n_steps, n_observers)
-        return summed.T
-
     def interpolate_positions(
         self,
         x_new: torch.Tensor,

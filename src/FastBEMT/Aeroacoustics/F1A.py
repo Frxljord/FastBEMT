@@ -2,10 +2,6 @@ import torch
 import numpy as np
 from typing import Union
 
-
-__all__ = ["F1A"]
-
-
 class F1A:
     '''Farassat 1A acoustic source formulation.
 

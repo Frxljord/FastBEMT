@@ -5,14 +5,14 @@ import torch
 from typing import Any, Tuple, Dict, List, Optional, Union
 import pyfar as pf
 
-from .Section import SectionForces
-from .F1A import F1A
-from .JobParameters import LowFidelityParameters
-from .BPM import BPM
+from .Aerodynamics.Section import SectionForces
+from .Aeroacoustics.F1A import F1A
+from .Utils.JobParameters import LowFidelityParameters
+from .Aeroacoustics.BPM import BPM
 
 
 class Propeller:
-    '''Propeller aeroacoustic analysis using BEMT, F1A, and BPM.
+    '''Propeller aerodynamic and aeroacoustic analysis using BEMT, F1A, and BPM.
 
     Performs blade element momentum theory aerodynamic analysis followed by
     Farassat 1A tonal noise calculation and Brooks-Pope-Marcolini broadband noise calculation.
@@ -210,15 +210,16 @@ class Propeller:
 
         self.solution_data = pd.DataFrame(rows, columns=self.solution_data.columns)
 
-    def compute_total_forces(self) -> Tuple[float, float, float, float]:
+    def compute_total_forces(self) -> Tuple[float, float, float, float, float]:
         '''Compute integrated thrust, torque, and coefficients.
 
         Returns:
-            Tuple of (thrust, torque, c_t, c_q) where:
+            Tuple of (thrust, torque, c_t, c_q, figure_of_merit) where:
             thrust: total thrust force (N)
             torque: total torque (N·m)
             c_t: thrust coefficient (dimensionless)
             c_q: torque coefficient (dimensionless)
+            figure_of_merit: figure of merit (dimensionless)
         '''
         total_thrust: float = self.solution_data["d_t"].sum()
         total_torque: float = self.solution_data["d_q"].sum()
@@ -227,10 +228,11 @@ class Propeller:
         d: float = 2 * self.geometry["tip_radius"]
         rho: float = self.params.rho
 
-        c_t = total_thrust / (rho * n_rev_s**2 * d**4)
-        c_q = total_torque / (rho * n_rev_s**2 * d**5)
+        c_t: float = total_thrust / (rho * n_rev_s**2 * d**4)
+        c_q: float = total_torque / (rho * n_rev_s**2 * d**5)
+        figure_of_merit: float = np.sqrt(2 / np.pi) * c_t**1.5 / 2 / np.pi / c_q
 
-        return total_thrust, total_torque, c_t, c_q
+        return total_thrust, total_torque, c_t, c_q, figure_of_merit
 
     def section_areas(self) -> None:
         '''Calculate cross-sectional areas using Shoelace formula.
@@ -307,7 +309,7 @@ class Propeller:
             alpha_stall: Stall angle for BPM separation noise (degrees).
             keep_bpm_components: Store individual BPM component SPL if True.
         '''
-        self.observer_positions = observer_positions
+        self.observer_positions = np.atleast_2d(observer_positions)
         self.third_octave_total_oaspl = None
 
         # Exclude malformed sections so NaN BEMT outputs cannot pollute acoustics.
@@ -400,7 +402,7 @@ class Propeller:
 
         with torch.inference_mode():
             # Initialize F1A compact source acoustic array
-            acoustic_array = self._time_cuda(
+            f1a = self._time_cuda(
                 F1A,
                 rho=self.params.rho,
                 a_inf=self.params.a_inf,
@@ -453,16 +455,16 @@ class Propeller:
             # Compute retarded times for acoustic propagation
             obs_times = self._time_cuda(
                 self.get_observer_times,
-                pos_fixed=acoustic_array.pos_fixed,
+                pos_fixed=f1a.pos_fixed,
                 src_times=self.params.src_times,
-                observers=observer_positions,
+                observers=self.observer_positions,
                 label="get_observer_times",
             )
 
             # Calculate F1A pressure contributions
             f1a_output = self._time_cuda(
-                acoustic_array.calculate_f1a_pressure,
-                observer_positions,
+                f1a.calculate_f1a_pressure,
+                self.observer_positions,
                 label="calculate_f1a_pressure",
             )
 

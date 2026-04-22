@@ -12,7 +12,7 @@ import aerosandbox as asb
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from .JobParameters import LowFidelityParameters
+from ..Utils.JobParameters import LowFidelityParameters
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
