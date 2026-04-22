@@ -863,6 +863,9 @@ class Propeller:
         self.third_octave_f1a_oaspl = self.calc_oaspl(
             self.third_octave_f1a_spl, self.third_octave_freqs, weighted=True
         ).cpu().numpy()
+        self.third_octave_bpm_oaspl = self.calc_oaspl(
+            self.third_octave_bpm_spl, self.third_octave_freqs, weighted=True
+        ).cpu().numpy()
         self.third_octave_total_oaspl = self.calc_oaspl(
             self.third_octave_total_spl, self.third_octave_freqs, weighted=True
         ).cpu().numpy()

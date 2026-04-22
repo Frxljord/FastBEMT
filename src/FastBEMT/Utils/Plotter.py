@@ -134,14 +134,14 @@ class Plotter:
             save_path: Optional path to save figure as PDF.
         '''
         # Reshape and mirror pre-calculated data
-        third_octave_oaspl = self.propeller.third_octave_total_oaspl.reshape(grid_size, grid_size)
+        third_octave_total_oaspl = self.propeller.third_octave_total_oaspl.reshape(grid_size, grid_size)
         if mirror:
             third_octave_oaspl_full = np.vstack([
-                third_octave_oaspl[::-1, :],     # Flip for negative y
-                third_octave_oaspl[1:, :],       # Original positive y, skip y=0 to avoid duplication
+                third_octave_total_oaspl[::-1, :],     # Flip for negative y
+                third_octave_total_oaspl[1:, :],       # Original positive y, skip y=0 to avoid duplication
             ])
         else:
-            third_octave_oaspl_full = third_octave_oaspl
+            third_octave_oaspl_full = third_octave_total_oaspl
 
         # Create figure
         fig, ax = plt.subplots(figsize=figsize)
