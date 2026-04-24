@@ -11,7 +11,6 @@ class LowFidelityParameters:
 
     def __init__(
         self,
-        rpm: float,
         a_inf: float,
         rho: float,
         mu: float,
@@ -24,7 +23,6 @@ class LowFidelityParameters:
         '''Initialize simulation parameters.
         
         Args:
-            rpm: Rotational speed (revolutions per minute).
             a_inf: Speed of sound (m/s).
             rho: Fluid density (kg/m³).
             mu: Dynamic viscosity (Pa·s).
@@ -35,8 +33,6 @@ class LowFidelityParameters:
             device: PyTorch device ('cuda' or 'cpu').
         '''
         self.device = torch.device(device)
-        self.rpm = rpm
-        self.omega = 2.0 * np.pi * rpm / 60.0
         self.a_inf = a_inf
         self.rho = rho
         self.mu = mu
@@ -44,10 +40,25 @@ class LowFidelityParameters:
         self.p_ref = p_ref
         self.revolutions = revolutions
         self.num_obs_times_per_rev = num_obs_times_per_rev
-        self.duration = self.revolutions * (2.0 * np.pi / self.omega)
-        self.blade_passing_period = self.duration / self.revolutions / n_blades
-        self.observer_time_range = self.revolutions * self.blade_passing_period
         self.num_obs_times = self.num_obs_times_per_rev * self.revolutions
+        self.blade_angles = (
+            2.0
+            * np.pi
+            / n_blades
+            * torch.arange(n_blades, dtype=torch.float32, device=self.device)
+        )
+
+    def set_rpm(self, rpm: float) -> None:
+        '''Update RPM and related parameters for a new simulation run.
+        
+        Args:
+            rpm: New rotational speed (revolutions per minute).
+        '''
+        self.rpm = rpm
+        self.omega = 2.0 * np.pi * rpm / 60.0
+        self.duration = self.revolutions * (2.0 * np.pi / self.omega)
+        self.blade_passing_period = self.duration / self.revolutions / self.n_blades
+        self.observer_time_range = self.revolutions * self.blade_passing_period
         self.dt = self.duration / self.num_obs_times
         self.src_times = (
             torch.arange(0, self.num_obs_times, dtype=torch.float32, device=self.device)
@@ -60,9 +71,5 @@ class LowFidelityParameters:
             * self.dt
         )
         self.num_src_times = self.src_times.shape[0]
-        self.blade_angles = (
-            2.0
-            * np.pi
-            / n_blades
-            * torch.arange(n_blades, dtype=torch.float32, device=self.device)
-        )
+
+

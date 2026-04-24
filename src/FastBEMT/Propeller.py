@@ -9,6 +9,7 @@ from .Aerodynamics.Section import SectionForces
 from .Aeroacoustics.F1A import F1A
 from .Utils.JobParameters import LowFidelityParameters
 from .Aeroacoustics.BPM import BPM
+from .Aeroacoustics.Utils import perform_spectral_analysis
 
 
 class Propeller:
@@ -22,7 +23,7 @@ class Propeller:
         self,
         geometry: Dict[str, Union[np.ndarray, int, float, list]],
         params: LowFidelityParameters,
-        use_cuda_timing: bool = True,
+        use_cuda_timing: bool = False,
     ) -> None:
         '''Initialize propeller analysis.
 
@@ -184,16 +185,20 @@ class Propeller:
             print(f"Error in section at r={self.geometry['r'][section_index]}: {e}")
             return [np.nan] * 18
 
-    def run_bemt(self, v_inf: Union[float, np.ndarray]) -> None:
+    def run_bemt(self, rpm: float, v_inf: Union[float, np.ndarray]) -> None:
         '''Execute radial BEMT sweep.
 
         Solves momentum and blade element equations at each radial station
         sequentially, using previous station's solution for faster convergence.
 
         Args:
+            rpm: Revolutions per minute.
             v_inf: Freestream velocity (m/s). Scalar or array of shape (n_sections,).
         '''
+        self.rpm = rpm
+        self.params.set_rpm(self.rpm)
         self.v_inf = v_inf
+
         prev_phi: Optional[float] = None
         rows: List[List[float]] = []
 
@@ -480,7 +485,7 @@ class Propeller:
                 )[:, None]
             )
             self._time_cuda(
-                self.combine_sources,
+                self.combine_sources_f1a,
                 obs_times=obs_times,
                 output_times=f1a_output_times,
                 f1a_output=f1a_output,
@@ -489,8 +494,9 @@ class Propeller:
 
             # Perform spectral analysis on combined F1A pressures
             self._time_cuda(
-                self._perform_spectral_analysis_torch,
-                label="_perform_spectral_analysis_torch",
+                perform_spectral_analysis,
+                propeller=self,
+                label="perform_spectral_analysis",
             )
 
             bpm_obs_times = obs_times[: self.params.num_obs_times_per_rev]
@@ -556,7 +562,7 @@ class Propeller:
         # Final Total SPL (acoustic pressure squared level)
         self.third_octave_bpm_spl = 10 * torch.log10(spp_interp_total.mean(dim=1) + 1e-12)
 
-    def combine_sources(
+    def combine_sources_f1a(
         self,
         obs_times: Union[torch.Tensor, np.ndarray],
         output_times: Union[torch.Tensor, np.ndarray],
@@ -641,70 +647,7 @@ class Propeller:
         # Transpose back to (n_steps, n_observers)
         return summed.T
 
-    def _perform_spectral_analysis_torch(self) -> None:
-        '''Compute FFT, SPL, A-weighted SPL, and OASPL using PyTorch.
-
-        Performs spectral analysis on total pressure signal with GPU acceleration.
-        Computes SPL in dB, A-weighted SPL, overall SPL, and overall A-weighted SPL.
-        '''
-        n: int = self.params.num_obs_times
-        no: int = self.observer_positions.shape[0]
-
-        # Frequency grid for spectral analysis
-        dt: float = self.params.observer_time_range / self.params.num_obs_times
-        f_single = torch.fft.rfftfreq(n, dt).to(self.device)
-        self.freq = f_single.unsqueeze(1).expand(-1, no)
-
-        # Compute FFT and convert to RMS amplitude
-        fft_p = torch.fft.rfft(self.p_tot, dim=0)
-        self.fft_amp = torch.abs(fft_p)
-        self.fft_amp.mul_(np.sqrt(2) / n)
-        self.fft_amp[0, :].div_(np.sqrt(2))  # DC component
-
-        # Compute SPL: 20*log10(p_rms / p_ref)
-        p_ref: float = self.params.p_ref
-        self.spl = torch.clamp(self.fft_amp, min=1e-15)
-        self.spl.div_(p_ref).log10_().mul_(20.0)
-
-        def r_a_func_torch(f: torch.Tensor) -> torch.Tensor:
-            """Compute A-weighting function per ISO 61672-1."""
-            f_sq = f.square()
-            c1 = 12194.0**2
-            c2 = 20.6**2
-            c3 = 107.7**2
-            c4 = 737.9**2
-
-            num = f_sq.square().mul_(c1**2)
-            den = (
-                f_sq.add(c2)
-                .mul_(torch.sqrt(f_sq.add(c3).mul_(f_sq.add(c4))))
-                .mul_(f_sq.add(c1))
-            )
-            return num.div_(den)
-
-        # Normalize A-weighting to 1000 Hz
-        r_a_1000 = r_a_func_torch(torch.tensor(1000.0, device=self.device))
-
-        # Compute A-weighted SPL
-        a_weight = r_a_func_torch(self.freq).div_(r_a_1000).log10_().mul_(20.0)
-
-        self.spl_a = self.spl.clone()
-        self.spl_a.add_(a_weight)
-
-        # Compute Overall Sound Pressure Level (OSPL)
-        p_rms_sq = self.fft_amp[0, :].square()
-        p_rms_sq.add_(torch.sum(self.fft_amp[1:, :].square(), dim=0).mul_(2.0))
-        self.ospl = torch.sqrt(p_rms_sq).div_(p_ref).log10_().mul_(20.0)
-        self.ospl = self.ospl.cpu().numpy()
-
-        # Compute Overall A-weighted Sound Pressure Level (OASPL)
-        amp_a = torch.pow(10.0, self.spl_a.div_(20.0)).mul_(p_ref)
-
-        p_rms_a_sq = amp_a[0, :].square()
-        p_rms_a_sq.add_(torch.sum(amp_a[1:, :].square(), dim=0).mul_(2.0))
-        self.oaspl = torch.sqrt(p_rms_a_sq).div_(p_ref).log10_().mul_(20.0)
-        self.oaspl = self.oaspl.cpu().numpy()
-
+    
     def get_observer_times(
         self,
         pos_fixed: torch.Tensor,

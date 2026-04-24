@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Iterable, Tuple
 
 import numpy as np
-from scipy.interpolate import interp1d
 
 from ..Propeller import Propeller
 
@@ -214,3 +213,19 @@ class BladeStressCalculator:
         c_x = (1.0 / (6.0 * area)) * np.sum((xi + xi1) * a)
         c_y = (1.0 / (6.0 * area)) * np.sum((yi + yi1) * a)
         return c_x, c_y
+    
+    def compute_propeller_mass(self, rho: float) -> float:
+        '''Compute the total mass of a single propeller blade.
+
+        Args:
+            rho: Material density (kg/m³).
+
+        Returns:
+            Total mass of the propeller blade (kg).
+        '''
+        dr = np.asarray(self.geometry["dr"])
+        cross_section = np.asarray(self.geometry["cross_section"])
+        segment_volumes = cross_section * dr
+        total_mass = np.sum(segment_volumes) * rho * self.geometry["n_blades"]
+
+        return total_mass
