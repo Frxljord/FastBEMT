@@ -114,6 +114,7 @@ class Plotter:
         self,
         grid_size: int = 26,
         domain_size: float = 5.0,
+        noise_type: str = 'total',
         figsize: Tuple[float, float] = (4.5, 2),
         cmap: str = 'magma',
         contour_levels: Optional[Tuple[float]] = None,
@@ -134,7 +135,12 @@ class Plotter:
             save_path: Optional path to save figure as PDF.
         '''
         # Reshape and mirror pre-calculated data
-        third_octave_total_oaspl = self.propeller.third_octave_total_oaspl.reshape(grid_size, grid_size)
+        if noise_type == 'bpm':
+            third_octave_total_oaspl = self.propeller.third_octave_bpm_oaspl.reshape(grid_size, grid_size)
+        elif noise_type == 'f1a':
+            third_octave_total_oaspl = self.propeller.third_octave_f1a_oaspl.reshape(grid_size, grid_size)
+        else:
+            third_octave_total_oaspl = self.propeller.third_octave_total_oaspl.reshape(grid_size, grid_size)
         if mirror:
             third_octave_oaspl_full = np.vstack([
                 third_octave_total_oaspl[::-1, :],     # Flip for negative y

@@ -345,78 +345,6 @@ def k2(re_c: torch.Tensor, m: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor
     return k1(re_c) + tmp
 
 
-def calculate_directivity(
-    r_element: torch.Tensor,
-    r_obs: torch.Tensor,
-    m: torch.Tensor,
-    azimuths: torch.Tensor,
-    blade_angles: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Calculate acoustic directivity patterns (deprecated, for reference only).
-
-    Args:
-        r_element: Element positions (azim, blade, radius, 3) as torch tensor
-        r_obs: Observer positions (obs, 3) as torch tensor
-        m: Mach number (radius,) as torch tensor
-        azimuths: Azimuthal positions (azim,) as torch tensor
-        blade_angles: Blade angles (blade,) as torch tensor
-
-    Returns:
-        Tuple of (r_mag, dh_te, dh_le, dl) directivity factor tensors
-    """
-    # All inputs are already torch tensors on correct device
-    # 1. Setup vectors from elements to observers
-    # r_vec shape: (obs, azim, blade, radius, 3)
-    r_vec = r_obs[:, None, None, None, :] - r_element[None, ...]
-    r_mag = torch.linalg.norm(r_vec, dim=-1, keepdims=True)
-    unit_r = r_vec / r_mag
-
-    # 2. Define the Local Basis (Rotation Matrix)
-    psi_total = azimuths[:, None, None] + blade_angles[None, :, None]
-    device = r_element.device
-
-    # xl: Thrust Vector (Axial)
-    e_xl = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=device)
-
-    # yl: Spanwise Vector (Radial)
-    e_yl = torch.stack(
-        [torch.zeros_like(psi_total), torch.cos(psi_total), torch.sin(psi_total)],
-        dim=-1,
-    )
-
-    # zl: Direction of Motion (Tangential)
-    e_zl = torch.cross(e_xl.expand_as(e_yl), e_yl, dim=-1)
-
-    # 3. Project Observer Unit Vector onto Local Axes
-    obs_xl = torch.sum(unit_r * e_xl, dim=-1)
-    obs_yl = torch.sum(unit_r * e_yl, dim=-1)
-    obs_zl = torch.sum(unit_r * e_zl, dim=-1)
-
-    # 4. Convert to BPM Angles
-    phi = torch.atan2(obs_zl, obs_yl)
-    theta = torch.acos(torch.clamp(obs_xl, -1.0, 1.0))
-
-    cos_theta = obs_xl
-    sin_phi = torch.sin(phi)
-    sin_theta_2 = torch.sin(theta / 2)
-    cos_theta_2 = torch.cos(theta / 2)
-
-    # 5. Expand Mach number tensor
-    m = m[None, None, None, :]
-
-    term1 = 2 * (sin_theta_2**2) * (sin_phi**2)
-    term2 = (1 + m * cos_theta) * (1 + 0.2 * m * cos_theta) ** 2
-    dh_te = term1 / term2
-    term1 = 2 * (cos_theta_2**2) * (sin_phi**2)
-    term2 = (1 + m * cos_theta) ** 3
-    dh_le = term1 / term2
-    term1 = (torch.sin(theta) ** 2) * (sin_phi**2)
-    term2 = (1 + m * cos_theta) ** 4
-    dl = term1 / term2
-
-    return torch.squeeze(r_mag), dh_te, dh_le, dl
-
-
 def st1_prime(re_c: torch.Tensor) -> torch.Tensor:
     """Compute peak Strouhal number reference parameter.
 
@@ -888,47 +816,76 @@ class BPM:
         and time-varying local basis vectors (thrust, radial, tangential).
         Stores pos_fixed and e_xl, e_yl, e_zl as instance attributes.
         '''
-        # Blade section positions in blade-fixed (rotating) frame.
-        pos_moving: torch.Tensor = torch.stack(
-            [
-                self.chord * self.com_shift_up * torch.sin(self.twist_rad),
-                self.r,
-                self.chord * self.com_shift_forward * torch.sin(self.twist_rad),
-            ],
-            dim=-1,
-        )
+        # 1. Setup global rotation (Hub rotation around X)
+        angles = self.omega * self.tau[:, None] + self.blade_angles[None, :] # (nt, nb)
+        c, s = torch.cos(angles), torch.sin(angles)
+        z, o = torch.zeros_like(c), torch.ones_like(c)
 
-        # Compute rotation angles at each time step and blade
-        angles: torch.Tensor = (
-            self.omega * self.tau[:, None] + self.blade_angles[None, :]
-        )
-        c: torch.Tensor = torch.cos(angles)
-        s: torch.Tensor = torch.sin(angles)
+        # R_g2b: Global -> Blade (nt, nb, 3, 3)
+        R_g2b = torch.stack([
+            torch.stack([o, z, z], dim=-1),   # Row 0: Axial
+            torch.stack([z, c, s], dim=-1),   # Row 1: Spanwise
+            torch.stack([z, -s, c], dim=-1)   # Row 2: Tangential
+        ], dim=-2)
 
-        # e_xl: thrust axis (fixed along X for a non-tilted propeller).
-        self.e_xl = torch.zeros((self.nt, self.nb, 3), device=self.device)
-        self.e_xl[..., 0] = 1.0
+        # 2. Setup airfoil rotation (Twist around Y)
+        ct, st = torch.cos(self.twist_rad), torch.sin(self.twist_rad)
+        zt, ot = torch.zeros_like(ct), torch.ones_like(ct)
 
-        # e_yl: spanwise axis (radial).
-        self.e_yl = torch.stack([torch.zeros_like(angles), c, s], dim=-1)
+        # R_b2a: Blade -> Airfoil (ns, 3, 3) 
+        # X_af = Backwards Chord, Z_af = Upward Normal
+        R_b2TE = torch.stack([
+            torch.stack([-st, zt, -ct], dim=-1), # Row 0: New X (TE)
+            torch.stack([zt,  ot, zt],  dim=-1), # Row 1: New Y (Span)
+            torch.stack([ct,  zt, -st], dim=-1)  # Row 2: New Z (Normal)
+        ], dim=-2)
 
-        # e_zl: tangential axis (direction of motion).
-        self.e_zl = torch.cross(self.e_xl, self.e_yl, dim=-1)
+        # Inflow angle reference for LE frame
+        ci, si = torch.cos(self.twist_rad - torch.deg2rad(self.alpha)), torch.sin(self.twist_rad - torch.deg2rad(self.alpha))
 
-        # Build rotation matrices (rotation around x-axis)
-        # Format: (time, blade, 3x3)
-        rot: torch.Tensor = torch.zeros(
-            (self.nt, self.nb, 3, 3), dtype=self.dtype, device=self.device
-        )
-        rot[..., 0, 0] = 1.0
-        rot[..., 1, 1], rot[..., 1, 2] = c, -s
-        rot[..., 2, 1], rot[..., 2, 2] = s, c
+        R_b2LE = torch.stack([
+            torch.stack([-si, zt, -ci], dim=-1), # Row 0: New X (TE)
+            torch.stack([zt,  ot, zt],  dim=-1), # Row 1: New Y (Span)
+            torch.stack([ci,  zt, -si], dim=-1)  # Row 2: New Z (Normal)
+        ], dim=-2)
 
-        # Transform positions from blade frame to fixed frame using rotation matrices.
-        # Shape: (time, section, blade, xyz)
-        self.pos_fixed: torch.Tensor = torch.einsum(
-            "tbik,sk->tsbi", rot, pos_moving
-        ).contiguous()
+        # 3. Total Rotation Matrix: Global -> Airfoil (nt, nb, ns, 3, 3)
+        self.R_g2TE = torch.matmul(R_b2TE[None, None, ...], R_g2b[:, :, None, ...])
+        self.R_g2LE = torch.matmul(R_b2LE[None, None, ...], R_g2b[:, :, None, ...])
+
+        # 4. Compute Global Positions (pos_fixed)
+        # The positions of the sections at radius r
+        # In airfoil frame, the 'center' of the section is at (0, r, 0)
+        # because r is the spanwise distance.
+        pos_airfoil_TE = torch.stack([
+            self.chord * 0.5,                       # FIX this with real TE position 
+            self.r, 
+            torch.zeros_like(self.r)
+        ], dim=-1) # (ns, 3)
+
+        pos_airfoil_LE = torch.stack([
+            - self.chord * 0.5,                       # FIX this with real LE position 
+            self.r, 
+            torch.zeros_like(self.r)
+        ], dim=-1) # (ns, 3)
+
+        # Add the local chordwise/thickness shifts (if any)
+        # pos_af_total = pos_airfoil_center + pos_airfoil_offsets 
+
+        # To get Global positions, we need Airfoil -> Global (Inverse = Transpose)
+        R_af2TE = self.R_g2TE.transpose(-1, -2)
+        R_af2LE = self.R_g2LE.transpose(-1, -2)
+
+        # Global positions shape: (nt, ns, nb, 3)
+        self.pos_fixed_TE = torch.einsum('tbskj,sj->tsbk', R_af2TE, pos_airfoil_TE)
+        self.pos_fixed_LE = torch.einsum('tbskj,sj->tsbk', R_af2LE, pos_airfoil_LE)
+
+        # 5. Extract Basis Vectors (For reference/other modules)
+        # These are usually defined as the columns of the Global->Blade matrix transpose
+        self.e_xl = R_g2b[..., 0, :].transpose(-1, -2) # Axial
+        self.e_yl = R_g2b[..., 1, :].transpose(-1, -2) # Radial
+        self.e_zl = R_g2b[..., 2, :].transpose(-1, -2) # Tangential
+
 
     def get_emission_geometry(
         self, r_obs: torch.Tensor
@@ -950,41 +907,51 @@ class BPM:
                 - dl: Low-frequency directivity factor (dimensionless)
         """
         # r_vec: (nt, ns, nb, n_obs, 3)
-        r_vec = r_obs[None, None, None, :, :] - self.pos_fixed
-        r_mag = torch.linalg.norm(r_vec, dim=-1)
-        inv_r = 1.0 / r_mag
-        unit_r = r_vec * inv_r[..., None]
+        r_vec_TE = r_obs[None, None, None, :, :] - self.pos_fixed_TE
+        r_mag_TE = torch.linalg.norm(r_vec_TE, dim=-1)
+        unit_r_TE = r_vec_TE / r_mag_TE[..., None]
 
-        # Projections onto local basis
-        obs_xl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_xl)
-        obs_yl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_yl)
-        obs_zl = torch.einsum('tsbni,tbi->tsbn', unit_r, self.e_zl)
+        r_vec_LE = r_obs[None, None, None, :, :] - self.pos_fixed_LE
+        r_mag_LE = torch.linalg.norm(r_vec_LE, dim=-1)
+        unit_r_LE = r_vec_LE / r_mag_LE[..., None]
 
-        # Elevation between propeller plane and observer.
-        phi = torch.asin(obs_xl)
+        # 2. Project unit_r into the Airfoil Frame using our combined rotation matrix
+        # self.R_g2af shape: (nt, nb, ns, 3, 3) -> Reordered or handled via einsum
+        # unit_r shape: (nt, ns, nb, n_obs, 3)
+        # Row 0 of R_g2af is local X (TE), Row 1 is local Y (Span), Row 2 is local Z (Normal)
 
-        # Azimuth between propeller plane and observer.
-        theta = torch.atan2(obs_zl, obs_yl) + torch.pi / 2
+        obs_af_TE = torch.einsum('tsbni,tbsij->tsbnj', unit_r_LE, self.R_g2TE)
+        obs_af_LE = torch.einsum('tsbni,tbsij->tsbnj', unit_r_TE, self.R_g2LE)
 
-        sin_phi_sq = torch.sin(phi) ** 2
-        # k = 0.5
-        # sin_phi_sq = k*torch.sin(phi) ** 2 / (k**2 * torch.cos(phi)**2 + torch.sin(phi)**2)**(3/2)
+        r_x_TE = obs_af_TE[..., 0]  # Projection on Trailing Edge axis
+        r_y_TE = obs_af_TE[..., 1]  # Projection on Spanwise axis
+        r_z_TE = obs_af_TE[..., 2]  # Projection on Normal axis
 
-        two_sin_theta_2_sq = 2 * torch.sin(theta / 2) ** 2
-        two_cos_theta_2_sq = 2 * torch.cos(theta / 2) ** 2
-        sin_theta_sq = torch.sin(theta) ** 2
+        r_x_LE = obs_af_LE[..., 0]  # Projection on Leading Edge axis
+        r_y_LE = obs_af_LE[..., 1]  # Projection on Spanwise axis
+        r_z_LE = obs_af_LE[..., 2]  # Projection on Normal axis
 
-        m = self.m[None, :, None, None]
-        doppler = 1.0 + m * torch.cos(theta)
+        # 3. Convert to BPM Angles
+        phi_TE = torch.atan2(r_z_TE, r_y_TE)
+        theta_TE = torch.atan2(r_y_TE * torch.cos(phi_TE) + r_z_TE * torch.sin(phi_TE), r_x_TE)
 
-        # Doppler-corrected directivity factors.
-        dh_te = (two_sin_theta_2_sq * sin_phi_sq) / (
-            doppler * (1.0 + 0.2 * m * torch.cos(theta)) ** 2
+        phi_LE = torch.atan2(r_z_LE, r_y_LE)
+        theta_LE = torch.atan2(r_y_LE * torch.cos(phi_LE) + r_z_LE * torch.sin(phi_LE), r_x_LE)
+
+        # 4. Mach & Doppler
+        m = self.m[None, :, None, None] # (1, ns, 1, 1)
+
+        # 6. Directivity Factors
+        # Note: We use sin_phi_sq (the projection into the xy plane) 
+        # to account for the roll-off toward the wing tips.
+        dh_te = (2 * torch.sin(theta_TE / 2)**2 * torch.sin(phi_TE)**2) / (
+            (1.0 + m * torch.cos(theta_TE)) * (1.0 + 0.2 * m * torch.cos(theta_TE)) ** 2
         )
-        dh_le = (two_cos_theta_2_sq * sin_phi_sq) / (doppler**3)
-        dl = (sin_theta_sq * sin_phi_sq) / (doppler**4)
 
-        return r_mag, dh_te, dh_le, dl
+        dh_le = (2 * torch.cos(theta_LE / 2)**2 * torch.sin(phi_LE)**2) / (1.0 + m * torch.cos(theta_LE))**3
+        dl = (torch.sin(theta_TE)**2 * torch.sin(phi_TE)**2) / (1.0 + m * torch.cos(theta_TE))**4
+
+        return (r_mag_LE + r_mag_TE) / 2, dh_te, dh_le, dl
 
     def run_forward_bpm(
         self,
@@ -1019,8 +986,11 @@ class BPM:
         )
 
         self.generate_trajectory_and_basis()
-        self.pos_fixed = self.interpolate_positions(
-            bpm_output_times, bpm_obs_times, self.pos_fixed
+        self.pos_fixed_TE = self.interpolate_positions(
+            bpm_output_times, bpm_obs_times, self.pos_fixed_TE
+        )
+        self.pos_fixed_LE = self.interpolate_positions(
+            bpm_output_times, bpm_obs_times, self.pos_fixed_LE
         )
 
         # 1. Geometry and Base Values at Emission Time
