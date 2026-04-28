@@ -31,7 +31,7 @@ def circular_observer_array(radius: float, n_points: int) -> np.ndarray:
     Returns:
         np.ndarray: A 3D array of observer points.
     '''
-    angles = np.linspace(-np.pi / 2 , np.pi / 2, n_points, endpoint=False)[1:]
+    angles = np.linspace(-np.pi / 2 , np.pi / 2, n_points, endpoint=True)
     X = radius * np.sin(angles)
     Y = radius * np.cos(angles)
     Z = np.zeros_like(X)

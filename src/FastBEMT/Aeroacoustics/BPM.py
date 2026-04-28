@@ -829,7 +829,7 @@ class BPM:
         ], dim=-2)
 
         # 2. Setup airfoil rotation (Twist around Y)
-        ct, st = torch.cos(self.twist_rad), torch.sin(self.twist_rad)
+        ct, st = torch.cos(self.twist_rad), torch.sin(self.twist_rad)  # Use real angle of the TE wrt horizontal
         zt, ot = torch.zeros_like(ct), torch.ones_like(ct)
 
         # R_b2a: Blade -> Airfoil (ns, 3, 3) 
@@ -850,41 +850,39 @@ class BPM:
         ], dim=-2)
 
         # 3. Total Rotation Matrix: Global -> Airfoil (nt, nb, ns, 3, 3)
-        self.R_g2TE = torch.matmul(R_b2TE[None, None, ...], R_g2b[:, :, None, ...])
-        self.R_g2LE = torch.matmul(R_b2LE[None, None, ...], R_g2b[:, :, None, ...])
+        self.R_g2TE = torch.matmul(R_g2b[:, :, None, ...], R_b2TE[None, None, ...])
+        self.R_g2LE = torch.matmul(R_g2b[:, :, None, ...], R_b2LE[None, None, ...])
 
         # 4. Compute Global Positions (pos_fixed)
         # The positions of the sections at radius r
         # In airfoil frame, the 'center' of the section is at (0, r, 0)
         # because r is the spanwise distance.
         pos_airfoil_TE = torch.stack([
-            self.chord * 0.5,                       # FIX this with real TE position 
+            self.chord * 0.5,              
             self.r, 
             torch.zeros_like(self.r)
         ], dim=-1) # (ns, 3)
 
         pos_airfoil_LE = torch.stack([
-            - self.chord * 0.5,                       # FIX this with real LE position 
+            - self.chord * 0.5,                    
             self.r, 
             torch.zeros_like(self.r)
         ], dim=-1) # (ns, 3)
 
-        # Add the local chordwise/thickness shifts (if any)
-        # pos_af_total = pos_airfoil_center + pos_airfoil_offsets 
+        com_shift_blade_frame = torch.stack([
+            self.com_shift_up,                       
+            torch.zeros_like(self.r), 
+            self.com_shift_forward
+        ], dim=-1) # (ns, 3)
 
-        # To get Global positions, we need Airfoil -> Global (Inverse = Transpose)
-        R_af2TE = self.R_g2TE.transpose(-1, -2)
-        R_af2LE = self.R_g2LE.transpose(-1, -2)
+        # Add the local chordwise/thickness shifts (if any)
+        # pos_af_total = pos_airfoil_center + pos_airfoil_offsets
+        pos_blade_TE = torch.einsum('skj,sj->sk', R_b2TE.transpose(-1, -2), pos_airfoil_TE) + com_shift_blade_frame
+        pos_blade_LE = torch.einsum('skj,sj->sk', R_b2LE.transpose(-1, -2), pos_airfoil_LE) + com_shift_blade_frame
 
         # Global positions shape: (nt, ns, nb, 3)
-        self.pos_fixed_TE = torch.einsum('tbskj,sj->tsbk', R_af2TE, pos_airfoil_TE)
-        self.pos_fixed_LE = torch.einsum('tbskj,sj->tsbk', R_af2LE, pos_airfoil_LE)
-
-        # 5. Extract Basis Vectors (For reference/other modules)
-        # These are usually defined as the columns of the Global->Blade matrix transpose
-        self.e_xl = R_g2b[..., 0, :].transpose(-1, -2) # Axial
-        self.e_yl = R_g2b[..., 1, :].transpose(-1, -2) # Radial
-        self.e_zl = R_g2b[..., 2, :].transpose(-1, -2) # Tangential
+        self.pos_fixed_TE = torch.einsum('tbkj,sj->tsbk', R_g2b.transpose(-1, -2), pos_blade_TE)
+        self.pos_fixed_LE = torch.einsum('tbkj,sj->tsbk', R_g2b.transpose(-1, -2), pos_blade_LE)
 
 
     def get_emission_geometry(
@@ -909,27 +907,27 @@ class BPM:
         # r_vec: (nt, ns, nb, n_obs, 3)
         r_vec_TE = r_obs[None, None, None, :, :] - self.pos_fixed_TE
         r_mag_TE = torch.linalg.norm(r_vec_TE, dim=-1)
-        unit_r_TE = r_vec_TE / r_mag_TE[..., None]
+        unit_r_TE_fixed = r_vec_TE / r_mag_TE[..., None]
 
         r_vec_LE = r_obs[None, None, None, :, :] - self.pos_fixed_LE
         r_mag_LE = torch.linalg.norm(r_vec_LE, dim=-1)
-        unit_r_LE = r_vec_LE / r_mag_LE[..., None]
+        unit_r_LE_fixed = r_vec_LE / r_mag_LE[..., None]
 
         # 2. Project unit_r into the Airfoil Frame using our combined rotation matrix
         # self.R_g2af shape: (nt, nb, ns, 3, 3) -> Reordered or handled via einsum
         # unit_r shape: (nt, ns, nb, n_obs, 3)
         # Row 0 of R_g2af is local X (TE), Row 1 is local Y (Span), Row 2 is local Z (Normal)
 
-        obs_af_TE = torch.einsum('tsbni,tbsij->tsbnj', unit_r_LE, self.R_g2TE)
-        obs_af_LE = torch.einsum('tsbni,tbsij->tsbnj', unit_r_TE, self.R_g2LE)
+        unit_r_TE_airfoil = torch.einsum('tbsij,tsbni->tsbnj', self.R_g2TE, unit_r_TE_fixed)
+        unit_r_LE_airfoil = torch.einsum('tbsij,tsbni->tsbnj', self.R_g2LE, unit_r_LE_fixed)
 
-        r_x_TE = obs_af_TE[..., 0]  # Projection on Trailing Edge axis
-        r_y_TE = obs_af_TE[..., 1]  # Projection on Spanwise axis
-        r_z_TE = obs_af_TE[..., 2]  # Projection on Normal axis
+        r_x_TE = unit_r_TE_airfoil[..., 0]  # Projection on Trailing Edge axis
+        r_y_TE = unit_r_TE_airfoil[..., 1]  # Projection on Spanwise axis
+        r_z_TE = unit_r_TE_airfoil[..., 2]  # Projection on Normal axis
 
-        r_x_LE = obs_af_LE[..., 0]  # Projection on Leading Edge axis
-        r_y_LE = obs_af_LE[..., 1]  # Projection on Spanwise axis
-        r_z_LE = obs_af_LE[..., 2]  # Projection on Normal axis
+        r_x_LE = unit_r_LE_airfoil[..., 0]  # Projection on Leading Edge axis
+        r_y_LE = unit_r_LE_airfoil[..., 1]  # Projection on Spanwise axis
+        r_z_LE = unit_r_LE_airfoil[..., 2]  # Projection on Normal axis
 
         # 3. Convert to BPM Angles
         phi_TE = torch.atan2(r_z_TE, r_y_TE)
@@ -1230,9 +1228,9 @@ class BPM:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
         # Tip-specific parameters.
-        chord_tip = self.chord[-1]
-        alpha_tip = self.alpha[-1]
-        m_tip = self.m[-1]
+        chord_tip = self.chord[-2]
+        alpha_tip = self.alpha[-2]
+        m_tip = self.m[-2]
 
         l_tip = calc_l_tip(chord_tip, alpha_tip)
         m_max = m_tip * (1 + 0.036 * alpha_tip)
@@ -1269,7 +1267,7 @@ class BPM:
         )
 
         # Assign to the last radial station (-1).
-        spp_full[:, :, -1:, :, :] = 10 ** (spl_tip / 10)
+        spp_full[:, :, -1, :, :] = 10 ** (spl_tip.squeeze(2) / 10)
 
         return spp_full
 

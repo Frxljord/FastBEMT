@@ -121,42 +121,56 @@ class F1A:
         '''Compute kinematic properties of rotating blade sources.
 
         Calculates position, velocity, acceleration, jerk, and force derivatives
-        in the fixed reference frame. Uses 4th-order finite differences for
-        time derivatives of forces.
+        in the fixed reference frame.
         
         Stores pos_fixed, vel_fixed, acc_fixed, jerk_fixed, force_fixed,
         and force_der_fixed as instance attributes.
         '''
-        # Blade section positions in blade-fixed (rotating) frame
-        pos_moving: torch.Tensor = torch.stack(
-            [
-                self.chord * self.com_shift_up * torch.sin(self.twist_rad),
-                self.r,
-                self.chord * self.com_shift_forward * torch.sin(self.twist_rad),
-            ],
-            dim=-1,
-        )
 
         # Compute rotation angles at each time step and blade
         angles: torch.Tensor = (
             self.omega * self.tau[:, None] + self.blade_angles[None, :]
         )
-        c: torch.Tensor = torch.cos(angles)
-        s: torch.Tensor = torch.sin(angles)
+        c, s = torch.cos(angles), torch.sin(angles)
+        z, o = torch.zeros_like(c), torch.ones_like(c)
 
-        # Build rotation matrices (rotation around x-axis)
-        # Format: (time, blade, 3x3)
-        rot: torch.Tensor = torch.zeros(
-            (self.nt, self.nb, 3, 3), dtype=self.dtype, device=self.device
-        )
-        rot[..., 0, 0] = 1.0
-        rot[..., 1, 1], rot[..., 1, 2] = c, -s
-        rot[..., 2, 1], rot[..., 2, 2] = s, c
+        # R_g2b: Global -> Blade (nt, nb, 3, 3)
+        R_g2b = torch.stack([
+            torch.stack([o, z, z], dim=-1),   # Row 0: Axial
+            torch.stack([z, c, s], dim=-1),   # Row 1: Spanwise
+            torch.stack([z, -s, c], dim=-1)   # Row 2: Tangential
+        ], dim=-2)
+
+        # 2. Setup airfoil rotation (Twist around Y)
+        ct, st = torch.cos(self.twist_rad), torch.sin(self.twist_rad)
+        zt, ot = torch.zeros_like(ct), torch.ones_like(ct)
+
+        # R_b2a: Blade -> Airfoil (ns, 3, 3) 
+        # X_af = Backwards Chord, Z_af = Upward Normal
+        R_b2a = torch.stack([
+            torch.stack([-st, zt, -ct], dim=-1), # Row 0: New X (TE)
+            torch.stack([zt,  ot, zt],  dim=-1), # Row 1: New Y (Span)
+            torch.stack([ct,  zt, -st], dim=-1)  # Row 2: New Z (Normal)
+        ], dim=-2)
+
+        com_shift_blade_frame = torch.stack([
+            self.com_shift_up,                       
+            torch.zeros_like(self.r), 
+            self.com_shift_forward
+        ], dim=-1) # (ns, 3)
+
+        pos_airfoil = torch.stack([
+            torch.zeros_like(self.r), # X in blade frame is zero (rotation axis)
+            self.r,                    # Y in blade frame is spanwise position
+            torch.zeros_like(self.r)  # Z in blade frame is zero (on chord line
+        ], dim=-1) # (ns, 3)
 
         # Transform positions from blade frame to fixed frame using rotation matrices
         # Shape: (time, section, blade, xyz)
+        pos_blade = torch.einsum('skj,sj->sk', R_b2a.transpose(-1, -2), pos_airfoil) + com_shift_blade_frame
+
         self.pos_fixed: torch.Tensor = torch.einsum(
-            "tbik,sk->tsbi", rot, pos_moving
+            'tbkj,sj->tsbk', R_g2b.transpose(-1, -2), pos_blade
         ).contiguous()
 
         # Compute kinematic derivatives by successive cross products with angular velocity
@@ -178,7 +192,7 @@ class F1A:
 
         # Rotate forces to fixed frame
         self.force_fixed: torch.Tensor = torch.einsum(
-            "tbik,tbsk->tsbi", rot, force_moving
+            'tbkj,tbsj->tsbk', R_g2b.transpose(-1, -2), force_moving
         ).contiguous()
 
         self.force_der_fixed: torch.Tensor = torch.linalg.cross(
