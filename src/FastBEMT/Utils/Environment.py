@@ -17,9 +17,9 @@ class Environment:
         p_ref: Reference acoustic pressure in Pa.
     """
 
-    a_inf: float
-    rho: float
-    mu: float
+    a_inf: float = 343.0
+    rho: float = 1.225
+    mu: float = 1.81e-5
     p_ref: float = 2e-5
 
     def __post_init__(self) -> None:
