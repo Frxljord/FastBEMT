@@ -9,6 +9,7 @@ import torch
 from .Aeroacoustics.F1A import F1A
 from .Aeroacoustics.BPM import BPM
 from .Aeroacoustics.Utils import perform_spectral_analysis
+from .Kinematics import Kinematics
 from .Utils.Environment import Environment
 from .Utils.Simulation import Simulation
 
@@ -85,6 +86,7 @@ class Propeller:
         self.fft_amp: Optional[torch.Tensor] = None
         self.observer_positions: Optional[np.ndarray] = None
         self.spl_breakdown: Dict[str, np.ndarray] = {}
+        self.kinematics: Optional[Kinematics] = None
 
     def section_areas(self) -> None:
         '''Calculate cross-sectional areas using Shoelace formula.
@@ -176,9 +178,11 @@ class Propeller:
             v_inf,
         )
         solution_data = bemt.solution_for(operating_rpm, operating_v_inf)
-        self.simulation.configure_operating_point(
-            operating_rpm,
-            n_blades=int(self.geometry["n_blades"]),
+        self.kinematics = self._time_cuda(
+            Kinematics,
+            propeller=self,
+            rpm=operating_rpm,
+            label="Kinematics.__init__",
         )
 
         self.observer_positions = np.atleast_2d(observer_positions)
@@ -291,6 +295,8 @@ class Propeller:
                 d_q=local_dq,
                 blade_angles=self.simulation.blade_angles,
                 device=self.device,
+                kinematics=self.kinematics,
+                section_mask=section_mask,
                 label="TorchCompactAcousticSourceArray.__init__",
             )
 

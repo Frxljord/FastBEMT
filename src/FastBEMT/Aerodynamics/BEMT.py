@@ -60,11 +60,12 @@ class BEMTPerformance(NamedTuple):
 
 
 class BEMT:
-    """Solve BEMT over the Cartesian product of RPM and freestream values.
+    """Solve BEMT over RPM and freestream or advance-ratio values.
 
     The analysis is performed during initialization. ``solution_data`` uses a
     ``(rpm, v_inf, section)`` MultiIndex, while ``performance`` uses a
-    ``(rpm, v_inf)`` MultiIndex.
+    ``(rpm, v_inf)`` MultiIndex. When ``J`` is provided, the freestream
+    velocity is calculated as ``v_inf = J * (rpm / 60) * diameter``.
 
     Args:
         propeller: Propeller containing the blade geometry.
@@ -72,7 +73,11 @@ class BEMT:
         rpm: One RPM value or a one-dimensional sequence of RPM values.
         v_inf: One freestream velocity or a one-dimensional sequence of
             freestream velocities. Each value is applied uniformly to all
-            radial sections for its operating point.
+            radial sections for its operating point. Mutually exclusive with
+            ``J``.
+        J: One advance ratio or a one-dimensional sequence of advance ratios.
+            Each value is combined with every RPM value. Mutually exclusive
+            with ``v_inf``.
     """
 
     def __init__(
@@ -80,7 +85,9 @@ class BEMT:
         propeller: Propeller,
         environment: Environment,
         rpm: OperatingInput,
-        v_inf: OperatingInput,
+        v_inf: OperatingInput | None = None,
+        *,
+        J: OperatingInput | None = None,
     ) -> None:
         self.propeller = propeller
         self.environment = environment
@@ -94,12 +101,39 @@ class BEMT:
             name="rpm",
             require_positive=True,
         )
-        self.v_inf = self._normalize_operating_values(v_inf, name="v_inf")
         self.omega = 2.0 * np.pi * self.rpm / 60.0
-        self.operating_points = pd.MultiIndex.from_product(
-            [self.rpm, self.v_inf],
-            names=["rpm", "v_inf"],
-        )
+
+        if (v_inf is None) == (J is None):
+            raise ValueError("Exactly one of v_inf and J must be provided.")
+
+        if J is None:
+            self.J: np.ndarray | None = None
+            self.v_inf = self._normalize_operating_values(v_inf, name="v_inf")
+            self.operating_points = pd.MultiIndex.from_product(
+                [self.rpm, self.v_inf],
+                names=["rpm", "v_inf"],
+            )
+        else:
+            self.J = self._normalize_operating_values(J, name="J")
+            diameter = 2.0 * float(self.propeller.geometry["tip_radius"])
+            if not np.isfinite(diameter) or diameter <= 0.0:
+                raise ValueError(
+                    "Propeller diameter must be finite and greater than zero "
+                    "when J is provided."
+                )
+
+            computed_v_inf = np.multiply.outer(
+                self.rpm / 60.0 * diameter,
+                self.J,
+            )
+            self.v_inf = computed_v_inf.reshape(-1)
+            self.operating_points = pd.MultiIndex.from_arrays(
+                [
+                    np.repeat(self.rpm, self.J.size),
+                    self.v_inf,
+                ],
+                names=["rpm", "v_inf"],
+            )
 
         self._airfoils = [
             asb.Airfoil(coordinates=coordinates)

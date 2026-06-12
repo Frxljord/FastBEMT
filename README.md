@@ -138,3 +138,17 @@ This evaluates the four-point Cartesian product. Section results are stored in
 `bemt.solution_data` with a `(rpm, v_inf, section)` MultiIndex. Integrated
 results are stored in `bemt.performance` with a `(rpm, v_inf)` MultiIndex.
 Use `bemt.solution_for(7000, 0.0)` to select one radial solution.
+
+Alternatively, specify advance ratio `J` instead of `v_inf`:
+
+```python
+bemt = BEMT(
+    propeller=propeller,
+    environment=environment,
+    rpm=[3000, 7000],
+    J=[0.4, 0.8],
+)
+```
+
+For each RPM and advance-ratio pair, the freestream velocity is computed as
+`v_inf = J * (rpm / 60) * propeller_diameter`.

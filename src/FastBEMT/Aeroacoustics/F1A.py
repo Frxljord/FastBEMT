@@ -1,6 +1,13 @@
-import torch
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Union
+
 import numpy as np
-from typing import Union
+import torch
+
+if TYPE_CHECKING:
+    from ..Kinematics import Kinematics
+
 
 class F1A:
     '''Farassat 1A acoustic source formulation.
@@ -26,6 +33,8 @@ class F1A:
         d_q: Union[np.ndarray, torch.Tensor],
         blade_angles: Union[np.ndarray, torch.Tensor],
         device: str,
+        kinematics: Kinematics | None = None,
+        section_mask: Union[np.ndarray, torch.Tensor, None] = None,
     ) -> None:
         '''Initialize F1A acoustic source array.
 
@@ -45,6 +54,9 @@ class F1A:
             d_q: Torque distribution (N·m), shape (n_times, n_blades, n_sections).
             blade_angles: Blade phase offsets (rad), shape (n_blades,).
             device: PyTorch device ('cpu' or 'cuda').
+            kinematics: Shared propeller kinematics to reuse for source motion.
+            section_mask: Boolean mask selecting the Kinematics sections used
+                by the supplied force distributions.
         '''
         torch.backends.opt_einsum.strategy = "branch-all"
         self.device: torch.device = torch.device(device)
@@ -114,6 +126,8 @@ class F1A:
         self.nt: int = self.tau.shape[0]
         self.ns: int = self.r.shape[0]
         self.nb: int = self.blade_angles.shape[0]
+        self.kinematics = kinematics
+        self.section_mask = section_mask
 
         self._initialize_geometry_and_kinematics()
 
@@ -126,6 +140,9 @@ class F1A:
         Stores pos_fixed, vel_fixed, acc_fixed, jerk_fixed, force_fixed,
         and force_der_fixed as instance attributes.
         '''
+        if self.kinematics is not None:
+            self._initialize_from_kinematics()
+            return
 
         # Compute rotation angles at each time step and blade
         angles: torch.Tensor = (
@@ -197,6 +214,73 @@ class F1A:
 
         self.force_der_fixed: torch.Tensor = torch.linalg.cross(
             self.omega_vec, self.force_fixed
+        )
+
+    def _initialize_from_kinematics(self) -> None:
+        """Reuse shared source motion and initialize F1A force kinematics."""
+        kinematics = self.kinematics
+        if kinematics is None:
+            raise RuntimeError("Kinematics was not provided.")
+        if kinematics.device != self.device:
+            raise ValueError("F1A and Kinematics must use the same device.")
+        if kinematics.nt != self.nt or kinematics.nb != self.nb:
+            raise ValueError(
+                "F1A source times and blades must match the Kinematics object."
+            )
+
+        if self.section_mask is None:
+            if kinematics.ns != self.ns:
+                raise ValueError(
+                    "section_mask is required when F1A uses a section subset."
+                )
+            selected_sections: slice | torch.Tensor = slice(None)
+        else:
+            selected_sections = torch.as_tensor(
+                self.section_mask,
+                device=self.device,
+            )
+            if (
+                selected_sections.dtype != torch.bool
+                or selected_sections.ndim != 1
+                or selected_sections.shape[0] != kinematics.ns
+            ):
+                raise ValueError(
+                    "section_mask must be a one-dimensional boolean mask "
+                    "matching the Kinematics sections."
+                )
+            if int(selected_sections.sum().item()) != self.ns:
+                raise ValueError(
+                    "section_mask must select the same number of sections "
+                    "provided to F1A."
+                )
+
+        self.omega_vec = kinematics.angular_velocity_vector
+        self.pos_fixed = kinematics.section_position_global_frame[
+            :, selected_sections
+        ].contiguous()
+        self.vel_fixed = kinematics.section_velocity_global_frame[
+            :, selected_sections
+        ].contiguous()
+        self.acc_fixed = kinematics.section_acceleration_global_frame[
+            :, selected_sections
+        ].contiguous()
+        self.jerk_fixed = kinematics.section_jerk_global_frame[
+            :, selected_sections
+        ].contiguous()
+
+        force_moving = torch.stack(
+            (self.d_t, torch.zeros_like(self.d_t), -self.d_q),
+            dim=-1,
+        )
+        self.force_fixed = torch.einsum(
+            "tbij,tbsj->tsbi",
+            kinematics.global_to_blade_rotation_matrix.transpose(-1, -2),
+            force_moving,
+        ).contiguous()
+        self.force_der_fixed = torch.linalg.cross(
+            self.omega_vec,
+            self.force_fixed,
+            dim=-1,
         )
 
     def get_rf(
