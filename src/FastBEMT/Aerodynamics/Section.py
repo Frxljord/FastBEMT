@@ -11,33 +11,9 @@ import scipy.optimize
 import aerosandbox as asb
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Tuple
-from ..Utils.JobParameters import LowFidelityParameters
+from typing import Optional
 
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-def compute_com(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
-    '''Compute polygon centroid using Shoelace formula.
-    
-    Args:
-        x: X coordinates, shape (n_points,).
-        y: Y coordinates, shape (n_points,).
-        
-    Returns:
-        Tuple of (x_centroid, y_centroid).
-    '''
-    xi = x[:-1]
-    yi = y[:-1]
-    xi1 = x[1:]
-    yi1 = y[1:]
-
-    a = xi * yi1 - xi1 * yi
-    area = 0.5 * np.sum(a)
-
-    c_x = (1.0 / (6.0 * area)) * np.sum((xi + xi1) * a)
-    c_y = (1.0 / (6.0 * area)) * np.sum((yi + yi1) * a)
-    return c_x, c_y
-
+from ..Utils.Environment import Environment
 
 @dataclass
 class RootResult:
@@ -62,7 +38,8 @@ class SectionForces:
         dr: float,
         chord: float,
         theta: float,
-        params: LowFidelityParameters,
+        environment: Environment,
+        omega: float,
         prop_radius: float,
         hub_radius: float,
         n_blades: int,
@@ -75,7 +52,8 @@ class SectionForces:
             dr: Radial element width (m).
             chord: Section chord length (m).
             theta: Geometric twist angle (radians).
-            params: Simulation parameters.
+            environment: Fluid properties.
+            omega: Angular velocity in rad/s.
             prop_radius: Propeller tip radius (m).
             hub_radius: Propeller hub radius (m).
             n_blades: Number of blades.
@@ -85,7 +63,8 @@ class SectionForces:
         self.dr = dr
         self.chord = chord
         self.theta = theta
-        self.params = params
+        self.environment = environment
+        self.omega = omega
         self.prop_radius = prop_radius
         self.hub_radius = hub_radius
         self.n_blades = n_blades
@@ -112,12 +91,12 @@ class SectionForces:
         '''
         self._phi_grid = np.linspace(np.radians(-89.9), np.radians(89.9), 401)
 
-        sin_phi = np.sin(self._phi_grid)
+        sin_phi = np.maximum(np.abs(np.sin(self._phi_grid)), np.finfo(float).eps)
         n_blades = self.n_blades
         r = self.r
 
-        f_tip = n_blades * (self.prop_radius - r) / (2 * r * np.abs(sin_phi))
-        f_hub = n_blades * (r - self.hub_radius) / (2 * r * np.abs(sin_phi))
+        f_tip = n_blades * (self.prop_radius - r) / (2 * r * sin_phi)
+        f_hub = n_blades * (r - self.hub_radius) / (2 * r * sin_phi)
 
         # Clip to avoid overflow in exponential
         f_tip = np.clip(f_tip, 0.0, 500.0)
@@ -257,10 +236,10 @@ class SectionForces:
         k_q = self.sigma * c_d_prime / (4 * loss_factor * sin_phi * cos_phi)
 
         # Compute velocity components
-        u = self.params.omega * self.r * k_t / (1 + k_q)
+        u = self.omega * self.r * k_t / (1 + k_q)
         a_prime = k_q / (1 + k_q)
         v_a = self.v_inf + u
-        v_t = self.params.omega * self.r * (1 - a_prime)
+        v_t = self.omega * self.r * (1 - a_prime)
         w = np.sqrt(v_a**2 + v_t**2)
 
         return (
@@ -332,9 +311,14 @@ class SectionForces:
         '''
         self.v_inf = v_inf
         if self.re is None or self.ma is None:
-            v_local = np.sqrt(self.v_inf**2 + (self.params.omega * self.r) ** 2)
-            self.ma = v_local / self.params.a_inf
-            self.re = self.params.rho * v_local * self.chord / self.params.mu
+            v_local = np.sqrt(self.v_inf**2 + (self.omega * self.r) ** 2)
+            self.ma = v_local / self.environment.a_inf
+            self.re = (
+                self.environment.rho
+                * v_local
+                * self.chord
+                / self.environment.mu
+            )
 
         # Define bounds for inflow angle based on residual sign at phi=0.
         residual_at_zero = self.residual_function(1e-6)
@@ -400,29 +384,9 @@ class SectionForces:
                 x0=np.mean(bracket),
             )
         if not result.converged:
-            # Plot residual vs phi to aid debugging.
-            # import matplotlib.pyplot as plt
-
-            # phi_grid = np.linspace(phi_min_default, phi_max_default, 200)
-            # residuals = []
-            # for phi_val in phi_grid:
-            #     try:
-            #         residuals.append(self.residual_function(phi_val))
-            #     except Exception:
-            #         residuals.append(np.nan)
-
-            # plt.figure(figsize=(8, 4))
-            # plt.plot(np.degrees(phi_grid), residuals, label="Residual")
-            # plt.axhline(0.0, color="k", linewidth=0.8, linestyle="--")
-            # plt.xlabel("Phi [deg]")
-            # plt.ylabel("Residual")
-            # plt.title("BEMT Residual vs Phi (Non-Converged)")
-            # plt.grid(True, alpha=0.3)
-            # plt.tight_layout()
-            # plt.show()
             warnings.warn(f"Root finding did not converge at r = {self.r}")
             result = RootResult(
-                root=prev_phi,
+                root=prev_phi if prev_phi is not None else float(np.mean(bracket)),
             )
             
 
@@ -442,15 +406,23 @@ class SectionForces:
         ) = self.section_parameters(phi)
 
         # Update Reynolds and Mach numbers
-        self.re = self.params.rho * w * self.chord / self.params.mu
-        self.ma = w / self.params.a_inf
+        self.re = self.environment.rho * w * self.chord / self.environment.mu
+        self.ma = w / self.environment.a_inf
 
         # Compute local thrust and torque
-        d_t = self.sigma * np.pi * self.params.rho * w**2 * c_l_prime * self.r * self.dr
+        d_t = (
+            self.sigma
+            * np.pi
+            * self.environment.rho
+            * w**2
+            * c_l_prime
+            * self.r
+            * self.dr
+        )
         d_q = (
             self.sigma
             * np.pi
-            * self.params.rho
+            * self.environment.rho
             * w**2
             * c_d_prime
             * self.r**2

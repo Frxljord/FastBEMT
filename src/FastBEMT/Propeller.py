@@ -1,28 +1,34 @@
-import numpy as np
-import pandas as pd
-import aerosandbox as asb
-import torch
-from typing import Any, Tuple, Dict, List, Optional, Union
-import pyfar as pf
+from __future__ import annotations
 
-from .Aerodynamics.Section import SectionForces
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
+
+import numpy as np
+import pyfar as pf
+import torch
+
 from .Aeroacoustics.F1A import F1A
-from .Utils.JobParameters import LowFidelityParameters
 from .Aeroacoustics.BPM import BPM
 from .Aeroacoustics.Utils import perform_spectral_analysis
+from .Utils.Environment import Environment
+from .Utils.Simulation import Simulation
+
+if TYPE_CHECKING:
+    from .Aerodynamics.BEMT import BEMT
 
 
 class Propeller:
-    '''Propeller aerodynamic and aeroacoustic analysis using BEMT, F1A, and BPM.
+    '''Propeller geometry, environment, and aeroacoustic analysis.
 
-    Performs blade element momentum theory aerodynamic analysis followed by
-    Farassat 1A tonal noise calculation and Brooks-Pope-Marcolini broadband noise calculation.
+    Aerodynamic operating-point calculations are handled by
+    :class:`FastBEMT.Aerodynamics.BEMT`. This class retains the geometry and
+    environment needed by aerodynamic, acoustic, and structural analyses.
     '''
 
     def __init__(
         self,
         geometry: Dict[str, Union[np.ndarray, int, float, list]],
-        params: LowFidelityParameters,
+        environment: Environment,
+        simulation: Simulation,
         use_cuda_timing: bool = False,
     ) -> None:
         '''Initialize propeller analysis.
@@ -38,13 +44,15 @@ class Propeller:
                 'tip_radius': propeller tip radius (m)
                 'hub_radius': propeller hub radius (m)
                 'n_blades': number of blades
-            params: Simulation parameters.
+            environment: Fluid and acoustic reference properties.
+            simulation: Numerical device and time-discretization settings.
             use_cuda_timing: Print GPU/CPU timing diagnostics if True.
         '''
         self.geometry = geometry
-        self.params = params
+        self.environment = environment
+        self.simulation = simulation
         self.dtype = torch.float32
-        self.device = params.device
+        self.device = simulation.device
         self.use_cuda_timing = use_cuda_timing
         self.section_areas()
         self.calculate_boat_tail_angle()
@@ -65,51 +73,6 @@ class Propeller:
             -s[0] for s in self.geometry["COM_shift"]
         ]
 
-        # BEMT solution storage
-        self.solution_data: pd.DataFrame = pd.DataFrame(
-            columns=[
-                "r",
-                "dr",
-                "chord",
-                "twist",
-                "phi",
-                "alpha",
-                "Cl",
-                "Cd",
-                "u",
-                "a_prime",
-                "d_t",
-                "d_q",
-                "F",
-                "W",
-                "Re",
-                "Ma",
-                "ds",
-                "dp",
-            ]
-        )
-
-        # Initialize airfoil objects using aerosandbox
-        self._section_airfoils: List[asb.Airfoil] = [
-            asb.Airfoil(coordinates=af) for af in self.geometry["airfoil"]
-        ]
-
-        # Initialize section force solvers for each radial station
-        self._sections: List[SectionForces] = [
-            SectionForces(
-                airfoil=self._section_airfoils[idx],
-                r=self.geometry["r"][idx],
-                dr=self.geometry["dr"][idx],
-                chord=self.geometry["chord"][idx],
-                theta=np.radians(self.geometry["twist"][idx]),
-                params=self.params,
-                prop_radius=self.geometry["tip_radius"],
-                hub_radius=self.geometry["hub_radius"],
-                n_blades=self.geometry["n_blades"],
-            )
-            for idx in range(len(self.geometry["r"]))
-        ]
-
         # Acoustic results containers
         self.p_m: Optional[torch.Tensor] = None
         self.p_d: Optional[torch.Tensor] = None
@@ -120,124 +83,8 @@ class Propeller:
         self.ospl: Optional[np.ndarray] = None
         self.oaspl: Optional[np.ndarray] = None
         self.fft_amp: Optional[torch.Tensor] = None
-        self.v_inf: Optional[np.ndarray] = None
         self.observer_positions: Optional[np.ndarray] = None
         self.spl_breakdown: Dict[str, np.ndarray] = {}
-        self.third_octave_total_oaspl_full: Optional[np.ndarray] = None
-
-    def process_section(
-        self,
-        section_index: int,
-        v_inf: float,
-        prev_phi: Optional[float] = None,
-    ) -> List[float]:
-        '''Solve BEMT for a single radial section.
-
-        Args:
-            section_index: Radial station index.
-            v_inf: Freestream velocity (m/s).
-            prev_phi: Previous section inflow angle for warm start (radians).
-
-        Returns:
-            List of 18 elements: [r, dr, chord, twist, phi, alpha, c_l, c_d, u,
-            a_prime, d_t, d_q, f_factor, w, reynolds, mach, delta_star_upper,
-            delta_star_lower]. Returns NaN values if solver fails.
-        '''
-        try:
-            (
-                phi,
-                d_t,
-                d_q,
-                alpha,
-                u,
-                a_prime,
-                c_l,
-                c_d,
-                f_factor,
-                w,
-                reynolds,
-                mach,
-                delta_star_upper,
-                delta_star_lower,
-            ) = self._sections[section_index].solve(v_inf, prev_phi=prev_phi)
-
-            return [
-                self.geometry["r"][section_index],
-                self.geometry["dr"][section_index],
-                self.geometry["chord"][section_index],
-                self.geometry["twist"][section_index],
-                np.degrees(phi),
-                alpha,
-                c_l,
-                c_d,
-                u,
-                a_prime,
-                d_t,
-                d_q,
-                f_factor,
-                w,
-                reynolds,
-                mach,
-                delta_star_upper,
-                delta_star_lower,
-            ]
-        except RuntimeError as e:
-            print(f"Error in section at r={self.geometry['r'][section_index]}: {e}")
-            return [np.nan] * 18
-
-    def run_bemt(self, rpm: float, v_inf: Union[float, np.ndarray]) -> None:
-        '''Execute radial BEMT sweep.
-
-        Solves momentum and blade element equations at each radial station
-        sequentially, using previous station's solution for faster convergence.
-
-        Args:
-            rpm: Revolutions per minute.
-            v_inf: Freestream velocity (m/s). Scalar or array of shape (n_sections,).
-        '''
-        self.rpm = rpm
-        self.params.set_rpm(self.rpm)
-        self.v_inf = v_inf
-
-        prev_phi: Optional[float] = None
-        rows: List[List[float]] = []
-
-        # Ensure v_inf is an array
-        if isinstance(v_inf, (int, float)):
-            v_inf = np.full(len(self.geometry["r"]), v_inf)
-
-        # Process each radial section
-        for i in range(len(self.geometry["r"])):
-            res = self.process_section(i, v_inf[i], prev_phi=prev_phi)
-            if not np.isnan(res[4]):  # Index 4 is phi in degrees
-                prev_phi = np.radians(res[4])
-            rows.append(res)
-
-        self.solution_data = pd.DataFrame(rows, columns=self.solution_data.columns)
-
-    def compute_total_forces(self) -> Tuple[float, float, float, float, float]:
-        '''Compute integrated thrust, torque, and coefficients.
-
-        Returns:
-            Tuple of (thrust, torque, c_t, c_q, figure_of_merit) where:
-            thrust: total thrust force (N)
-            torque: total torque (N·m)
-            c_t: thrust coefficient (dimensionless)
-            c_q: torque coefficient (dimensionless)
-            figure_of_merit: figure of merit (dimensionless)
-        '''
-        total_thrust: float = self.solution_data["d_t"].sum()
-        total_torque: float = self.solution_data["d_q"].sum()
-
-        n_rev_s: float = self.params.rpm / 60.0
-        d: float = 2 * self.geometry["tip_radius"]
-        rho: float = self.params.rho
-
-        c_t: float = total_thrust / (rho * n_rev_s**2 * d**4)
-        c_q: float = total_torque / (rho * n_rev_s**2 * d**5)
-        figure_of_merit: float = np.sqrt(2 / np.pi) * c_t**1.5 / 2 / np.pi / c_q
-
-        return total_thrust, total_torque, c_t, c_q, figure_of_merit
 
     def section_areas(self) -> None:
         '''Calculate cross-sectional areas using Shoelace formula.
@@ -291,12 +138,15 @@ class Propeller:
     def run_aeroacoustics(
         self,
         observer_positions: np.ndarray,
+        bemt: BEMT,
         local_dt: Optional[np.ndarray] = None,
         local_dq: Optional[np.ndarray] = None,
         lt: int = 1,
         i: float = 0.01,
         alpha_stall: float = 15.0,
         keep_bpm_components: bool = True,
+        rpm: Optional[float] = None,
+        v_inf: Optional[float] = None,
     ) -> None:
         '''Compute F1A and BPM acoustic predictions.
 
@@ -305,15 +155,32 @@ class Propeller:
 
         Args:
             observer_positions: Observer coordinates, shape (n_observers, 3) in meters.
+            bemt: Aerodynamic analysis providing the section loads.
             local_dt: Thrust distribution override, shape (n_times, n_blades, n_sections).
-                Uses solution_data['d_t'] if None.
+                Uses ``bemt.solution_data['d_t']`` if None.
             local_dq: Torque distribution override, shape (n_times, n_blades, n_sections).
-                Uses solution_data['d_q'] if None.
+                Uses ``bemt.solution_data['d_q']`` if None.
             lt: Turbulent length scale
             i: Turbulence intensity for BPM (dimensionless).
             alpha_stall: Stall angle for BPM separation noise (degrees).
             keep_bpm_components: Store individual BPM component SPL if True.
+            rpm: RPM of the BEMT case to use. Required for multi-point BEMT.
+            v_inf: Freestream velocity of the BEMT case to use. Required for
+                multi-point BEMT.
         '''
+        if bemt.propeller is not self:
+            raise ValueError("The BEMT analysis belongs to a different propeller.")
+
+        operating_rpm, operating_v_inf = bemt.resolve_operating_point(
+            rpm,
+            v_inf,
+        )
+        solution_data = bemt.solution_for(operating_rpm, operating_v_inf)
+        self.simulation.configure_operating_point(
+            operating_rpm,
+            n_blades=int(self.geometry["n_blades"]),
+        )
+
         self.observer_positions = np.atleast_2d(observer_positions)
         self.third_octave_total_oaspl = None
 
@@ -326,15 +193,15 @@ class Propeller:
         geom_boat_tail = np.asarray(self.geometry['boat_tail_angle'])
         n_blades = int(self.geometry['n_blades'])
 
-        sol_d_t = np.asarray(self.solution_data['d_t'].values)
-        sol_d_q = np.asarray(self.solution_data['d_q'].values)
-        sol_alpha = np.asarray(self.solution_data['alpha'].values)
-        sol_u = np.asarray(self.solution_data['u'].values)
-        sol_w = np.asarray(self.solution_data['W'].values)
-        sol_re = np.asarray(self.solution_data['Re'].values)
-        sol_ma = np.asarray(self.solution_data['Ma'].values)
-        sol_dp = np.asarray(self.solution_data['dp'].values)
-        sol_ds = np.asarray(self.solution_data['ds'].values)
+        sol_d_t = np.asarray(solution_data['d_t'].values)
+        sol_d_q = np.asarray(solution_data['d_q'].values)
+        sol_alpha = np.asarray(solution_data['alpha'].values)
+        sol_u = np.asarray(solution_data['u'].values)
+        sol_w = np.asarray(solution_data['W'].values)
+        sol_re = np.asarray(solution_data['Re'].values)
+        sol_ma = np.asarray(solution_data['Ma'].values)
+        sol_dp = np.asarray(solution_data['dp'].values)
+        sol_ds = np.asarray(solution_data['ds'].values)
 
         section_mask = (
             np.isfinite(geom_r)
@@ -388,7 +255,7 @@ class Propeller:
             local_dt = np.broadcast_to(
                 local_dt[None, None, :],
                 (
-                    self.params.num_src_times,
+                    self.simulation.num_src_times,
                     n_blades,
                     len(r),
                 ),
@@ -396,7 +263,7 @@ class Propeller:
             local_dq = np.broadcast_to(
                 local_dq[None, None, :],
                 (
-                    self.params.num_src_times,
+                    self.simulation.num_src_times,
                     n_blades,
                     len(r),
                 ),
@@ -409,8 +276,8 @@ class Propeller:
             # Initialize F1A compact source acoustic array
             f1a = self._time_cuda(
                 F1A,
-                rho=self.params.rho,
-                a_inf=self.params.a_inf,
+                rho=self.environment.rho,
+                a_inf=self.environment.a_inf,
                 r=r,
                 dr=dr,
                 area=area,
@@ -418,11 +285,11 @@ class Propeller:
                 twist=twist,
                 com_shift_forward=com_shift_forward,
                 com_shift_up=com_shift_up,
-                source_times=self.params.src_times,
-                omega=self.params.omega,
+                source_times=self.simulation.src_times,
+                omega=self.simulation.omega,
                 d_t=local_dt,
                 d_q=local_dq,
-                blade_angles=self.params.blade_angles,
+                blade_angles=self.simulation.blade_angles,
                 device=self.device,
                 label="TorchCompactAcousticSourceArray.__init__",
             )
@@ -442,17 +309,18 @@ class Propeller:
                 delta_p=delta_p,
                 delta_s=delta_s,
                 boat_tail_angle=boat_tail_angle,
-                src_times=self.params.src_times_one_rotation,
-                a_inf=self.params.a_inf,
-                rho=self.params.rho,
-                omega=self.params.omega,
-                blade_angles=self.params.blade_angles,
+                src_times=self.simulation.src_times_one_rotation,
+                a_inf=self.environment.a_inf,
+                rho=self.environment.rho,
+                omega=self.simulation.omega,
+                blade_angles=self.simulation.blade_angles,
                 twist=twist,
                 com_shift_forward=com_shift_forward,
                 com_shift_up=com_shift_up,
-                observer_time_range=self.params.observer_time_range
-                / self.params.revolutions,
-                num_obs_times=self.params.num_obs_times // self.params.revolutions,
+                observer_time_range=self.simulation.observer_time_range
+                / self.simulation.revolutions,
+                num_obs_times=self.simulation.num_obs_times
+                // self.simulation.revolutions,
                 device=self.device,
                 label="BPM.__init__",
             )
@@ -461,7 +329,7 @@ class Propeller:
             obs_times = self._time_cuda(
                 self.get_observer_times,
                 pos_fixed=f1a.pos_fixed,
-                src_times=self.params.src_times,
+                src_times=self.simulation.src_times,
                 observers=self.observer_positions,
                 label="get_observer_times",
             )
@@ -479,8 +347,8 @@ class Propeller:
                 latest_reception_start_time[None, :]
                 + torch.linspace(
                     0,
-                    self.params.observer_time_range,
-                    self.params.num_obs_times,
+                    self.simulation.observer_time_range,
+                    self.simulation.num_obs_times,
                     device=self.device,
                 )[:, None]
             )
@@ -499,8 +367,10 @@ class Propeller:
                 label="perform_spectral_analysis",
             )
 
-            bpm_obs_times = obs_times[: self.params.num_obs_times_per_rev]
-            bpm_output_times = f1a_output_times[: self.params.num_obs_times_per_rev]
+            bpm_obs_times = obs_times[: self.simulation.num_obs_times_per_rev]
+            bpm_output_times = f1a_output_times[
+                : self.simulation.num_obs_times_per_rev
+            ]
 
             # Compute BPM noise contributions
             bpm_output = self._time_cuda(
@@ -530,7 +400,7 @@ class Propeller:
         bpm_output: Dict[str, torch.Tensor],
         keep_components: bool = True,
     ) -> None:
-        self.spl_breakdown: Dict[str, np.ndarray] = {}
+        self.spl_breakdown = {}
 
         if not keep_components:
             # Sum all BPM component tensors
@@ -679,7 +549,7 @@ class Propeller:
             src_times, dtype=self.dtype, device=self.device
         )[:, None, None, None]
         speed_of_sound = torch.as_tensor(
-            self.params.a_inf, dtype=self.dtype, device=self.device
+            self.environment.a_inf, dtype=self.dtype, device=self.device
         ).reciprocal()
         return src_times_tensor.add(dist.mul(speed_of_sound))
 

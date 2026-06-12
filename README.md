@@ -16,14 +16,20 @@ FastBEMT provides a high-performance Python package for analyzing propeller aero
 ### src/FastBEMT
 
 #### [Propeller.py](src/FastBEMT/Propeller.py)
-Main propeller analysis class orchestrating the complete aeroacoustic workflow. Handles:
-- Initialization of propeller geometry and simulation parameters
-- BEMT aerodynamic solution across blade sections
+Propeller data and aeroacoustic workflow. Handles:
+- Propeller geometry and environmental parameters
 - F1A acoustic source computation (monopole and dipole noise)
 - BPM broadband noise prediction in third-octave bands
 - Integration of results into output acoustic spectra and time histories
 
-#### [Section.py](src/FastBEMT/Section.py)
+#### [BEMT.py](src/FastBEMT/Aerodynamics/BEMT.py)
+Complete blade element momentum theory analysis. Handles:
+- Operating-point inputs including RPM and freestream velocity
+- BEMT aerodynamic solution across blade sections
+- Section-level result storage
+- Integrated thrust, torque, coefficients, and figure of merit
+
+#### [Section.py](src/FastBEMT/Aerodynamics/Section.py)
 Blade Element Momentum Theory solver for individual propeller sections. Provides:
 - Iterative solution of momentum and blade element equations
 - Prandtl tip and hub loss factor computations
@@ -49,13 +55,16 @@ Farassat 1A acoustic formulation (PyTorch implementation) for rotating sources. 
 - GPU-accelerated tensor operations for time-domain pressure computation
 - Observer position and blade angle handling
 
-#### [JobParameters.py](src/FastBEMT/JobParameters.py)
-Simulation parameter container storing:
-- Operational parameters (RPM, angular velocity)
-- Environmental properties (air density, speed of sound, dynamic viscosity)
-- Acoustic reference properties (reference pressure)
-- Time discretization (revolutions, time steps per revolution, observer time range)
-- PyTorch device specification (CPU or CUDA GPU)
+#### [Environment.py](src/FastBEMT/Utils/Environment.py)
+Immutable physical properties:
+- Air density, speed of sound, and dynamic viscosity
+- Acoustic reference pressure
+
+#### [Simulation.py](src/FastBEMT/Utils/Simulation.py)
+Numerical and temporal settings:
+- Number of simulated revolutions and samples per revolution
+- PyTorch device specification
+- RPM-dependent source times and observer time range
 
 #### [DataLoader.py](src/FastBEMT/DataLoader.py)
 Utility functions for data input/output:
@@ -94,3 +103,38 @@ Blade structural analysis tools computing:
 uv sync
 pip install -e .
 ```
+
+## BEMT Sweep
+
+```python
+from FastBEMT import BEMT, Environment, Propeller, Simulation
+
+environment = Environment(
+    a_inf=343.0,
+    rho=1.225,
+    mu=1.81e-5,
+    p_ref=2e-5,
+)
+simulation = Simulation(
+    revolutions=1,
+    num_obs_times_per_rev=100,
+    device="cpu",
+)
+
+propeller = Propeller(
+    geometry=geometry,
+    environment=environment,
+    simulation=simulation,
+)
+bemt = BEMT(
+    propeller=propeller,
+    environment=environment,
+    rpm=[3000, 7000],
+    v_inf=[0.0, 10.0],
+)
+```
+
+This evaluates the four-point Cartesian product. Section results are stored in
+`bemt.solution_data` with a `(rpm, v_inf, section)` MultiIndex. Integrated
+results are stored in `bemt.performance` with a `(rpm, v_inf)` MultiIndex.
+Use `bemt.solution_for(7000, 0.0)` to select one radial solution.

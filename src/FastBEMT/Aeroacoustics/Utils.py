@@ -7,11 +7,14 @@ def perform_spectral_analysis(propeller) -> None:
     Performs spectral analysis on total pressure signal with GPU acceleration.
     Computes SPL in dB, A-weighted SPL, overall SPL, and overall A-weighted SPL.
     '''
-    n: int = propeller.params.num_obs_times
+    n: int = propeller.simulation.num_obs_times
     no: int = propeller.observer_positions.shape[0]
 
     # Frequency grid for spectral analysis
-    dt: float = propeller.params.observer_time_range / propeller.params.num_obs_times
+    dt: float = (
+        propeller.simulation.observer_time_range
+        / propeller.simulation.num_obs_times
+    )
     f_single = torch.fft.rfftfreq(n, dt).to(propeller.device)
     propeller.freq = f_single.unsqueeze(1).expand(-1, no)
 
@@ -22,7 +25,7 @@ def perform_spectral_analysis(propeller) -> None:
     propeller.fft_amp[0, :].div_(np.sqrt(2))  # DC component
 
     # Compute SPL: 20*log10(p_rms / p_ref)
-    p_ref: float = propeller.params.p_ref
+    p_ref: float = propeller.environment.p_ref
     propeller.spl = torch.clamp(propeller.fft_amp, min=1e-15)
     propeller.spl.div_(p_ref).log10_().mul_(20.0)
 

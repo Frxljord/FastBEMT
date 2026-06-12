@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from typing import Iterable, Tuple
+from typing import Iterable, TYPE_CHECKING, Tuple
 
 import numpy as np
 
 from ..Propeller import Propeller
+
+if TYPE_CHECKING:
+    from ..Aerodynamics.BEMT import BEMT
 
 
 class BladeStressCalculator:
     '''Propeller blade stress analysis.
 
     Computes centrifugal and bending stresses along blade span using
-    geometry and BEMT solution data from Propeller instance.
+    propeller geometry and an explicit BEMT analysis.
     '''
 
     def __init__(self, propeller: Propeller) -> None:
@@ -109,24 +112,42 @@ class BladeStressCalculator:
     def blade_stress_report(
         self,
         material_rho: float,
+        bemt: BEMT,
         show: bool = False,
+        rpm: float | None = None,
+        v_inf: float | None = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         '''Compute and optionally plot stress distributions.
 
         Args:
             material_rho: Material density (kg/m³).
+            bemt: Aerodynamic analysis providing the section loads.
             show: Plot stress distributions if True.
+            rpm: RPM of the BEMT case to use.
+            v_inf: Freestream velocity of the BEMT case to use.
 
         Returns:
             Tuple of (sigma_c, sigma_b) where:
             sigma_c: centrifugal stress (Pa), shape (n_sections,)
             sigma_b: bending stress (Pa), shape (n_sections, n_airfoil_points)
             
-        Note:
-            Requires propeller.run_bemt() to have been called first.
         '''
-        sigma_c = self.compute_centrifugal_stress(material_rho, self.propeller.params.omega)
-        sigma_b = self.compute_bending_stress(self.propeller.solution_data["d_t"].values / self.geometry["n_blades"], self.propeller.solution_data["d_q"].values / self.geometry["n_blades"])
+        if bemt.propeller is not self.propeller:
+            raise ValueError("The BEMT analysis belongs to a different propeller.")
+
+        operating_rpm, operating_v_inf = bemt.resolve_operating_point(rpm, v_inf)
+        solution = bemt.solution_for(
+            operating_rpm,
+            operating_v_inf,
+        )
+        omega = 2.0 * np.pi * operating_rpm / 60.0
+        n_blades = self.geometry["n_blades"]
+
+        sigma_c = self.compute_centrifugal_stress(material_rho, omega)
+        sigma_b = self.compute_bending_stress(
+            solution["d_t"].values / n_blades,
+            solution["d_q"].values / n_blades,
+        )
 
         if show:
             # Lazy import to keep plotting optional.
