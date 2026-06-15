@@ -16,13 +16,15 @@ def perform_spectral_analysis(propeller) -> None:
         / propeller.simulation.num_obs_times
     )
     f_single = torch.fft.rfftfreq(n, dt).to(propeller.device)
-    propeller.freq = f_single.unsqueeze(1).expand(-1, no)
+    propeller.freq = f_single.unsqueeze(0).expand(no, -1)
 
-    # Compute FFT and convert to RMS amplitude
-    fft_p = torch.fft.rfft(propeller.p_tot, dim=0)
-    propeller.fft_amp = torch.abs(fft_p)
-    propeller.fft_amp.mul_(np.sqrt(2) / n)
-    propeller.fft_amp[0, :].div_(np.sqrt(2))  # DC component
+    # Compute one-sided RMS amplitude per frequency bin.
+    fft_p = torch.fft.rfft(propeller.p_tot, dim=1)
+    propeller.fft_amp = torch.abs(fft_p).div_(n)
+    if n % 2 == 0:
+        propeller.fft_amp[:, 1:-1].mul_(np.sqrt(2.0))
+    else:
+        propeller.fft_amp[:, 1:].mul_(np.sqrt(2.0))
 
     # Compute SPL: 20*log10(p_rms / p_ref)
     p_ref: float = propeller.environment.p_ref
@@ -55,15 +57,13 @@ def perform_spectral_analysis(propeller) -> None:
     propeller.spl_a.add_(a_weight)
 
     # Compute Overall Sound Pressure Level (OSPL)
-    p_rms_sq = propeller.fft_amp[0, :].square()
-    p_rms_sq.add_(torch.sum(propeller.fft_amp[1:, :].square(), dim=0).mul_(2.0))
+    p_rms_sq = torch.sum(propeller.fft_amp.square(), dim=1)
     propeller.ospl = torch.sqrt(p_rms_sq).div_(p_ref).log10_().mul_(20.0)
     propeller.ospl = propeller.ospl.cpu().numpy()
 
     # Compute Overall A-weighted Sound Pressure Level (OASPL)
     amp_a = torch.pow(10.0, propeller.spl_a.div_(20.0)).mul_(p_ref)
 
-    p_rms_a_sq = amp_a[0, :].square()
-    p_rms_a_sq.add_(torch.sum(amp_a[1:, :].square(), dim=0).mul_(2.0))
+    p_rms_a_sq = torch.sum(amp_a.square(), dim=1)
     propeller.oaspl = torch.sqrt(p_rms_a_sq).div_(p_ref).log10_().mul_(20.0)
     propeller.oaspl = propeller.oaspl.cpu().numpy()

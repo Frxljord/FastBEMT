@@ -219,7 +219,7 @@ def build_animation(
 
     blade_basis = global_to_blade[0, blade_index].T
     airfoil_basis = blade_basis @ blade_to_airfoil[section_index].T
-    section_origin = positions[0, section_index, blade_index]
+    section_origin = positions[0, blade_index, section_index]
 
     blade_lines, blade_labels = create_triad(
         ax,
@@ -242,7 +242,7 @@ def build_animation(
 
     blade_lines_all = []
     for blade in range(kinematics.nb):
-        blade_positions = np.vstack((origin, positions[0, :, blade]))
+        blade_positions = np.vstack((origin, positions[0, blade, :]))
         line, = ax.plot(
             blade_positions[:, 0],
             blade_positions[:, 1],
@@ -261,7 +261,7 @@ def build_animation(
         color="black",
         markersize=6,
     )
-    section_trajectory = positions[:, section_index, blade_index]
+    section_trajectory = positions[:, blade_index, section_index]
     section_trajectory = np.vstack(
         (section_trajectory, section_trajectory[0])
     )
@@ -301,7 +301,7 @@ def build_animation(
             current_blade_basis @ blade_to_airfoil[section_index].T
         )
         current_section_origin = positions[
-            frame_index, section_index, blade_index
+            frame_index, blade_index, section_index
         ]
 
         update_triad(
@@ -321,7 +321,7 @@ def build_animation(
 
         for blade, line in enumerate(blade_lines_all):
             blade_positions = np.vstack(
-                (origin, positions[frame_index, :, blade])
+                (origin, positions[frame_index, blade, :])
             )
             line.set_data_3d(
                 blade_positions[:, 0],

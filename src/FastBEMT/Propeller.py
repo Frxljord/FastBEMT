@@ -87,6 +87,7 @@ class Propeller:
         self.observer_positions: Optional[np.ndarray] = None
         self.spl_breakdown: Dict[str, np.ndarray] = {}
         self.kinematics: Optional[Kinematics] = None
+        self.f1a: Optional[F1A] = None
 
     def section_areas(self) -> None:
         '''Calculate cross-sectional areas using Shoelace formula.
@@ -141,8 +142,7 @@ class Propeller:
         self,
         observer_positions: np.ndarray,
         bemt: BEMT,
-        local_dt: Optional[np.ndarray] = None,
-        local_dq: Optional[np.ndarray] = None,
+        loads: Optional[Union[np.ndarray, torch.Tensor]] = None,
         lt: int = 1,
         i: float = 0.01,
         alpha_stall: float = 15.0,
@@ -158,10 +158,11 @@ class Propeller:
         Args:
             observer_positions: Observer coordinates, shape (n_observers, 3) in meters.
             bemt: Aerodynamic analysis providing the section loads.
-            local_dt: Thrust distribution override, shape (n_times, n_blades, n_sections).
-                Uses ``bemt.solution_data['d_t']`` if None.
-            local_dq: Torque distribution override, shape (n_times, n_blades, n_sections).
-                Uses ``bemt.solution_data['d_q']`` if None.
+            loads: Optional blade-frame loading per unit span on the fluid in
+                ``(axial, radial, tangential)`` components with shape
+                ``(n_sections, 3)`` or
+                ``(n_times, n_blades, n_sections, 3)``. BEMT loading is
+                used when None.
             lt: Turbulent length scale
             i: Turbulence intensity for BPM (dimensionless).
             alpha_stall: Stall angle for BPM separation noise (degrees).
@@ -178,12 +179,18 @@ class Propeller:
             v_inf,
         )
         solution_data = bemt.solution_for(operating_rpm, operating_v_inf)
-        self.kinematics = self._time_cuda(
-            Kinematics,
-            propeller=self,
-            rpm=operating_rpm,
-            label="Kinematics.__init__",
-        )
+
+        with torch.inference_mode():
+            self.f1a = self._time_cuda(
+                F1A,
+                propeller=self,
+                environment=self.environment,
+                loadings=bemt if loads is None else loads,
+                rpm=operating_rpm,
+                v_inf=operating_v_inf if loads is None else None,
+                label="F1A.__init__",
+            )
+        self.kinematics = self.f1a.kinematics
 
         self.observer_positions = np.atleast_2d(observer_positions)
         self.third_octave_total_oaspl = None
@@ -224,6 +231,7 @@ class Propeller:
             & np.isfinite(sol_ma)
             & np.isfinite(sol_dp)
             & np.isfinite(sol_ds)
+            & self.f1a.section_mask
         )
         if not np.any(section_mask):
             raise ValueError('No valid blade sections available for aeroacoustics.')
@@ -251,55 +259,7 @@ class Propeller:
         delta_p = sol_dp[section_mask]
         delta_s = sol_ds[section_mask]
 
-        # Prepare local force distributions per unit span and per blade
-        if local_dt is None or local_dq is None:
-            local_dt = sol_d_t[section_mask] / dr / n_blades
-            local_dq = sol_d_q[section_mask] / dr / r / n_blades
-            # Broadcast to source time and blade dimensions
-            local_dt = np.broadcast_to(
-                local_dt[None, None, :],
-                (
-                    self.simulation.num_src_times,
-                    n_blades,
-                    len(r),
-                ),
-            )
-            local_dq = np.broadcast_to(
-                local_dq[None, None, :],
-                (
-                    self.simulation.num_src_times,
-                    n_blades,
-                    len(r),
-                ),
-            )
-        else:
-            local_dt = np.asarray(local_dt)[..., section_mask] / dr
-            local_dq = np.asarray(local_dq)[..., section_mask] / dr / r
-
         with torch.inference_mode():
-            # Initialize F1A compact source acoustic array
-            f1a = self._time_cuda(
-                F1A,
-                rho=self.environment.rho,
-                a_inf=self.environment.a_inf,
-                r=r,
-                dr=dr,
-                area=area,
-                chord=chord,
-                twist=twist,
-                com_shift_forward=com_shift_forward,
-                com_shift_up=com_shift_up,
-                source_times=self.simulation.src_times,
-                omega=self.simulation.omega,
-                d_t=local_dt,
-                d_q=local_dq,
-                blade_angles=self.simulation.blade_angles,
-                device=self.device,
-                kinematics=self.kinematics,
-                section_mask=section_mask,
-                label="TorchCompactAcousticSourceArray.__init__",
-            )
-
             # Initialize BPM noise source model
             bpm = self._time_cuda(
                 BPM,
@@ -331,40 +291,27 @@ class Propeller:
                 label="BPM.__init__",
             )
 
-            # Compute retarded times for acoustic propagation
-            obs_times = self._time_cuda(
-                self.get_observer_times,
-                pos_fixed=f1a.pos_fixed,
-                src_times=self.simulation.src_times,
-                observers=self.observer_positions,
-                label="get_observer_times",
-            )
-
-            # Calculate F1A pressure contributions
-            f1a_output = self._time_cuda(
-                f1a.calculate_f1a_pressure,
-                self.observer_positions,
-                label="calculate_f1a_pressure",
-            )
-
-            # Interpolate F1A pressures to uniform observer time grid
-            latest_reception_start_time = torch.amax(obs_times[0, :, :, :], dim=(0, 1))
-            f1a_output_times = (
-                latest_reception_start_time[None, :]
-                + torch.linspace(
-                    0,
-                    self.simulation.observer_time_range,
-                    self.simulation.num_obs_times,
-                    device=self.device,
-                )[:, None]
-            )
             self._time_cuda(
-                self.combine_sources_f1a,
-                obs_times=obs_times,
-                output_times=f1a_output_times,
-                f1a_output=f1a_output,
-                label="combine_sources (F1A)",
+                self.f1a.run,
+                self.observer_positions,
+                observer_time_range=self.simulation.observer_time_range,
+                num_observer_times=self.simulation.num_obs_times,
+                label="F1A.run",
             )
+            if (
+                self.f1a.p_m is None
+                or self.f1a.p_d is None
+                or self.f1a.p_tot is None
+                or self.f1a.observer_times is None
+                or self.f1a.t is None
+            ):
+                raise RuntimeError("F1A did not populate its acoustic results.")
+
+            # Retain the established Propeller result API as aliases.
+            self.p_m = self.f1a.p_m
+            self.p_d = self.f1a.p_d
+            self.p_tot = self.f1a.p_tot
+            self.t = self.f1a.t
 
             # Perform spectral analysis on combined F1A pressures
             self._time_cuda(
@@ -373,10 +320,21 @@ class Propeller:
                 label="perform_spectral_analysis",
             )
 
-            bpm_obs_times = obs_times[: self.simulation.num_obs_times_per_rev]
-            bpm_output_times = f1a_output_times[
-                : self.simulation.num_obs_times_per_rev
-            ]
+            bpm_sections_in_f1a = torch.as_tensor(
+                section_mask[self.f1a.section_mask],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            bpm_obs_times = self.f1a.observer_times[
+                :,
+                : self.simulation.num_obs_times_per_rev,
+                :,
+                bpm_sections_in_f1a,
+            ].permute(1, 3, 2, 0).contiguous()
+            bpm_output_times = self.f1a.t[
+                :,
+                : self.simulation.num_obs_times_per_rev,
+            ].T.contiguous()
 
             # Compute BPM noise contributions
             bpm_output = self._time_cuda(
@@ -437,127 +395,6 @@ class Propeller:
 
         # Final Total SPL (acoustic pressure squared level)
         self.third_octave_bpm_spl = 10 * torch.log10(spp_interp_total.mean(dim=1) + 1e-12)
-
-    def combine_sources_f1a(
-        self,
-        obs_times: Union[torch.Tensor, np.ndarray],
-        output_times: Union[torch.Tensor, np.ndarray],
-        f1a_output: Union[torch.Tensor, np.ndarray],
-    ) -> None:
-        '''Interpolate F1A sources to uniform observer time grid.
-
-        Combines monopole and dipole contributions from all blade elements
-        via GPU-accelerated interpolation.
-
-        Args:
-            obs_times: Retarded times, shape (n_src_times, n_sections, n_blades, n_observers).
-            output_times: Uniform time grid, shape (n_steps, n_observers).
-            f1a_output: Pressure contributions, shape (n_times, n_sections, n_blades, n_observers, 2).
-        '''
-
-        # Interpolate monopole and dipole contributions to uniform time grid
-        self.p_m = self._interp_tensor_vectorized(
-            output_times, obs_times, f1a_output[..., 0]
-        )
-        self.p_d = self._interp_tensor_vectorized(
-            output_times, obs_times, f1a_output[..., 1]
-        )
-
-        # Compute total pressure and remove mean (DC offset)
-        self.t = output_times
-        self.p_tot = self.p_m + self.p_d
-        self.p_tot -= torch.mean(self.p_tot, dim=0)
-
-    def _interp_tensor_vectorized(
-        self,
-        x_new: torch.Tensor,
-        x_old: torch.Tensor,
-        y_old: torch.Tensor,
-    ) -> torch.Tensor:
-        '''Vectorized linear interpolation for 4D GPU tensors.
-
-        Args:
-            x_new: Target coordinates, shape (n_steps, n_observers).
-            x_old: Source coordinates, shape (n_src_times, n_sections, n_blades, n_observers).
-            y_old: Source values, shape (n_src_times, n_sections, n_blades, n_observers).
-
-        Returns:
-            Interpolated values, shape (n_steps, n_observers).
-        '''
-        nt, n_sec, n_b, n_obs = x_old.shape
-        n_steps = x_new.shape[0]
-
-        # 1. Permute to put time (interpolation dim) at the end
-        # From (nt, n_sec, n_b, no) -> (no, n_sec, n_b, nt)
-        x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
-        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()
-
-        # 2. Prepare x_new: (n_steps, no) -> (no, n_sec, n_b, n_steps)
-        # Transpose x_new to (no, n_steps), then expand to match dimensions
-        x_new_p = (
-            x_new.T.view(n_obs, 1, 1, n_steps).expand(-1, n_sec, n_b, -1).contiguous()
-        )
-
-        # 3. Find bracketing indices
-        # searchsorted works on the last dimension (nt)
-        idx = torch.searchsorted(x_old_p, x_new_p)
-        idx = torch.clamp(idx, 1, nt - 1)
-
-        # 4. Gather bracketing points
-        # Dim 3 is the time dimension we are interpolating within
-        x0 = torch.gather(x_old_p, 3, idx - 1)
-        x1 = torch.gather(x_old_p, 3, idx)
-        y0 = torch.gather(y_old_p, 3, idx - 1)
-        y1 = torch.gather(y_old_p, 3, idx)
-
-        # 5. Linear interpolation formula
-        # (y - y0) / (x - x0) = (y1 - y0) / (x1 - x0)
-        weights = (x_new_p - x0) / (x1 - x0 + 1e-12)
-        interp_vals = y0 + weights * (y1 - y0)
-
-        # 6. Reduction
-        # Sum across sections (dim 1) and blades (dim 2)
-        # Result shape: (no, n_steps)
-        summed = torch.sum(interp_vals, dim=(1, 2))
-
-        # Transpose back to (n_steps, n_observers)
-        return summed.T
-
-    
-    def get_observer_times(
-        self,
-        pos_fixed: torch.Tensor,
-        observers: np.ndarray,
-        src_times: torch.Tensor,
-    ) -> torch.Tensor:
-        '''Compute acoustic retarded times for source-observer pairs.
-
-        Calculates arrival times accounting for propagation delay.
-
-        Args:
-            pos_fixed: Source positions, shape (n_src_times, n_sections, n_blades, 3).
-            observers: Observer positions, shape (n_observers, 3) in meters.
-            src_times: Source emission times, shape (n_src_times,) in seconds.
-
-        Returns:
-            Retarded times, shape (n_src_times, n_sections, n_blades, n_observers) in seconds.
-        '''
-        # Convert observer positions to tensor with batch dimensions
-        obs = torch.as_tensor(observers, dtype=self.dtype, device=self.device)[
-            None, None, None, :, :
-        ]
-
-        # Compute distance from each source to each observer
-        dist = torch.linalg.norm(obs.sub(pos_fixed[..., None, :]), dim=-1)
-
-        # Compute retarded time: t_retarded = t_source + distance / speed_of_sound
-        src_times_tensor = torch.as_tensor(
-            src_times, dtype=self.dtype, device=self.device
-        )[:, None, None, None]
-        speed_of_sound = torch.as_tensor(
-            self.environment.a_inf, dtype=self.dtype, device=self.device
-        ).reciprocal()
-        return src_times_tensor.add(dist.mul(speed_of_sound))
 
     def _time_cuda(
         self,
@@ -664,12 +501,12 @@ class Propeller:
         '''
         f_low = self.third_octave_freqs / (2 ** (1 / 6))
         f_high = self.third_octave_freqs * (2 ** (1 / 6))
-        mask = (self.freq[:, 0:1].T >= f_low.unsqueeze(1)) & (
-            self.freq[:, 0:1].T < f_high.unsqueeze(1)
+        mask = (self.freq[0:1, :] >= f_low.unsqueeze(1)) & (
+            self.freq[0:1, :] < f_high.unsqueeze(1)
         )
 
         p_raw = 10 ** (self.spl / 10.0)
-        p_band = torch.matmul(mask.float(), p_raw)
+        p_band = torch.einsum("kf,of->ko", mask.float(), p_raw)
         third_octave_f1a_spl = 10.0 * torch.log10(p_band.clamp(min=1e-12))
         third_octave_f1a_spl[p_band == 0] = float("-inf")
         self.third_octave_f1a_spl = third_octave_f1a_spl

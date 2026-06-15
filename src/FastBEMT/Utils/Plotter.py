@@ -44,8 +44,8 @@ class Plotter:
             color = colors[idx % len(colors)]
 
             ax_time.plot(
-                self.propeller.t[:, idx],
-                self.propeller.p_m[:, idx],
+                self.propeller.t[idx, :],
+                self.propeller.p_m[idx, :],
                 label="Monopole",
                 linestyle="-",
                 marker="o",
@@ -53,8 +53,8 @@ class Plotter:
                 alpha=0.4,
             )
             ax_time.plot(
-                self.propeller.t[:, idx],
-                self.propeller.p_d[:, idx],
+                self.propeller.t[idx, :],
+                self.propeller.p_d[idx, :],
                 label="Dipole",
                 linestyle="-",
                 marker="s",
@@ -62,8 +62,8 @@ class Plotter:
                 alpha=0.4,
             )
             ax_time.plot(
-                self.propeller.t[:, idx],
-                self.propeller.p_tot[:, idx],
+                self.propeller.t[idx, :],
+                self.propeller.p_tot[idx, :],
                 color=color,
                 linestyle="-",
                 marker="d",
@@ -83,8 +83,8 @@ class Plotter:
             label_text = f"Obs {idx} (OASPL: {self.propeller.oaspl[idx]:.3f} dB)"
 
             ax_spl.semilogx(
-                self.propeller.freq[1:, idx],
-                self.propeller.spl[1:, idx],
+                self.propeller.freq[idx, 1:],
+                self.propeller.spl[idx, 1:],
                 color=color,
                 linestyle="-",
                 marker=".",

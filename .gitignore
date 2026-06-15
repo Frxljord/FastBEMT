@@ -6,14 +6,16 @@ dist/
 wheels/
 *.egg-info
 *.ruff_cache
+.tools
 
 # Virtual environments
 .FastBEMT
 .github
 .vscode
+.venv
 
 Datasets
 Figures
 src/old
-
-FastBEMT_Implementation.pdf
+AcousticAnalogies.jl-main
+Validation/f1a_equivalence
