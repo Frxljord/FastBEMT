@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Union
 import numpy as np
 import torch
 
+from .Utils import (
+    a_weighting_db,
+    spl_spectrum_to_overall_level,
+    time_domain_to_spl_spectrum,
+)
 from ..Kinematics import Kinematics
 
 if TYPE_CHECKING:
@@ -53,16 +58,8 @@ class F1A:
 
         self.device = torch.device(propeller.device)
         self.dtype = propeller.dtype
-        self.rho = torch.tensor(
-            environment.rho,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.a_inf = torch.tensor(
-            environment.a_inf,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        self.rho = propeller.rho_tensor
+        self.a_inf = propeller.a_inf_tensor
 
         from ..Aerodynamics.BEMT import BEMT
 
@@ -104,29 +101,8 @@ class F1A:
         self.nt = self.kinematics.nt
         self.nb = self.kinematics.nb
 
-        geometry = propeller.geometry
-        r_all = np.asarray(geometry["r"], dtype=np.float64)
-        dr_all = np.asarray(geometry["dr"], dtype=np.float64)
-        chord_all = np.asarray(geometry["chord"], dtype=np.float64)
-        twist_all = np.asarray(geometry["twist"], dtype=np.float64)
-        area_all = np.asarray(geometry["cross_section"], dtype=np.float64)
-        com_forward_all = np.asarray(
-            propeller.com_shift_forward,
-            dtype=np.float64,
-        )
-        com_up_all = np.asarray(propeller.com_shift_up, dtype=np.float64)
-
-        section_mask = (
-            np.isfinite(r_all)
-            & (np.abs(r_all) > 1.0e-12)
-            & np.isfinite(dr_all)
-            & (dr_all > 0.0)
-            & np.isfinite(chord_all)
-            & np.isfinite(twist_all)
-            & np.isfinite(area_all)
-            & np.isfinite(com_forward_all)
-            & np.isfinite(com_up_all)
-        )
+        section_mask = propeller.f1a_geometry_mask.copy()
+        section_count = propeller.n_sections
 
         if solution is not None:
             d_t = np.asarray(solution["d_t"].values, dtype=np.float64)
@@ -134,24 +110,62 @@ class F1A:
             section_mask &= np.isfinite(d_t) & np.isfinite(d_q)
             if not np.any(section_mask):
                 raise ValueError("No valid blade sections available for F1A.")
-            axial_load = d_t[section_mask] / dr_all[section_mask] / self.nb
-            tangential_load = (
-                d_q[section_mask]
-                / dr_all[section_mask]
-                / r_all[section_mask]
-                / self.nb
+            all_sections_selected = bool(np.all(section_mask))
+            selected_sections = (
+                propeller.f1a_geometry_mask_tensor
+                if all_sections_selected
+                else torch.as_tensor(
+                    section_mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
             )
-            loads = torch.as_tensor(
-                np.stack(
-                    (
-                        axial_load,
-                        np.zeros_like(axial_load),
-                        -tangential_load,
-                    ),
-                    axis=-1,
-                ),
+            d_t_tensor = torch.as_tensor(
+                d_t,
                 dtype=self.dtype,
                 device=self.device,
+            )
+            d_q_tensor = torch.as_tensor(
+                d_q,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            section_width = (
+                propeller.section_width
+                if all_sections_selected
+                else propeller.section_width[selected_sections]
+            )
+            section_radius = (
+                propeller.section_radius
+                if all_sections_selected
+                else propeller.section_radius[selected_sections]
+            )
+            axial_load = (
+                (
+                    d_t_tensor
+                    if all_sections_selected
+                    else d_t_tensor[selected_sections]
+                )
+                / section_width
+                / self.nb
+            )
+            tangential_load = (
+                (
+                    d_q_tensor
+                    if all_sections_selected
+                    else d_q_tensor[selected_sections]
+                )
+                / section_width
+                / section_radius
+                / self.nb
+            )
+            loads = torch.stack(
+                (
+                    axial_load,
+                    torch.zeros_like(axial_load),
+                    -tangential_load,
+                ),
+                dim=-1,
             )
         else:
             loads_full = torch.as_tensor(
@@ -159,11 +173,11 @@ class F1A:
                 dtype=self.dtype,
                 device=self.device,
             )
-            steady_shape = (int(r_all.shape[0]), 3)
+            steady_shape = (section_count, 3)
             unsteady_shape = (
                 self.nt,
                 self.nb,
-                int(r_all.shape[0]),
+                section_count,
                 3,
             )
             if tuple(loads_full.shape) not in (steady_shape, unsteady_shape):
@@ -183,96 +197,75 @@ class F1A:
             section_mask &= finite_load_sections
             if not np.any(section_mask):
                 raise ValueError("No valid blade sections available for F1A.")
-            if np.all(section_mask):
+            all_sections_selected = bool(np.all(section_mask))
+            if all_sections_selected:
+                selected_sections = propeller.f1a_geometry_mask_tensor
                 loads = loads_full
             else:
-                section_mask_tensor = torch.as_tensor(
+                selected_sections = torch.as_tensor(
                     section_mask,
                     dtype=torch.bool,
                     device=self.device,
                 )
                 if loads_full.ndim == 2:
-                    loads = loads_full[section_mask_tensor, :]
+                    loads = loads_full[selected_sections, :]
                 else:
-                    loads = loads_full[:, :, section_mask_tensor, :]
+                    loads = loads_full[:, :, selected_sections, :]
 
         self.section_mask = section_mask
-        self.r = torch.as_tensor(
-            r_all[section_mask],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.dr = torch.as_tensor(
-            dr_all[section_mask],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.area = torch.as_tensor(
-            area_all[section_mask],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.chord = torch.as_tensor(
-            chord_all[section_mask],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.twist_rad = torch.deg2rad(
-            torch.as_tensor(
-                twist_all[section_mask],
-                dtype=self.dtype,
-                device=self.device,
-            )
-        )
-        self.com_shift_forward = torch.as_tensor(
-            com_forward_all[section_mask],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.com_shift_up = torch.as_tensor(
-            com_up_all[section_mask],
-            dtype=self.dtype,
-            device=self.device,
-        )
+        self._selected_sections = selected_sections
+        self._uses_all_sections = all_sections_selected
+        if all_sections_selected:
+            self.r = propeller.section_radius
+            self.dr = propeller.section_width
+            self.area = propeller.section_area
+            self.chord = propeller.section_chord
+            self.twist_rad = propeller.section_twist_rad
+            self.com_shift_forward = propeller.section_com_shift_forward
+            self.com_shift_up = propeller.section_com_shift_up
+            self.thickness_strength = propeller.f1a_thickness_strength
+            self.dipole_strength = propeller.f1a_dipole_strength
+        else:
+            self.r = propeller.section_radius[selected_sections]
+            self.dr = propeller.section_width[selected_sections]
+            self.area = propeller.section_area[selected_sections]
+            self.chord = propeller.section_chord[selected_sections]
+            self.twist_rad = propeller.section_twist_rad[selected_sections]
+            self.com_shift_forward = propeller.section_com_shift_forward[
+                selected_sections
+            ]
+            self.com_shift_up = propeller.section_com_shift_up[
+                selected_sections
+            ]
+            self.thickness_strength = propeller.f1a_thickness_strength[
+                selected_sections
+            ]
+            self.dipole_strength = propeller.f1a_dipole_strength[
+                selected_sections
+            ]
         self.ns = int(self.r.shape[0])
-        self._selected_sections = torch.as_tensor(
-            section_mask,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        self.loads = self._validate_loads(loads)
+        self.loads = loads
         self.loadings = self.loads
-
-        # Section-only factors broadcast over (O, T, B, S).
-        self.thickness_strength = self.rho * self.area * self.dr / (4.0 * np.pi)
-        self.dipole_strength = self.dr / (4.0 * np.pi * self.a_inf)
 
         self._initialize_loading()
 
         self.observers: torch.Tensor | None = None
         self.observer_times: torch.Tensor | None = None
         self.t: torch.Tensor | None = None
+        self.observer_rotations: int | None = None
+        self.observer_time_range: float | None = None
+        self.num_observer_times: int | None = None
+        self.sample_spacing: float | None = None
         self.p_m: torch.Tensor | None = None
         self.p_d: torch.Tensor | None = None
         self.p_tot: torch.Tensor | None = None
+        self.frequencies: torch.Tensor | None = None
+        self.spl: torch.Tensor | None = None
+        self.spl_a: torch.Tensor | None = None
+        self.ospl: torch.Tensor | None = None
+        self.oaspl: torch.Tensor | None = None
         self.source_p_m: torch.Tensor | None = None
         self.source_p_d: torch.Tensor | None = None
-
-    def _validate_loads(self, loads: ArrayLike) -> torch.Tensor:
-        """Validate steady ``(S, 3)`` or unsteady ``(T, B, S, 3)`` loads."""
-        load_tensor = torch.as_tensor(
-            loads,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        steady_shape = (self.ns, 3)
-        unsteady_shape = (self.nt, self.nb, self.ns, 3)
-        if tuple(load_tensor.shape) not in (steady_shape, unsteady_shape):
-            raise ValueError(
-                "loads must have shape "
-                f"{steady_shape} or {unsteady_shape}; got {tuple(load_tensor.shape)}."
-            )
-        return load_tensor
 
     def _initialize_loading(self) -> None:
         """Rotate loads and form their complete source-time derivative."""
@@ -320,6 +313,7 @@ class F1A:
         self.force_fixed = self.f0dot
         self.force_der_fixed = self.f1dot
 
+    @torch.inference_mode()
     def run(
         self,
         observers: ArrayLike,
@@ -332,28 +326,48 @@ class F1A:
 
         Args:
             observers: Stationary observer coordinates, shape ``(O, 3)``.
-            observer_time_range: Duration of the uniform observer-time grid.
-            num_observer_times: Number of output samples. Defaults to ``T``.
+            observer_time_range: Maximum duration of the observer-time grid.
+                The actual duration is the largest whole number of rotor
+                revolutions supported by this request and the source data.
+            num_observer_times: Requested number of output samples. The
+                implied samples per revolution are preserved. Defaults to
+                ``T``.
             retain_source_terms: Keep the uncombined ``(O, T, B, S)`` source
                 pressure tensors for diagnostics.
 
         Results are stored in ``p_m``, ``p_d``, and ``p_tot`` with shape
         ``(O, T_observer)``. ``p_tot`` has its observer-wise mean removed.
+        The actual grid is described by ``observer_rotations``,
+        ``observer_time_range``, ``num_observer_times``, and
+        ``sample_spacing``.
+        ``frequencies`` has shape ``(F,)``; ``spl`` and ``spl_a`` have shape
+        ``(O, F)``; ``ospl`` and ``oaspl`` have shape ``(O,)``.
         """
-        observer_count = self.nt if num_observer_times is None else int(
-            num_observer_times
+        requested_observer_count = (
+            self.nt
+            if num_observer_times is None
+            else int(num_observer_times)
         )
-        if observer_count <= 0:
+        if requested_observer_count <= 0:
             raise ValueError("num_observer_times must be greater than zero.")
-        observer_time_range = float(observer_time_range)
-        if not np.isfinite(observer_time_range) or observer_time_range <= 0.0:
+        requested_time_range = float(observer_time_range)
+        if not np.isfinite(requested_time_range) or requested_time_range <= 0.0:
             raise ValueError("observer_time_range must be finite and positive.")
 
         self.observer_times = None
         self.t = None
+        self.observer_rotations = None
+        self.observer_time_range = None
+        self.num_observer_times = None
+        self.sample_spacing = None
         self.p_m = None
         self.p_d = None
         self.p_tot = None
+        self.frequencies = None
+        self.spl = None
+        self.spl_a = None
+        self.ospl = None
+        self.oaspl = None
         self.source_p_m = None
         self.source_p_d = None
 
@@ -369,26 +383,86 @@ class F1A:
 
         source_p_m, source_p_d = self._calculate_source_pressures(self.observers)
         self.observer_times = self._calculate_observer_times(self.observers)
+        source_pressure = torch.stack((source_p_m, source_p_d), dim=-1)
+        interpolation_times, interpolation_pressure = (
+            self._extend_periodic_steady_sources(
+                self.observer_times,
+                source_pressure,
+            )
+        )
 
         latest_reception_start = torch.amax(
             self.observer_times[:, 0, :, :],
             dim=(1, 2),
         )
+        earliest_reception_end = torch.amin(
+            interpolation_times[:, -1, :, :],
+            dim=(1, 2),
+        )
+
+        rotation_period = 60.0 / self.rpm
+        requested_rotations = int(
+            np.floor(requested_time_range / rotation_period + 1.0e-7)
+        )
+        if requested_rotations < 1:
+            raise ValueError(
+                "observer_time_range must contain at least one complete "
+                f"rotor revolution ({rotation_period:.9g} s)."
+            )
+
+        requested_spacing = (
+            requested_time_range / requested_observer_count
+        )
+        samples_per_rotation = max(
+            1,
+            int(np.rint(rotation_period / requested_spacing)),
+        )
+        sample_spacing = rotation_period / samples_per_rotation
+        available_time_range = torch.amin(
+            earliest_reception_end - latest_reception_start
+        ).item()
+        available_rotations = int(
+            np.floor(
+                (
+                    available_time_range
+                    + sample_spacing
+                    + 1.0e-7 * rotation_period
+                )
+                / rotation_period
+            )
+        )
+        self.observer_rotations = min(
+            requested_rotations,
+            available_rotations,
+        )
+        if self.observer_rotations < 1:
+            raise ValueError(
+                "The source-time data do not cover one complete observer "
+                "revolution after the latest initial reception time. "
+                "Provide at least one additional source revolution."
+            )
+
+        self.observer_time_range = (
+            self.observer_rotations * rotation_period
+        )
+        self.num_observer_times = (
+            self.observer_rotations * samples_per_rotation
+        )
+        self.sample_spacing = sample_spacing
         observer_time_offsets = (
             torch.arange(
-                observer_count,
+                self.num_observer_times,
                 dtype=self.dtype,
                 device=self.device,
             )
-            * (observer_time_range / observer_count)
+            * self.sample_spacing
         )
         self.t = latest_reception_start[:, None] + observer_time_offsets[None, :]
 
-        source_pressure = torch.stack((source_p_m, source_p_d), dim=-1)
         observer_pressure = self._interpolate_sources(
             self.t,
-            self.observer_times,
-            source_pressure,
+            interpolation_times,
+            interpolation_pressure,
         )
         self.p_m = observer_pressure[..., 0]
         self.p_d = observer_pressure[..., 1]
@@ -398,6 +472,26 @@ class F1A:
             dim=1,
             keepdim=True,
         )
+        self.frequencies, self.spl = time_domain_to_spl_spectrum(
+            self.p_tot,
+            self.sample_spacing,
+            self.environment.p_ref,
+            time_dim=1,
+        )
+        self.spl_a = self.spl + a_weighting_db(
+            self.frequencies
+        )[None, :]
+        self.ospl = spl_spectrum_to_overall_level(
+            self.spl,
+            self.frequencies,
+            frequency_dim=1,
+        )
+        self.oaspl = spl_spectrum_to_overall_level(
+            self.spl,
+            self.frequencies,
+            weighted=True,
+            frequency_dim=1,
+        )
 
         if retain_source_terms:
             self.source_p_m = source_p_m
@@ -405,6 +499,38 @@ class F1A:
         else:
             self.source_p_m = None
             self.source_p_d = None
+
+    def _extend_periodic_steady_sources(
+        self,
+        observer_times: torch.Tensor,
+        source_pressure: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append one periodic source revolution for steady section loads."""
+        if self.loads.ndim != 2:
+            return observer_times, source_pressure
+
+        simulation = self.propeller.simulation
+        samples_per_rotation = simulation.num_obs_times_per_rev
+        source_duration = simulation.duration
+        if source_duration is None or samples_per_rotation > self.nt:
+            return observer_times, source_pressure
+
+        periodic_slice = slice(0, samples_per_rotation)
+        extended_times = torch.cat(
+            (
+                observer_times,
+                observer_times[:, periodic_slice] + source_duration,
+            ),
+            dim=1,
+        )
+        extended_pressure = torch.cat(
+            (
+                source_pressure,
+                source_pressure[:, periodic_slice],
+            ),
+            dim=1,
+        )
+        return extended_times, extended_pressure
 
     def _calculate_source_pressures(
         self,
@@ -415,18 +541,24 @@ class F1A:
 
         # Kinematics are stored as (T, B, S, 3). Adding the observer axis
         # gives every source term the native order (O, T, B, S, ...).
-        y0dot = self.kinematics.section_position_global_frame[
-            :, :, self._selected_sections
-        ].unsqueeze(0)
-        y1dot = self.kinematics.section_vel[
-            :, :, self._selected_sections
-        ].unsqueeze(0)
-        y2dot = self.kinematics.section_acc[
-            :, :, self._selected_sections
-        ].unsqueeze(0)
-        y3dot = self.kinematics.section_jerk[
-            :, :, self._selected_sections
-        ].unsqueeze(0)
+        if self._uses_all_sections:
+            y0dot = self.kinematics.section_position_global_frame.unsqueeze(0)
+            y1dot = self.kinematics.section_vel.unsqueeze(0)
+            y2dot = self.kinematics.section_acc.unsqueeze(0)
+            y3dot = self.kinematics.section_jerk.unsqueeze(0)
+        else:
+            y0dot = self.kinematics.section_position_global_frame[
+                :, :, self._selected_sections
+            ].unsqueeze(0)
+            y1dot = self.kinematics.section_vel[
+                :, :, self._selected_sections
+            ].unsqueeze(0)
+            y2dot = self.kinematics.section_acc[
+                :, :, self._selected_sections
+            ].unsqueeze(0)
+            y3dot = self.kinematics.section_jerk[
+                :, :, self._selected_sections
+            ].unsqueeze(0)
 
         rv = x_obs - y0dot
         r = torch.linalg.vector_norm(rv, dim=-1)
@@ -509,9 +641,14 @@ class F1A:
     ) -> torch.Tensor:
         """Calculate source-to-observer arrival times in ``(O, T, B, S)``."""
         x_obs = observers[:, None, None, None, :]
-        source_position = self.kinematics.section_position_global_frame[
-            :, :, self._selected_sections
-        ].unsqueeze(0)
+        if self._uses_all_sections:
+            source_position = (
+                self.kinematics.section_position_global_frame.unsqueeze(0)
+            )
+        else:
+            source_position = self.kinematics.section_position_global_frame[
+                :, :, self._selected_sections
+            ].unsqueeze(0)
         distance = torch.linalg.vector_norm(x_obs - source_position, dim=-1)
         return (
             self.kinematics.source_times[None, :, None, None]

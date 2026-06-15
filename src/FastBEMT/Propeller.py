@@ -8,7 +8,7 @@ import torch
 
 from .Aeroacoustics.F1A import F1A
 from .Aeroacoustics.BPM import BPM
-from .Aeroacoustics.Utils import perform_spectral_analysis
+from .Aeroacoustics.Utils import a_weighting_db, spl_spectrum_to_overall_level
 from .Kinematics import Kinematics
 from .Utils.Environment import Environment
 from .Utils.Simulation import Simulation
@@ -58,6 +58,13 @@ class Propeller:
         self.section_areas()
         self.calculate_boat_tail_angle()
 
+        # COM shift: positive in forward direction (+x), positive in upward direction (+z)
+        self.com_shift_up: List[float] = [s[1] for s in self.geometry["COM_shift"]]
+        self.com_shift_forward: List[float] = [
+            -s[0] for s in self.geometry["COM_shift"]
+        ]
+        self._initialize_geometry_cache()
+
         # Initialize third-octave band frequencies for BPM analysis
         octave_freqs = pf.dsp.filter.fractional_octave_frequencies(
             num_fractions=3, frequency_range=(20, 20000)
@@ -67,12 +74,6 @@ class Propeller:
         self.third_octave_freqs = torch.as_tensor(
             octave_freqs, dtype=self.dtype, device=self.device
         )
-
-        # COM shift: positive in forward direction (+x), positive in upward direction (+z)
-        self.com_shift_up: List[float] = [s[1] for s in self.geometry["COM_shift"]]
-        self.com_shift_forward: List[float] = [
-            -s[0] for s in self.geometry["COM_shift"]
-        ]
 
         # Acoustic results containers
         self.p_m: Optional[torch.Tensor] = None
@@ -88,6 +89,143 @@ class Propeller:
         self.spl_breakdown: Dict[str, np.ndarray] = {}
         self.kinematics: Optional[Kinematics] = None
         self.f1a: Optional[F1A] = None
+
+    def _initialize_geometry_cache(self) -> None:
+        """Validate and cache immutable section data on the compute device."""
+        section_arrays = {
+            "r": np.array(self.geometry["r"], dtype=np.float64, copy=True),
+            "dr": np.array(self.geometry["dr"], dtype=np.float64, copy=True),
+            "chord": np.array(
+                self.geometry["chord"],
+                dtype=np.float64,
+                copy=True,
+            ),
+            "twist": np.array(
+                self.geometry["twist"],
+                dtype=np.float64,
+                copy=True,
+            ),
+            "area": np.array(
+                self.geometry["cross_section"],
+                dtype=np.float64,
+                copy=True,
+            ),
+            "boat_tail_angle": np.array(
+                self.geometry["boat_tail_angle"],
+                dtype=np.float64,
+                copy=True,
+            ),
+            "com_shift_forward": np.array(
+                self.com_shift_forward,
+                dtype=np.float64,
+                copy=True,
+            ),
+            "com_shift_up": np.array(
+                self.com_shift_up,
+                dtype=np.float64,
+                copy=True,
+            ),
+        }
+        if section_arrays["r"].ndim != 1:
+            raise ValueError("geometry['r'] must be one-dimensional.")
+        section_count = int(section_arrays["r"].shape[0])
+        if section_count == 0:
+            raise ValueError("Propeller geometry must contain at least one section.")
+        for name, values in section_arrays.items():
+            if values.ndim != 1 or values.shape[0] != section_count:
+                raise ValueError(
+                    f"geometry['{name}'] must be one-dimensional with "
+                    f"{section_count} entries."
+                )
+            values.setflags(write=False)
+
+        self.n_sections = section_count
+        self.n_blades = int(self.geometry["n_blades"])
+        if self.n_blades <= 0:
+            raise ValueError("geometry['n_blades'] must be greater than zero.")
+
+        self.section_geometry_np = section_arrays
+        self.f1a_geometry_mask = (
+            np.isfinite(section_arrays["r"])
+            & (np.abs(section_arrays["r"]) > 1.0e-12)
+            & np.isfinite(section_arrays["dr"])
+            & (section_arrays["dr"] > 0.0)
+            & np.isfinite(section_arrays["chord"])
+            & np.isfinite(section_arrays["twist"])
+            & np.isfinite(section_arrays["area"])
+            & np.isfinite(section_arrays["com_shift_forward"])
+            & np.isfinite(section_arrays["com_shift_up"])
+        )
+        self.bpm_geometry_mask = (
+            self.f1a_geometry_mask
+            & np.isfinite(section_arrays["boat_tail_angle"])
+        )
+        self.all_f1a_geometry_valid = bool(np.all(self.f1a_geometry_mask))
+        self.all_bpm_geometry_valid = bool(np.all(self.bpm_geometry_mask))
+        if not np.any(self.f1a_geometry_mask):
+            raise ValueError("No valid blade sections are available for F1A.")
+
+        self.f1a_geometry_mask_tensor = torch.tensor(
+            self.f1a_geometry_mask,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.section_radius = torch.tensor(
+            section_arrays["r"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.section_width = torch.tensor(
+            section_arrays["dr"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.section_chord = torch.tensor(
+            section_arrays["chord"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.section_twist_rad = torch.deg2rad(
+            torch.tensor(
+                section_arrays["twist"],
+                dtype=self.dtype,
+                device=self.device,
+            )
+        )
+        self.section_area = torch.tensor(
+            section_arrays["area"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.section_com_shift_forward = torch.tensor(
+            section_arrays["com_shift_forward"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.section_com_shift_up = torch.tensor(
+            section_arrays["com_shift_up"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.rho_tensor = torch.tensor(
+            self.environment.rho,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.a_inf_tensor = torch.tensor(
+            self.environment.a_inf,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.f1a_thickness_strength = (
+            self.rho_tensor
+            * self.section_area
+            * self.section_width
+            / (4.0 * np.pi)
+        )
+        self.f1a_dipole_strength = (
+            self.section_width / (4.0 * np.pi * self.a_inf_tensor)
+        )
 
     def section_areas(self) -> None:
         '''Calculate cross-sectional areas using Shoelace formula.
@@ -195,17 +333,14 @@ class Propeller:
         self.observer_positions = np.atleast_2d(observer_positions)
         self.third_octave_total_oaspl = None
 
-        # Exclude malformed sections so NaN BEMT outputs cannot pollute acoustics.
-        geom_r = np.asarray(self.geometry['r'])
-        geom_dr = np.asarray(self.geometry['dr'])
-        geom_chord = np.asarray(self.geometry['chord'])
-        geom_twist = np.asarray(self.geometry['twist'])
-        geom_area = np.asarray(self.geometry['cross_section'])
-        geom_boat_tail = np.asarray(self.geometry['boat_tail_angle'])
-        n_blades = int(self.geometry['n_blades'])
+        # Immutable geometry was validated and converted when Propeller was built.
+        geometry = self.section_geometry_np
+        geom_r = geometry["r"]
+        geom_dr = geometry["dr"]
+        geom_chord = geometry["chord"]
+        geom_twist = geometry["twist"]
+        geom_boat_tail = geometry["boat_tail_angle"]
 
-        sol_d_t = np.asarray(solution_data['d_t'].values)
-        sol_d_q = np.asarray(solution_data['d_q'].values)
         sol_alpha = np.asarray(solution_data['alpha'].values)
         sol_u = np.asarray(solution_data['u'].values)
         sol_w = np.asarray(solution_data['W'].values)
@@ -215,15 +350,7 @@ class Propeller:
         sol_ds = np.asarray(solution_data['ds'].values)
 
         section_mask = (
-            np.isfinite(geom_r)
-            & (np.abs(geom_r) > 1e-12)
-            & np.isfinite(geom_dr)
-            & np.isfinite(geom_chord)
-            & np.isfinite(geom_twist)
-            & np.isfinite(geom_area)
-            & np.isfinite(geom_boat_tail)
-            & np.isfinite(sol_d_t)
-            & np.isfinite(sol_d_q)
+            self.bpm_geometry_mask
             & np.isfinite(sol_alpha)
             & np.isfinite(sol_u)
             & np.isfinite(sol_w)
@@ -246,10 +373,9 @@ class Propeller:
         dr = geom_dr[section_mask]
         chord = geom_chord[section_mask]
         twist = geom_twist[section_mask]
-        area = geom_area[section_mask]
         boat_tail_angle = geom_boat_tail[section_mask]
-        com_shift_forward = np.asarray(self.com_shift_forward)[section_mask]
-        com_shift_up = np.asarray(self.com_shift_up)[section_mask]
+        com_shift_forward = geometry["com_shift_forward"][section_mask]
+        com_shift_up = geometry["com_shift_up"][section_mask]
 
         alpha = sol_alpha[section_mask]
         vi = sol_u[section_mask]
@@ -304,6 +430,11 @@ class Propeller:
                 or self.f1a.p_tot is None
                 or self.f1a.observer_times is None
                 or self.f1a.t is None
+                or self.f1a.frequencies is None
+                or self.f1a.spl is None
+                or self.f1a.spl_a is None
+                or self.f1a.ospl is None
+                or self.f1a.oaspl is None
             ):
                 raise RuntimeError("F1A did not populate its acoustic results.")
 
@@ -313,11 +444,19 @@ class Propeller:
             self.p_tot = self.f1a.p_tot
             self.t = self.f1a.t
 
-            # Perform spectral analysis on combined F1A pressures
-            self._time_cuda(
-                perform_spectral_analysis,
-                propeller=self,
-                label="perform_spectral_analysis",
+            # Retain the established Propeller spectral result API as aliases.
+            observer_count = int(self.f1a.p_tot.shape[0])
+            self.freq = self.f1a.frequencies[None, :].expand(
+                observer_count,
+                -1,
+            )
+            self.spl = self.f1a.spl
+            self.spl_a = self.f1a.spl_a
+            self.ospl = self.f1a.ospl.cpu().numpy()
+            self.oaspl = self.f1a.oaspl.cpu().numpy()
+            self.fft_amp = self.environment.p_ref * torch.pow(
+                10.0,
+                self.f1a.spl / 20.0,
             )
 
             bpm_sections_in_f1a = torch.as_tensor(
@@ -452,18 +591,8 @@ class Propeller:
             A-weighting offset in dB.
         '''
 
-        def ra_calc(freq: torch.Tensor) -> torch.Tensor:
-            return (12194.0**2 * freq**4) / (
-                (freq**2 + 20.6**2)
-                * ((freq**2 + 107.7**2) * (freq**2 + 737.9**2)).sqrt()
-                * (freq**2 + 12194.0**2)
-            )
-
         f_tensor = torch.as_tensor(f, dtype=self.dtype, device=self.device)
-        ra = ra_calc(f_tensor)
-        ra_1000 = ra_calc(torch.tensor(1000.0, dtype=self.dtype, device=self.device))
-
-        return 20.0 * torch.log10(ra) - 20.0 * torch.log10(ra_1000)
+        return a_weighting_db(f_tensor)
 
     def calc_oaspl(
         self,
@@ -481,17 +610,12 @@ class Propeller:
         Returns:
             OASPL or OASPL-A, shape (...).
         '''
-        if weighted:
-            a_offsets = self.get_a_weighting(freqs).to(spl_tensor.device)
-
-            # Align A-weighting to the frequency dimension.
-            dims_to_add = spl_tensor.ndim - 1
-            view_shape = (-1,) + (1,) * dims_to_add
-            spl_tensor = spl_tensor + a_offsets.view(view_shape)
-
-        power_ratio = 10 ** (spl_tensor / 10.0)
-        summed_power = torch.sum(power_ratio, dim=0)
-        return 10.0 * torch.log10(summed_power)
+        return spl_spectrum_to_overall_level(
+            spl_tensor,
+            freqs,
+            weighted=weighted,
+            frequency_dim=0,
+        )
 
     def postprocess(self) -> None:
         '''Aggregate to third-octave bands and compute OASPL.

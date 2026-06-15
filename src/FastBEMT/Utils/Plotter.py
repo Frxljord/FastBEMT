@@ -3,7 +3,8 @@ import matplotlib.gridspec as gridspec
 import matplotlib as mpl
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
-from typing import TYPE_CHECKING, Optional, Tuple
+import torch
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 from .Stress import BladeStressCalculator
 
 if TYPE_CHECKING:
@@ -115,6 +116,8 @@ class Plotter:
         grid_size: int = 26,
         domain_size: float = 5.0,
         noise_type: str = 'total',
+        metric: str = 'oaspl',
+        levels: Optional[Union[np.ndarray, torch.Tensor]] = None,
         figsize: Tuple[float, float] = (4.5, 2),
         cmap: str = 'magma',
         contour_levels: Optional[Tuple[float]] = None,
@@ -123,37 +126,86 @@ class Plotter:
     ) -> None:
         '''Plot 2D acoustic radiation pattern as contour map.
         
-        Visualizes pre-calculated OASPL data. Assumes propeller has already been
-        run through run_aeroacoustics() and postprocess().
+        Visualizes pre-calculated third-octave acoustic data stored on the
+        propeller. These fields may come from the combined aeroacoustic
+        pipeline or from a directly evaluated F1A object.
         
         Args:
             grid_size: Number of grid points in each direction (default 26).
             domain_size: Size of domain in meters (default 5.0).
+            noise_type: Acoustic source to plot: ``"f1a"``, ``"bpm"``, or
+                ``"total"``.
+            metric: Overall level to plot: unweighted ``"ospl"`` or
+                A-weighted ``"oaspl"``.
+            levels: Optional precomputed overall levels with
+                ``grid_size**2`` entries. When supplied, these values are
+                plotted directly instead of reading a spectrum from the
+                propeller.
             figsize: Figure size tuple (width, height) in inches.
             cmap: Colormap name (default 'magma').
-            show_contours: Whether to show contour lines (default True).
             save_path: Optional path to save figure as PDF.
         '''
-        # Reshape and mirror pre-calculated data
-        if noise_type == 'bpm':
-            third_octave_total_oaspl = self.propeller.third_octave_bpm_oaspl.reshape(grid_size, grid_size)
-        elif noise_type == 'f1a':
-            third_octave_total_oaspl = self.propeller.third_octave_f1a_oaspl.reshape(grid_size, grid_size)
+        noise_type = noise_type.lower()
+        metric = metric.lower()
+        spectrum_attributes = {
+            'f1a': 'third_octave_f1a_spl',
+            'bpm': 'third_octave_bpm_spl',
+            'total': 'third_octave_total_spl',
+        }
+        if noise_type not in spectrum_attributes:
+            raise ValueError(
+                "noise_type must be 'f1a', 'bpm', or 'total'."
+            )
+        if metric not in {'ospl', 'oaspl'}:
+            raise ValueError("metric must be 'ospl' or 'oaspl'.")
+
+        if levels is None:
+            spectrum_name = spectrum_attributes[noise_type]
+            if not hasattr(self.propeller, spectrum_name):
+                raise RuntimeError(
+                    f"Propeller has no {spectrum_name} data to plot."
+                )
+            spectrum = getattr(self.propeller, spectrum_name)
+            if spectrum is None:
+                raise RuntimeError(
+                    f"Propeller has no {spectrum_name} data to plot."
+                )
+
+            overall_level = self.propeller.calc_oaspl(
+                spectrum,
+                self.propeller.third_octave_freqs,
+                weighted=metric == 'oaspl',
+            )
+            overall_level = overall_level.detach().cpu().numpy()
+        elif isinstance(levels, torch.Tensor):
+            overall_level = levels.detach().cpu().numpy()
         else:
-            third_octave_total_oaspl = self.propeller.third_octave_total_oaspl.reshape(grid_size, grid_size)
+            overall_level = np.asarray(levels)
+
+        expected_size = grid_size * grid_size
+        if overall_level.size != expected_size:
+            raise ValueError(
+                f"levels must contain {expected_size} values; "
+                f"got {overall_level.size}."
+            )
+        overall_level = overall_level.reshape(grid_size, grid_size)
+
         if mirror:
-            third_octave_oaspl_full = np.vstack([
-                third_octave_total_oaspl[::-1, :],     # Flip for negative y
-                third_octave_total_oaspl[1:, :],       # Original positive y, skip y=0 to avoid duplication
+            overall_level_full = np.vstack([
+                overall_level[::-1, :],
+                overall_level[1:, :],
             ])
         else:
-            third_octave_oaspl_full = third_octave_total_oaspl
+            overall_level_full = overall_level
 
         # Create figure
         fig, ax = plt.subplots(figsize=figsize)
         
-        vmin = np.floor(third_octave_oaspl_full.min() / 10) * 10
-        vmax = np.ceil(third_octave_oaspl_full.max() / 10) * 10
+        vmin = 0.0
+        vmax = max(
+            10.0,
+            np.ceil(np.nanmax(overall_level_full) / 10.0) * 10.0,
+        )
         
         # Create full grid for plotting
         x_range_plot = np.linspace(-domain_size, domain_size, grid_size)
@@ -162,9 +214,15 @@ class Plotter:
 
         # Plot with smooth coloring
         smooth_levels = np.linspace(vmin, vmax, 1000)
-        ax.contourf(Y_plot, X_plot, third_octave_oaspl_full, levels=smooth_levels, cmap=cmap)
+        ax.contourf(
+            Y_plot,
+            X_plot,
+            overall_level_full,
+            levels=smooth_levels,
+            cmap=cmap,
+        )
         im = ax.pcolormesh(
-            Y_plot, X_plot, third_octave_oaspl_full,
+            Y_plot, X_plot, overall_level_full,
             cmap=cmap,
             vmin=vmin, vmax=vmax,
             shading='gouraud',
@@ -176,8 +234,11 @@ class Plotter:
             im, ax=ax, shrink=1, aspect=10, pad=0.05,
             ticks=np.arange(vmin, vmax + 10, 10),
         )
-        cbar.set_label('OASPL [dB(A)]', fontsize=12)
-        cbar.ax.tick_params(labelsize=10)
+        colorbar_label = (
+            'OASPL [dB(A)]' if metric == 'oaspl' else 'OSPL [dB]'
+        )
+        cbar.set_label(colorbar_label, fontsize=12)
+        cbar.ax.tick_params(labelsize=12)
         
         # Add propeller disk circle
         angles = np.linspace(-np.pi, np.pi, 100)
@@ -190,7 +251,7 @@ class Plotter:
             
             for level, coord in zip(contour_levels, label_coords):
                 cntr = ax.contour(
-                    Y_plot, X_plot, third_octave_oaspl_full,
+                    Y_plot, X_plot, overall_level_full,
                     levels=[level], colors='white',
                     linewidths=0.8, alpha=0.5,
                 )
@@ -198,9 +259,8 @@ class Plotter:
         
         ax.set_xlabel('r [m]', fontsize=12)
         ax.set_ylabel('Z [m]', fontsize=12)
+        ax.tick_params(axis='both', labelsize=12)
         ax.grid(True, alpha=0.15, color='white')
-        plt.xticks(fontsize=12)
-        plt.yticks(fontsize=12)
         plt.tight_layout()
         
         if save_path is not None:

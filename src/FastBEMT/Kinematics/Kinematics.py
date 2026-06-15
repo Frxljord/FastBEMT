@@ -29,8 +29,7 @@ class Kinematics:
         self.dtype: torch.dtype = propeller.dtype
         self.device: torch.device = torch.device(propeller.device)
 
-        geometry = propeller.geometry
-        self.n_blades = int(geometry["n_blades"])
+        self.n_blades = propeller.n_blades
         propeller.simulation.configure_operating_point(self.rpm, self.n_blades)
 
         simulation = propeller.simulation
@@ -57,52 +56,19 @@ class Kinematics:
             device=self.device,
         )
 
-        self.radial_positions = torch.as_tensor(
-            geometry["r"],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.twist_rad = torch.deg2rad(
-            torch.as_tensor(
-                geometry["twist"],
-                dtype=self.dtype,
-                device=self.device,
-            )
-        )
-        self.com_shift_forward = torch.as_tensor(
-            propeller.com_shift_forward,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.com_shift_up = torch.as_tensor(
-            propeller.com_shift_up,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        self.radial_positions = propeller.section_radius
+        self.twist_rad = propeller.section_twist_rad
+        self.com_shift_forward = propeller.section_com_shift_forward
+        self.com_shift_up = propeller.section_com_shift_up
 
         self.nt = int(self.source_times.shape[0])
-        self.ns = int(self.radial_positions.shape[0])
+        self.ns = propeller.n_sections
         self.nb = int(self.blade_phase_offsets.shape[0])
-        self._validate_geometry()
-        self._compute()
-
-    def _validate_geometry(self) -> None:
-        """Validate section-wise geometry dimensions."""
-        section_tensors = {
-            "r": self.radial_positions,
-            "twist": self.twist_rad,
-            "com_shift_forward": self.com_shift_forward,
-            "com_shift_up": self.com_shift_up,
-        }
-        for name, value in section_tensors.items():
-            if value.ndim != 1 or value.shape[0] != self.ns:
-                raise ValueError(
-                    f"{name} must be one-dimensional with {self.ns} entries."
-                )
         if self.nb != self.n_blades:
             raise ValueError(
                 "The configured blade angles do not match geometry['n_blades']."
             )
+        self._compute()
 
     def _compute(self) -> None:
         """Compute rotations, section positions, and their time derivatives."""

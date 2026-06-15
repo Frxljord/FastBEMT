@@ -63,7 +63,7 @@ class Simulation:
         self.blade_passing_period = (
             self.duration / self.revolutions / int(n_blades)
         )
-        self.observer_time_range = self.revolutions * self.blade_passing_period
+        self.observer_time_range = self.duration
         self.dt = self.duration / self.num_obs_times
         self.src_times = (
             torch.arange(
