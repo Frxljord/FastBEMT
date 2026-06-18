@@ -742,6 +742,7 @@ class F1A:
         observer_time_range: float,
         num_observer_times: int | None = None,
         *,
+        observer_batch_size: int | None = None,
         retain_source_terms: bool = False,
     ) -> None:
         """Calculate and interpolate compact F1A pressure to observer time.
@@ -754,6 +755,8 @@ class F1A:
             num_observer_times: Requested number of output samples. The
                 implied samples per revolution are preserved. Defaults to
                 ``T``.
+            observer_batch_size: Optional number of observers to process at a
+                time. Results are merged onto this object in observer order.
             retain_source_terms: Keep the uncombined ``(O, T, B, S)`` source
                 pressure tensors for diagnostics.
 
@@ -765,6 +768,7 @@ class F1A:
         ``frequencies`` has shape ``(F,)``; ``spl`` and ``spl_a`` have shape
         ``(O, F)``; ``ospl`` and ``oaspl`` have shape ``(O,)``.
         """
+        observer_tensor = self._observer_tensor(observers)
         requested_observer_count = (
             self.nt
             if num_observer_times is None
@@ -776,6 +780,48 @@ class F1A:
         if not np.isfinite(requested_time_range) or requested_time_range <= 0.0:
             raise ValueError("observer_time_range must be finite and positive.")
 
+        batch_size = self._normalize_observer_batch_size(
+            observer_batch_size,
+            observer_count=int(observer_tensor.shape[0]),
+        )
+        if batch_size is None:
+            self._run_observer_batch(
+                observer_tensor,
+                requested_time_range=requested_time_range,
+                requested_observer_count=requested_observer_count,
+                retain_source_terms=retain_source_terms,
+            )
+            return
+
+        observer_rotations = self._observer_rotations_for_batches(
+            observer_tensor,
+            requested_time_range=requested_time_range,
+            requested_observer_count=requested_observer_count,
+            batch_size=batch_size,
+        )
+        batch_results = []
+        for start in range(0, int(observer_tensor.shape[0]), batch_size):
+            observer_batch = observer_tensor[start : start + batch_size]
+            self._run_observer_batch(
+                observer_batch,
+                requested_time_range=requested_time_range,
+                requested_observer_count=requested_observer_count,
+                retain_source_terms=retain_source_terms,
+                forced_observer_rotations=observer_rotations,
+            )
+            batch_results.append(
+                self._snapshot_batch_results(
+                    retain_source_terms=retain_source_terms,
+                )
+            )
+
+        self._merge_batch_results(
+            observer_tensor,
+            batch_results,
+            retain_source_terms=retain_source_terms,
+        )
+
+    def _reset_results(self) -> None:
         self.observer_times = None
         self.t = None
         self.observer_rotations = None
@@ -793,15 +839,76 @@ class F1A:
         self.source_p_m = None
         self.source_p_d = None
 
-        self.observers = torch.as_tensor(
+    def _observer_tensor(self, observers: ArrayLike) -> torch.Tensor:
+        observer_tensor = torch.as_tensor(
             observers,
             dtype=self.dtype,
             device=self.device,
         )
-        if self.observers.ndim == 1:
-            self.observers = self.observers.unsqueeze(0)
-        if self.observers.ndim != 2 or self.observers.shape[1] != 3:
+        if observer_tensor.ndim == 1:
+            observer_tensor = observer_tensor.unsqueeze(0)
+        if observer_tensor.ndim != 2 or observer_tensor.shape[1] != 3:
             raise ValueError("observers must have shape (O, 3).")
+        return observer_tensor.contiguous()
+
+    @staticmethod
+    def _normalize_observer_batch_size(
+        observer_batch_size: int | None,
+        *,
+        observer_count: int,
+    ) -> int | None:
+        if observer_batch_size is None:
+            return None
+        batch_size = int(observer_batch_size)
+        if batch_size <= 0:
+            raise ValueError("observer_batch_size must be greater than zero.")
+        if batch_size >= observer_count:
+            return None
+        return batch_size
+
+    def _observer_rotations_for_batches(
+        self,
+        observers: torch.Tensor,
+        *,
+        requested_time_range: float,
+        requested_observer_count: int,
+        batch_size: int,
+    ) -> int:
+        observer_rotations = None
+        for start in range(0, int(observers.shape[0]), batch_size):
+            observer_batch = observers[start : start + batch_size]
+            batch_observer_times = self._calculate_observer_times(observer_batch)
+            batch_interpolation_times = (
+                self._extend_periodic_steady_observer_times(
+                    batch_observer_times,
+                )
+            )
+            batch_rotations, _, _, _ = self._resolve_observer_time_grid(
+                batch_observer_times,
+                batch_interpolation_times,
+                requested_time_range=requested_time_range,
+                requested_observer_count=requested_observer_count,
+            )
+            observer_rotations = (
+                batch_rotations
+                if observer_rotations is None
+                else min(observer_rotations, batch_rotations)
+            )
+        if observer_rotations is None:
+            raise ValueError("observers must contain at least one observer.")
+        return observer_rotations
+
+    def _run_observer_batch(
+        self,
+        observers: torch.Tensor,
+        *,
+        requested_time_range: float,
+        requested_observer_count: int,
+        retain_source_terms: bool,
+        forced_observer_rotations: int | None = None,
+    ) -> None:
+        self._reset_results()
+        self.observers = observers
 
         source_p_m, source_p_d = self._calculate_source_pressures(self.observers)
         self.observer_times = self._calculate_observer_times(self.observers)
@@ -813,64 +920,22 @@ class F1A:
             )
         )
 
+        (
+            self.observer_rotations,
+            self.observer_time_range,
+            self.num_observer_times,
+            self.sample_spacing,
+        ) = self._resolve_observer_time_grid(
+            self.observer_times,
+            interpolation_times,
+            requested_time_range=requested_time_range,
+            requested_observer_count=requested_observer_count,
+            forced_observer_rotations=forced_observer_rotations,
+        )
         latest_reception_start = torch.amax(
             self.observer_times[:, 0, :, :],
             dim=(1, 2),
         )
-        earliest_reception_end = torch.amin(
-            interpolation_times[:, -1, :, :],
-            dim=(1, 2),
-        )
-
-        rotation_period = 60.0 / self.rpm
-        requested_rotations = int(
-            np.floor(requested_time_range / rotation_period + 1.0e-7)
-        )
-        if requested_rotations < 1:
-            raise ValueError(
-                "observer_time_range must contain at least one complete "
-                f"rotor revolution ({rotation_period:.9g} s)."
-            )
-
-        requested_spacing = (
-            requested_time_range / requested_observer_count
-        )
-        samples_per_rotation = max(
-            1,
-            int(np.rint(rotation_period / requested_spacing)),
-        )
-        sample_spacing = rotation_period / samples_per_rotation
-        available_time_range = torch.amin(
-            earliest_reception_end - latest_reception_start
-        ).item()
-        available_rotations = int(
-            np.floor(
-                (
-                    available_time_range
-                    + sample_spacing
-                    + 1.0e-7 * rotation_period
-                )
-                / rotation_period
-            )
-        )
-        self.observer_rotations = min(
-            requested_rotations,
-            available_rotations,
-        )
-        if self.observer_rotations < 1:
-            raise ValueError(
-                "The source-time data do not cover one complete observer "
-                "revolution after the latest initial reception time. "
-                "Provide at least one additional source revolution."
-            )
-
-        self.observer_time_range = (
-            self.observer_rotations * rotation_period
-        )
-        self.num_observer_times = (
-            self.observer_rotations * samples_per_rotation
-        )
-        self.sample_spacing = sample_spacing
         observer_time_offsets = (
             torch.arange(
                 self.num_observer_times,
@@ -922,6 +987,205 @@ class F1A:
             self.source_p_m = None
             self.source_p_d = None
 
+    def _resolve_observer_time_grid(
+        self,
+        observer_times: torch.Tensor,
+        interpolation_times: torch.Tensor,
+        *,
+        requested_time_range: float,
+        requested_observer_count: int,
+        forced_observer_rotations: int | None = None,
+    ) -> tuple[int, float, int, float]:
+        latest_reception_start = torch.amax(
+            observer_times[:, 0, :, :],
+            dim=(1, 2),
+        )
+        earliest_reception_end = torch.amin(
+            interpolation_times[:, -1, :, :],
+            dim=(1, 2),
+        )
+
+        rotation_period = 60.0 / self.rpm
+        requested_rotations = int(
+            np.floor(requested_time_range / rotation_period + 1.0e-7)
+        )
+        if requested_rotations < 1:
+            raise ValueError(
+                "observer_time_range must contain at least one complete "
+                f"rotor revolution ({rotation_period:.9g} s)."
+            )
+
+        requested_spacing = requested_time_range / requested_observer_count
+        samples_per_rotation = max(
+            1,
+            int(np.rint(rotation_period / requested_spacing)),
+        )
+        sample_spacing = rotation_period / samples_per_rotation
+        available_time_range = torch.amin(
+            earliest_reception_end - latest_reception_start
+        ).item()
+        available_rotations = int(
+            np.floor(
+                (
+                    available_time_range
+                    + sample_spacing
+                    + 1.0e-7 * rotation_period
+                )
+                / rotation_period
+            )
+        )
+
+        if forced_observer_rotations is None:
+            observer_rotations = min(requested_rotations, available_rotations)
+        else:
+            observer_rotations = int(forced_observer_rotations)
+            if observer_rotations > requested_rotations:
+                raise ValueError(
+                    "forced observer rotations exceed the requested duration."
+                )
+            if observer_rotations > available_rotations:
+                raise ValueError(
+                    "The source-time data do not cover the forced observer "
+                    "rotation count for this batch."
+                )
+
+        if observer_rotations < 1:
+            raise ValueError(
+                "The source-time data do not cover one complete observer "
+                "revolution after the latest initial reception time. "
+                "Provide at least one additional source revolution."
+            )
+
+        observer_time_range = observer_rotations * rotation_period
+        num_observer_times = observer_rotations * samples_per_rotation
+        return (
+            observer_rotations,
+            observer_time_range,
+            num_observer_times,
+            sample_spacing,
+        )
+
+    def _snapshot_batch_results(
+        self,
+        *,
+        retain_source_terms: bool,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "observer_times": self.observer_times,
+            "t": self.t,
+            "observer_rotations": self.observer_rotations,
+            "observer_time_range": self.observer_time_range,
+            "num_observer_times": self.num_observer_times,
+            "sample_spacing": self.sample_spacing,
+            "p_m": self.p_m,
+            "p_d": self.p_d,
+            "p_tot": self.p_tot,
+            "frequencies": self.frequencies,
+            "spl": self.spl,
+            "spl_a": self.spl_a,
+            "ospl": self.ospl,
+            "oaspl": self.oaspl,
+        }
+        if retain_source_terms:
+            result["source_p_m"] = self.source_p_m
+            result["source_p_d"] = self.source_p_d
+        return result
+
+    def _merge_batch_results(
+        self,
+        observers: torch.Tensor,
+        batch_results: list[dict[str, object]],
+        *,
+        retain_source_terms: bool,
+    ) -> None:
+        first = batch_results[0]
+        self.observers = observers
+        self.observer_rotations = int(first["observer_rotations"])
+        self.observer_time_range = float(first["observer_time_range"])
+        self.num_observer_times = int(first["num_observer_times"])
+        self.sample_spacing = float(first["sample_spacing"])
+        self.frequencies = first["frequencies"]
+
+        for result in batch_results[1:]:
+            if int(result["observer_rotations"]) != self.observer_rotations:
+                raise RuntimeError("F1A observer batches used different durations.")
+            if int(result["num_observer_times"]) != self.num_observer_times:
+                raise RuntimeError(
+                    "F1A observer batches used different sample counts."
+                )
+            if not np.isclose(
+                float(result["sample_spacing"]),
+                self.sample_spacing,
+                rtol=1.0e-7,
+                atol=1.0e-12,
+            ):
+                raise RuntimeError(
+                    "F1A observer batches used different sample spacing."
+                )
+            if not torch.allclose(result["frequencies"], self.frequencies):
+                raise RuntimeError(
+                    "F1A observer batches produced different frequency grids."
+                )
+
+        self.observer_times = torch.cat(
+            [result["observer_times"] for result in batch_results],
+            dim=0,
+        )
+        self.t = torch.cat([result["t"] for result in batch_results], dim=0)
+        self.p_m = torch.cat([result["p_m"] for result in batch_results], dim=0)
+        self.p_d = torch.cat([result["p_d"] for result in batch_results], dim=0)
+        self.p_tot = torch.cat(
+            [result["p_tot"] for result in batch_results],
+            dim=0,
+        )
+        self.spl = torch.cat([result["spl"] for result in batch_results], dim=0)
+        self.spl_a = torch.cat(
+            [result["spl_a"] for result in batch_results],
+            dim=0,
+        )
+        self.ospl = torch.cat(
+            [result["ospl"] for result in batch_results],
+            dim=0,
+        )
+        self.oaspl = torch.cat(
+            [result["oaspl"] for result in batch_results],
+            dim=0,
+        )
+        if retain_source_terms:
+            self.source_p_m = torch.cat(
+                [result["source_p_m"] for result in batch_results],
+                dim=0,
+            )
+            self.source_p_d = torch.cat(
+                [result["source_p_d"] for result in batch_results],
+                dim=0,
+            )
+        else:
+            self.source_p_m = None
+            self.source_p_d = None
+
+    def _extend_periodic_steady_observer_times(
+        self,
+        observer_times: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.loads.ndim != 2:
+            return observer_times
+
+        simulation = self.propeller.simulation
+        samples_per_rotation = simulation.num_obs_times_per_rev
+        source_duration = simulation.duration
+        if source_duration is None or samples_per_rotation > self.nt:
+            return observer_times
+
+        periodic_slice = slice(0, samples_per_rotation)
+        return torch.cat(
+            (
+                observer_times,
+                observer_times[:, periodic_slice] + source_duration,
+            ),
+            dim=1,
+        )
+
     def _extend_periodic_steady_sources(
         self,
         observer_times: torch.Tensor,
@@ -938,13 +1202,7 @@ class F1A:
             return observer_times, source_pressure
 
         periodic_slice = slice(0, samples_per_rotation)
-        extended_times = torch.cat(
-            (
-                observer_times,
-                observer_times[:, periodic_slice] + source_duration,
-            ),
-            dim=1,
-        )
+        extended_times = self._extend_periodic_steady_observer_times(observer_times)
         extended_pressure = torch.cat(
             (
                 source_pressure,

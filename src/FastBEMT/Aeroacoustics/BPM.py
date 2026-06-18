@@ -279,19 +279,103 @@ class BPM:
         lt: Optional[float] = None,
         i: Optional[float] = None,
         alpha_stall: Optional[float] = None,
+        observer_batch_size: Optional[int] = None,
         retain_source_terms: bool = False,
     ) -> None:
-        """Compute BPM component and total third-octave spectra."""
-        self._reset_results()
-        self.observers = torch.as_tensor(
+        """Compute BPM component and total third-octave spectra.
+
+        Args:
+            observers: Stationary observer coordinates, shape ``(O, 3)``.
+            observer_time_range: Optional requested observer-time duration.
+            num_observer_times: Optional requested observer sample count.
+            lt: Override the turbulent length scale for this run.
+            i: Override the turbulence intensity for this run.
+            alpha_stall: Override the stall angle in degrees for this run.
+            observer_batch_size: Optional number of observers to process at a
+                time. Results are merged onto this object in observer order.
+            retain_source_terms: Keep uncombined source component powers.
+        """
+        observer_tensor = self._observer_tensor(observers)
+        batch_size = self._normalize_observer_batch_size(
+            observer_batch_size,
+            observer_count=int(observer_tensor.shape[0]),
+        )
+        if batch_size is None:
+            self._run_observer_batch(
+                observer_tensor,
+                observer_time_range=observer_time_range,
+                num_observer_times=num_observer_times,
+                lt=lt,
+                i=i,
+                alpha_stall=alpha_stall,
+                retain_source_terms=retain_source_terms,
+            )
+            return
+
+        batch_results = []
+        for start in range(0, int(observer_tensor.shape[0]), batch_size):
+            observer_batch = observer_tensor[start : start + batch_size]
+            self._run_observer_batch(
+                observer_batch,
+                observer_time_range=observer_time_range,
+                num_observer_times=num_observer_times,
+                lt=lt,
+                i=i,
+                alpha_stall=alpha_stall,
+                retain_source_terms=retain_source_terms,
+            )
+            batch_results.append(
+                self._snapshot_batch_results(
+                    retain_source_terms=retain_source_terms,
+                )
+            )
+
+        self._merge_batch_results(
+            observer_tensor,
+            batch_results,
+            retain_source_terms=retain_source_terms,
+        )
+
+    def _observer_tensor(self, observers: ArrayLike) -> torch.Tensor:
+        observer_tensor = torch.as_tensor(
             observers,
             dtype=self.dtype,
             device=self.device,
         )
-        if self.observers.ndim == 1:
-            self.observers = self.observers.unsqueeze(0)
-        if self.observers.ndim != 2 or self.observers.shape[1] != 3:
+        if observer_tensor.ndim == 1:
+            observer_tensor = observer_tensor.unsqueeze(0)
+        if observer_tensor.ndim != 2 or observer_tensor.shape[1] != 3:
             raise ValueError("observers must have shape (O, 3).")
+        return observer_tensor.contiguous()
+
+    @staticmethod
+    def _normalize_observer_batch_size(
+        observer_batch_size: Optional[int],
+        *,
+        observer_count: int,
+    ) -> Optional[int]:
+        if observer_batch_size is None:
+            return None
+        batch_size = int(observer_batch_size)
+        if batch_size <= 0:
+            raise ValueError("observer_batch_size must be greater than zero.")
+        if batch_size >= observer_count:
+            return None
+        return batch_size
+
+    def _run_observer_batch(
+        self,
+        observers: torch.Tensor,
+        *,
+        observer_time_range: Optional[float],
+        num_observer_times: Optional[int],
+        lt: Optional[float],
+        i: Optional[float],
+        alpha_stall: Optional[float],
+        retain_source_terms: bool,
+    ) -> None:
+        self._reset_results()
+        self.observers = observers
 
         source_positions, source_beta = self._source_trajectory()
         source_observer_times = self._source_observer_times(
@@ -383,6 +467,134 @@ class BPM:
             weighted=True,
             frequency_dim=1,
         )
+
+    def _snapshot_batch_results(
+        self,
+        *,
+        retain_source_terms: bool,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "observer_times": self.observer_times,
+            "t": self.t,
+            "observer_rotations": self.observer_rotations,
+            "observer_time_range": self.observer_time_range,
+            "num_observer_times": self.num_observer_times,
+            "sample_spacing": self.sample_spacing,
+            "source_rotation_repetitions": self.source_rotation_repetitions,
+            "base_val_te": self.base_val_te,
+            "base_val_le": self.base_val_le,
+            "base_val_low": self.base_val_low,
+            "component_p2": self.component_p2,
+            "component_spl": self.component_spl,
+            "spl": self.spl,
+            "spl_a": self.spl_a,
+            "ospl": self.ospl,
+            "oaspl": self.oaspl,
+            "frequencies": self.frequencies,
+        }
+        if retain_source_terms:
+            result["source_component_p2"] = self.source_component_p2
+        return result
+
+    def _merge_batch_results(
+        self,
+        observers: torch.Tensor,
+        batch_results: list[dict[str, object]],
+        *,
+        retain_source_terms: bool,
+    ) -> None:
+        first = batch_results[0]
+        self.observers = observers
+        self.observer_rotations = int(first["observer_rotations"])
+        self.observer_time_range = float(first["observer_time_range"])
+        self.num_observer_times = int(first["num_observer_times"])
+        self.sample_spacing = float(first["sample_spacing"])
+        self.source_rotation_repetitions = max(
+            int(result["source_rotation_repetitions"])
+            for result in batch_results
+        )
+        self.frequencies = first["frequencies"]
+
+        for result in batch_results[1:]:
+            if int(result["observer_rotations"]) != self.observer_rotations:
+                raise RuntimeError("BPM observer batches used different durations.")
+            if int(result["num_observer_times"]) != self.num_observer_times:
+                raise RuntimeError(
+                    "BPM observer batches used different sample counts."
+                )
+            if not np.isclose(
+                float(result["sample_spacing"]),
+                self.sample_spacing,
+                rtol=1.0e-7,
+                atol=1.0e-12,
+            ):
+                raise RuntimeError(
+                    "BPM observer batches used different sample spacing."
+                )
+            if not torch.allclose(result["frequencies"], self.frequencies):
+                raise RuntimeError(
+                    "BPM observer batches produced different frequency grids."
+                )
+
+        self.observer_times = torch.cat(
+            [result["observer_times"] for result in batch_results],
+            dim=0,
+        )
+        self.t = torch.cat([result["t"] for result in batch_results], dim=0)
+        self.base_val_te = torch.cat(
+            [result["base_val_te"] for result in batch_results],
+            dim=3,
+        )
+        self.base_val_le = torch.cat(
+            [result["base_val_le"] for result in batch_results],
+            dim=3,
+        )
+        self.base_val_low = torch.cat(
+            [result["base_val_low"] for result in batch_results],
+            dim=3,
+        )
+
+        component_names = tuple(first["component_p2"])
+        self.component_p2 = {
+            name: torch.cat(
+                [result["component_p2"][name] for result in batch_results],
+                dim=2,
+            )
+            for name in component_names
+        }
+        self.component_spl = {
+            name: torch.cat(
+                [result["component_spl"][name] for result in batch_results],
+                dim=0,
+            )
+            for name in component_names
+        }
+        self.spl = torch.cat([result["spl"] for result in batch_results], dim=0)
+        self.spl_a = torch.cat(
+            [result["spl_a"] for result in batch_results],
+            dim=0,
+        )
+        self.ospl = torch.cat(
+            [result["ospl"] for result in batch_results],
+            dim=0,
+        )
+        self.oaspl = torch.cat(
+            [result["oaspl"] for result in batch_results],
+            dim=0,
+        )
+        if retain_source_terms:
+            self.source_component_p2 = {
+                name: torch.cat(
+                    [
+                        result["source_component_p2"][name]
+                        for result in batch_results
+                    ],
+                    dim=4,
+                )
+                for name in component_names
+            }
+        else:
+            self.source_component_p2 = None
 
     def _reset_results(self) -> None:
         self.observers = None
