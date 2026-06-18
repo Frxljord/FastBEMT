@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
 import torch
 
-if TYPE_CHECKING:
-    from ..Propeller import Propeller
-
 __all__ = [
     "a_weighting_db",
-    "perform_spectral_analysis",
+    "power_ratio_to_spl",
     "spl_spectrum_to_overall_level",
+    "sum_spl_spectra",
+    "third_octave_spectrum_to_overall_level",
     "time_domain_to_spl_spectrum",
 ]
 
@@ -74,6 +72,41 @@ def _rms_amplitude_to_spl(
     return 20.0 * torch.log10(
         rms_amplitude.clamp_min(1.0e-15) / p_ref
     )
+
+
+def power_ratio_to_spl(
+    power_ratio: torch.Tensor,
+    *,
+    floor: float | None = None,
+) -> torch.Tensor:
+    """Convert an acoustic pressure-squared ratio to SPL in dB."""
+    power_ratio = torch.as_tensor(power_ratio)
+    if not power_ratio.is_floating_point():
+        power_ratio = power_ratio.to(torch.get_default_dtype())
+    if floor is None:
+        floor_value = torch.finfo(power_ratio.dtype).tiny
+    else:
+        floor_value = float(floor)
+        if not math.isfinite(floor_value) or floor_value <= 0.0:
+            raise ValueError("floor must be finite and greater than zero.")
+    return 10.0 * torch.log10(power_ratio.clamp_min(floor_value))
+
+
+def sum_spl_spectra(
+    spl: torch.Tensor,
+    *,
+    component_dim: int = 0,
+) -> torch.Tensor:
+    """Log-sum SPL spectra along a component dimension."""
+    spl = torch.as_tensor(spl)
+    if not spl.is_floating_point():
+        spl = spl.to(torch.get_default_dtype())
+    if spl.ndim == 0:
+        raise ValueError("spl must have at least one dimension.")
+
+    component_dim = component_dim % spl.ndim
+    power_ratio = torch.pow(10.0, spl / 10.0)
+    return power_ratio_to_spl(torch.sum(power_ratio, dim=component_dim))
 
 
 def time_domain_to_spl_spectrum(
@@ -180,49 +213,17 @@ def spl_spectrum_to_overall_level(
     return 10.0 * torch.log10(torch.sum(power_ratio, dim=frequency_dim))
 
 
-def perform_spectral_analysis(propeller: Propeller) -> None:
-    """Populate the established Propeller spectral result attributes."""
-    f1a = getattr(propeller, "f1a", None)
-    if f1a is not None and f1a.sample_spacing is not None:
-        sample_spacing = f1a.sample_spacing
-    else:
-        sample_spacing = (
-            propeller.simulation.observer_time_range
-            / propeller.simulation.num_obs_times
-        )
-    frequencies, rms_amplitude = _one_sided_rms_spectrum(
-        propeller.p_tot,
-        sample_spacing,
-        1,
+def third_octave_spectrum_to_overall_level(
+    spl: torch.Tensor,
+    frequencies: torch.Tensor,
+    *,
+    weighted: bool = False,
+    frequency_dim: int = -1,
+) -> torch.Tensor:
+    """Integrate third-octave band SPL into OSPL or A-weighted OASPL."""
+    return spl_spectrum_to_overall_level(
+        spl,
+        frequencies,
+        weighted=weighted,
+        frequency_dim=frequency_dim,
     )
-    spl = _rms_amplitude_to_spl(
-        rms_amplitude,
-        propeller.environment.p_ref,
-    )
-    observer_count = int(propeller.p_tot.shape[0])
-
-    propeller.freq = frequencies.unsqueeze(0).expand(observer_count, -1)
-    propeller.spl = spl
-    propeller.spl_a = spl + a_weighting_db(frequencies)[None, :]
-    propeller.ospl = (
-        spl_spectrum_to_overall_level(
-            spl,
-            frequencies,
-            frequency_dim=1,
-        )
-        .cpu()
-        .numpy()
-    )
-    propeller.oaspl = (
-        spl_spectrum_to_overall_level(
-            spl,
-            frequencies,
-            weighted=True,
-            frequency_dim=1,
-        )
-        .cpu()
-        .numpy()
-    )
-
-    # Preserve the existing RMS-amplitude result for downstream callers.
-    propeller.fft_amp = rms_amplitude

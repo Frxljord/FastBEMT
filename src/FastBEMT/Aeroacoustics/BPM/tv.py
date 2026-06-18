@@ -29,7 +29,7 @@ def calc_l_tip(chord: torch.Tensor, alpha_tip: torch.Tensor) -> torch.Tensor:
 
 
 def aspect_ratio_correction(aspect_ratio: torch.Tensor) -> torch.Tensor:
-    """Compute BroadbandBPM.jl tip lift-curve correction."""
+    """Compute the tip lift-curve correction."""
     aspect_value = float(aspect_ratio.detach().cpu())
     if aspect_value < 2.0:
         aratio = 0.5

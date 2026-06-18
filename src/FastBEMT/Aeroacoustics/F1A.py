@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from os import PathLike
-from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
-import pandas as pd
 import torch
 
 from .Utils import (
@@ -18,11 +15,9 @@ from ..Kinematics import Kinematics
 if TYPE_CHECKING:
     from ..Aerodynamics.BEMT import BEMT
     from ..Propeller import Propeller
-    from ..Utils.Environment import Environment
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
-PathInput = Union[str, PathLike[str]]
 
 
 class F1A:
@@ -30,20 +25,14 @@ class F1A:
 
     Args:
         propeller: Propeller containing geometry and simulation settings.
-        environment: Acoustic environment stored by ``propeller``.
-        loadings: Either a BEMT analysis or a path to a ``.pt`` file
-            containing direct blade-frame force per unit span on the fluid
-            with shape ``(S, 3)`` or ``(T, B, S, 3)`` and
-            ``(axial, radial, tangential)`` components. ``S`` must match the
-            full Propeller geometry.
+        bemt: BEMT analysis providing steady section loads.
+        kinematics: Optional shared propeller kinematics. When omitted, F1A
+            reuses ``propeller.kinematics`` if it matches the RPM, otherwise it
+            creates one.
         rpm: Operating RPM. Optional for a single-point BEMT analysis and
-            required for direct loadings.
+            required for multi-point BEMT analyses.
         v_inf: BEMT freestream velocity. Required with ``rpm`` when
             selecting from a multi-point BEMT analysis.
-        source_times: Path to a CSV table containing source emission
-            timestamps in seconds for direct loadings. Required for direct
-            loading files and not allowed with BEMT loadings. The timestamp
-            length must match the first dimension of unsteady direct loadings.
 
     Observer-dependent source tensors use dimension order
     ``(O, T, B, S, ...)``.
@@ -52,196 +41,110 @@ class F1A:
     def __init__(
         self,
         propeller: Propeller,
-        environment: Environment,
-        loadings: BEMT | PathInput,
+        bemt: BEMT,
         *,
+        kinematics: Kinematics | None = None,
         rpm: float | None = None,
         v_inf: float | None = None,
-        source_times: PathInput | None = None,
     ) -> None:
         self.propeller = propeller
-        self.environment = environment
-        if environment is not propeller.environment:
-            raise ValueError(
-                "F1A environment must be the environment stored by the propeller."
-            )
+        self.environment = propeller.environment
 
         self.device = torch.device(propeller.device)
         self.dtype = propeller.dtype
         self.rho = propeller.rho_tensor
         self.a_inf = propeller.a_inf_tensor
-        self.loadings_path: Path | None = None
-        self.source_times_path: Path | None = None
 
         from ..Aerodynamics.BEMT import BEMT
 
-        direct_loadings: torch.Tensor | None = None
-        direct_source_times: torch.Tensor | None = None
-        if isinstance(loadings, BEMT):
-            if source_times is not None:
-                raise ValueError(
-                    "source_times is only supported for direct F1A loadings."
-                )
-            if loadings.propeller is not propeller:
-                raise ValueError(
-                    "The BEMT analysis belongs to a different propeller."
-                )
-            if loadings.environment is not environment:
-                raise ValueError(
-                    "F1A and BEMT must use the same environment."
-                )
-            self.bemt: BEMT | None = loadings
-            self.rpm, self.v_inf = loadings.resolve_operating_point(rpm, v_inf)
-            solution = loadings.solution_for(self.rpm, self.v_inf)
-        else:
-            self.bemt = None
-            if rpm is None:
-                raise ValueError("rpm is required for direct F1A loadings.")
-            self.rpm = float(rpm)
-            if not np.isfinite(self.rpm) or self.rpm <= 0.0:
-                raise ValueError("rpm must be finite and greater than zero.")
-            if v_inf is not None:
-                raise ValueError(
-                    "v_inf is only used when loadings is a BEMT analysis."
-                )
-            self.v_inf = None
-            solution = None
-            self.loadings_path = self._required_file_path(
-                loadings,
-                name="loadings",
-                suffix=".pt",
-            )
-            self.source_times_path = self._required_file_path(
-                source_times,
-                name="source_times",
-                suffix=".csv",
-            )
-            direct_loadings = self._load_direct_loadings(self.loadings_path)
-            direct_source_times = self._load_source_times(
-                self.source_times_path
-            )
+        if not isinstance(bemt, BEMT):
+            raise TypeError("bemt must be a FastBEMT Aerodynamics.BEMT object.")
+        if bemt.propeller is not propeller:
+            raise ValueError("The BEMT analysis belongs to a different propeller.")
+        if bemt.environment is not self.environment:
+            raise ValueError("F1A and BEMT must use the same environment.")
+        self.bemt = bemt
+        self.rpm, self.v_inf = bemt.resolve_operating_point(rpm, v_inf)
+        solution = bemt.solution_for(self.rpm, self.v_inf)
 
-        existing_kinematics = propeller.kinematics
-        if self._kinematics_matches(existing_kinematics, direct_source_times):
-            self.kinematics = existing_kinematics
+        if kinematics is not None:
+            if not self._kinematics_matches(kinematics):
+                raise ValueError(
+                    "The supplied Kinematics object must belong to this propeller "
+                    "and operating RPM."
+                )
+            self.kinematics = kinematics
+        elif self._kinematics_matches(propeller.kinematics):
+            self.kinematics = propeller.kinematics
         else:
-            self.kinematics = Kinematics(
-                propeller,
-                rpm=self.rpm,
-                source_times=direct_source_times,
-            )
+            self.kinematics = Kinematics(propeller, rpm=self.rpm)
         propeller.kinematics = self.kinematics
         self.nt = self.kinematics.nt
         self.nb = self.kinematics.nb
 
         section_mask = propeller.f1a_geometry_mask.copy()
-        section_count = propeller.n_sections
-
-        if solution is not None:
-            d_t = np.asarray(solution["d_t"].values, dtype=np.float64)
-            d_q = np.asarray(solution["d_q"].values, dtype=np.float64)
-            section_mask &= np.isfinite(d_t) & np.isfinite(d_q)
-            if not np.any(section_mask):
-                raise ValueError("No valid blade sections available for F1A.")
-            all_sections_selected = bool(np.all(section_mask))
-            selected_sections = (
-                propeller.f1a_geometry_mask_tensor
-                if all_sections_selected
-                else torch.as_tensor(
-                    section_mask,
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-            )
-            d_t_tensor = torch.as_tensor(
-                d_t,
-                dtype=self.dtype,
+        d_t = np.asarray(solution["d_t"].values, dtype=np.float64)
+        d_q = np.asarray(solution["d_q"].values, dtype=np.float64)
+        section_mask &= np.isfinite(d_t) & np.isfinite(d_q)
+        if not np.any(section_mask):
+            raise ValueError("No valid blade sections available for F1A.")
+        all_sections_selected = bool(np.all(section_mask))
+        selected_sections = (
+            propeller.f1a_geometry_mask_tensor
+            if all_sections_selected
+            else torch.as_tensor(
+                section_mask,
+                dtype=torch.bool,
                 device=self.device,
             )
-            d_q_tensor = torch.as_tensor(
-                d_q,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            section_width = (
-                propeller.section_width
+        )
+        d_t_tensor = torch.as_tensor(
+            d_t,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        d_q_tensor = torch.as_tensor(
+            d_q,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        section_width = (
+            propeller.section_width
+            if all_sections_selected
+            else propeller.section_width[selected_sections]
+        )
+        section_radius = (
+            propeller.section_radius
+            if all_sections_selected
+            else propeller.section_radius[selected_sections]
+        )
+        axial_load = (
+            (
+                d_t_tensor
                 if all_sections_selected
-                else propeller.section_width[selected_sections]
+                else d_t_tensor[selected_sections]
             )
-            section_radius = (
-                propeller.section_radius
+            / section_width
+            / self.nb
+        )
+        tangential_load = (
+            (
+                d_q_tensor
                 if all_sections_selected
-                else propeller.section_radius[selected_sections]
+                else d_q_tensor[selected_sections]
             )
-            axial_load = (
-                (
-                    d_t_tensor
-                    if all_sections_selected
-                    else d_t_tensor[selected_sections]
-                )
-                / section_width
-                / self.nb
-            )
-            tangential_load = (
-                (
-                    d_q_tensor
-                    if all_sections_selected
-                    else d_q_tensor[selected_sections]
-                )
-                / section_width
-                / section_radius
-                / self.nb
-            )
-            loads = torch.stack(
-                (
-                    axial_load,
-                    torch.zeros_like(axial_load),
-                    -tangential_load,
-                ),
-                dim=-1,
-            )
-        else:
-            if direct_loadings is None:
-                raise RuntimeError("Direct F1A loadings were not loaded.")
-            loads_full = direct_loadings
-            steady_shape = (section_count, 3)
-            unsteady_shape = (
-                self.nt,
-                self.nb,
-                section_count,
-                3,
-            )
-            if tuple(loads_full.shape) not in (steady_shape, unsteady_shape):
-                raise ValueError(
-                    "Direct F1A loadings must have shape "
-                    f"{steady_shape} or {unsteady_shape}; "
-                    f"got {tuple(loads_full.shape)}."
-                )
-            if loads_full.ndim == 2:
-                finite_load_sections = torch.isfinite(loads_full).all(
-                    dim=1
-                ).cpu().numpy()
-            else:
-                finite_load_sections = torch.isfinite(loads_full).all(
-                    dim=(0, 1, 3)
-                ).cpu().numpy()
-            section_mask &= finite_load_sections
-            if not np.any(section_mask):
-                raise ValueError("No valid blade sections available for F1A.")
-            all_sections_selected = bool(np.all(section_mask))
-            if all_sections_selected:
-                selected_sections = propeller.f1a_geometry_mask_tensor
-                loads = loads_full
-            else:
-                selected_sections = torch.as_tensor(
-                    section_mask,
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-                if loads_full.ndim == 2:
-                    loads = loads_full[selected_sections, :]
-                else:
-                    loads = loads_full[:, :, selected_sections, :]
+            / section_width
+            / section_radius
+            / self.nb
+        )
+        loads = torch.stack(
+            (
+                axial_load,
+                torch.zeros_like(axial_load),
+                -tangential_load,
+            ),
+            dim=-1,
+        )
 
         self.section_mask = section_mask
         self._selected_sections = selected_sections
@@ -276,7 +179,6 @@ class F1A:
             ]
         self.ns = int(self.r.shape[0])
         self.loads = loads
-        self.loadings = self.loads
 
         self._initialize_loading()
 
@@ -301,160 +203,13 @@ class F1A:
     def _kinematics_matches(
         self,
         kinematics: Kinematics | None,
-        source_times: torch.Tensor | None,
     ) -> bool:
-        """Return whether cached kinematics match RPM and source-time grid."""
-        if kinematics is None or kinematics.rpm != self.rpm:
+        """Return whether cached kinematics match this propeller and RPM."""
+        if kinematics is None:
             return False
-        uses_custom_source_times = getattr(
-            kinematics,
-            "uses_custom_source_times",
-            False,
-        )
-        if source_times is None:
-            return not uses_custom_source_times
-        if not uses_custom_source_times:
+        if kinematics.propeller is not self.propeller:
             return False
-
-        if source_times.shape != kinematics.source_times.shape:
-            return False
-        return torch.allclose(
-            source_times,
-            kinematics.source_times,
-            rtol=1.0e-6,
-            atol=1.0e-9,
-        )
-
-    def _required_file_path(
-        self,
-        value: object,
-        *,
-        name: str,
-        suffix: str,
-    ) -> Path:
-        """Validate a required direct-input path."""
-        if value is None:
-            raise ValueError(
-                f"{name} is required for direct F1A loadings and must be a "
-                f"path to a {suffix} file."
-            )
-        if not isinstance(value, (str, PathLike)):
-            raise TypeError(
-                f"{name} must be a path to a {suffix} file for direct F1A "
-                f"loadings; got {type(value).__name__}."
-            )
-
-        path = Path(value)
-        if path.suffix.lower() != suffix:
-            raise ValueError(
-                f"{name} must point to a {suffix} file; got '{path}'."
-            )
-        if not path.is_file():
-            raise FileNotFoundError(f"{name} file not found: {path}")
-        return path
-
-    def _load_direct_loadings(self, path: Path) -> torch.Tensor:
-        """Load direct F1A loadings from a ``.pt`` file."""
-        loaded = torch.load(path, map_location=self.device)
-        if isinstance(loaded, dict):
-            if "loadings" in loaded:
-                loaded = loaded["loadings"]
-            else:
-                tensor_items = [
-                    value
-                    for value in loaded.values()
-                    if isinstance(value, (torch.Tensor, np.ndarray))
-                ]
-                if len(tensor_items) != 1:
-                    raise ValueError(
-                        "Direct F1A loading files that contain a dictionary "
-                        "must have a 'loadings' tensor or exactly one tensor "
-                        f"value; got keys {list(loaded.keys())}."
-                    )
-                loaded = tensor_items[0]
-
-        if not isinstance(loaded, (torch.Tensor, np.ndarray)):
-            raise TypeError(
-                "Direct F1A loading files must contain a torch.Tensor or "
-                f"numpy.ndarray; got {type(loaded).__name__}."
-            )
-
-        return torch.as_tensor(
-            loaded,
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-    def _load_source_times(self, path: Path) -> torch.Tensor:
-        """Load a one-dimensional source-time vector from a CSV table."""
-        series = self._source_time_series_from_csv(path)
-        source_times = pd.to_numeric(series, errors="coerce")
-        if source_times.isna().any():
-            raise ValueError(
-                f"Timestamp CSV '{path}' contains non-numeric values in "
-                f"column '{series.name}'."
-            )
-
-        return torch.as_tensor(
-            source_times.to_numpy(dtype=np.float64),
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-    def _source_time_series_from_csv(self, path: Path) -> pd.Series:
-        """Select the timestamp column from a CSV file."""
-        table = pd.read_csv(path)
-        if table.shape[1] == 0:
-            raise ValueError(f"Timestamp CSV '{path}' has no columns.")
-
-        if table.shape[1] == 1 and self._looks_numeric(table.columns[0]):
-            table = pd.read_csv(path, header=None)
-            series = table.iloc[:, 0]
-            series.name = "time"
-            return series
-
-        preferred_columns = {
-            "t",
-            "time",
-            "times",
-            "time_s",
-            "time_sec",
-            "time_seconds",
-            "source_time",
-            "source_times",
-            "source_time_s",
-            "timestamp",
-            "timestamps",
-            "seconds",
-        }
-        for column in table.columns:
-            normalized = str(column).strip().lower().replace(" ", "_")
-            if normalized in preferred_columns:
-                return table[column]
-
-        if table.shape[1] == 1:
-            return table.iloc[:, 0]
-
-        numeric_columns = []
-        for column in table.columns:
-            converted = pd.to_numeric(table[column], errors="coerce")
-            if not converted.empty and not converted.isna().any():
-                numeric_columns.append(column)
-        if len(numeric_columns) == 1:
-            return table[numeric_columns[0]]
-
-        raise ValueError(
-            f"Timestamp CSV '{path}' must contain a recognized timestamp "
-            "column such as 'time_s', 'time', 't', or a single numeric column."
-        )
-
-    @staticmethod
-    def _looks_numeric(value: object) -> bool:
-        try:
-            float(value)
-        except (TypeError, ValueError):
-            return False
-        return True
+        return np.isclose(float(kinematics.rpm), float(self.rpm))
 
     def _initialize_loading(self) -> None:
         """Rotate loads and form their complete source-time derivative."""
@@ -497,10 +252,6 @@ class F1A:
                 intrinsic_derivative,
             )
         self.f1dot = self.f1dot.contiguous()
-
-        # Compatibility aliases for callers that inspect the transformed loads.
-        self.force_fixed = self.f0dot
-        self.force_der_fixed = self.f1dot
 
     @torch.inference_mode()
     def run(
@@ -725,7 +476,7 @@ class F1A:
         self,
         observers: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate uncombined source pressure in Julia's notation."""
+        """Calculate uncombined source-time pressure terms."""
         x_obs = observers[:, None, None, None, :]
 
         # Kinematics are stored as (T, B, S, 3). Adding the observer axis
@@ -795,7 +546,7 @@ class F1A:
         R02 = R01.square()
         R21 = R11 * R10
 
-        # Source-time derivatives used directly by AcousticAnalogies.jl.
+        # Source-time derivatives for the compact loading/thickness terms.
         R10dot = -R10_sq * r1dot
         R01dot = R01.square() * Mr1dot
         R11_factor = -R10 * r1dot + R01 * Mr1dot
