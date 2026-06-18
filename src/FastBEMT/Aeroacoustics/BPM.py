@@ -1,6 +1,27 @@
 import torch
 import numpy as np
+import importlib.util
+from pathlib import Path
+from types import ModuleType
 from typing import Dict, Sequence, Tuple, Optional, Union
+
+
+def _load_bpm_component(name: str) -> ModuleType:
+    """Load a BPM component module from the sibling BPM directory."""
+    component_path = Path(__file__).with_suffix("") / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"{__name__}_{name}", component_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load BPM component module: {component_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_tbl_component = _load_bpm_component("tbl")
+_lbl_component = _load_bpm_component("lbl")
+_teb_component = _load_bpm_component("teb")
+_ti_component = _load_bpm_component("ti")
+_tv_component = _load_bpm_component("tv")
 
 
 def _torch_select(
@@ -63,13 +84,13 @@ def st2(m: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         st2 parameter tensor
     """
     conditions = [
-        alpha < 1.33,
-        (alpha >= 1.33) & (alpha <= 12.5),
+        alpha <= 1.333,
+        (alpha > 1.333) & (alpha <= 12.5),
         alpha > 12.5,
     ]
     choices = [
         torch.ones_like(alpha),
-        torch.pow(10.0, 0.0054 * torch.pow(alpha - 1.33, 2)),
+        torch.pow(10.0, 0.0054 * torch.pow(alpha - 1.333, 2)),
         torch.full_like(alpha, 4.72),
     ]
     tmp = _torch_select(conditions, choices)
@@ -219,7 +240,7 @@ def tbl_te_b_max(b: torch.Tensor) -> torch.Tensor:
     ]
     choices = [
         torch.sqrt(16.888 - 886.788 * b**2) - 4.109,
-        -31.330 * b + 1.854,
+        -31.313 * b + 1.854,
         -80.541 * b**3 + 44.174 * b**2 - 39.381 * b + 2.344,
     ]
     return _torch_select(conditions, choices)
@@ -329,19 +350,21 @@ def k2(re_c: torch.Tensor, m: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor
     beta0 = -34.19 * m - 13.82
 
     conditions = [
-        alpha < gamma0 - gamma,
-        (alpha >= gamma0 - gamma) & (alpha <= gamma0 + gamma),
+        alpha <= gamma0 - gamma,
+        (alpha > gamma0 - gamma) & (alpha <= gamma0 + gamma),
         alpha > gamma0 + gamma,
     ]
 
     choices = [
         torch.full_like(alpha, -1000.0),
-        torch.sqrt(beta**2 - (beta / gamma) ** 2 * (alpha - gamma0) ** 2) + beta0,
+        torch.sqrt(
+            torch.clamp(beta**2 - (beta / gamma) ** 2 * (alpha - gamma0) ** 2, min=0)
+        )
+        + beta0,
         torch.full_like(alpha, -12.0),
     ]
 
     tmp = _torch_select(conditions, choices, default_value=-1000.0)
-    tmp = torch.where((alpha > gamma0) & (tmp < -12), torch.full_like(tmp, -12.0), tmp)
     return k1(re_c) + tmp
 
 
@@ -656,7 +679,7 @@ def g5_0(q: torch.Tensor, eta: torch.Tensor) -> torch.Tensor:
 
 
 def g5_tot(q: torch.Tensor, eta: torch.Tensor, psi: torch.Tensor) -> torch.Tensor:
-    """Compute total g5 function with boat tail angle correction.
+    """Compute total g5 function with bounded boat tail angle correction.
 
     Args:
         q: Bluntness ratio tensor
@@ -673,13 +696,12 @@ def g5_tot(q: torch.Tensor, eta: torch.Tensor, psi: torch.Tensor) -> torch.Tenso
     k = calc_k(m, mu, eta0)
     g5_val = g5(m, mu, eta, eta0, k)
 
+    # Retain the FastBEMT guard against the positive boat-tail correction branch,
+    # which can otherwise drive unrealistically large TEB levels for this geometry.
     delta_g5 = g5_val - g5_0_val
-    correction = (
-        0.0714 * psi * torch.where(delta_g5 < 0, delta_g5, torch.zeros_like(delta_g5))
+    correction = 0.0714 * psi * torch.where(
+        delta_g5 < 0, delta_g5, torch.zeros_like(delta_g5)
     )
-    # correction = (
-    #     0.0714 * psi * delta_g5
-    # )
     return g5_0_val + correction
 
 
@@ -729,6 +751,9 @@ class BPM:
         observer_time_range: float,
         num_obs_times: int,
         device: str,
+        kinematics: Optional[object] = None,
+        section_indices: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        c1: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ) -> None:
         '''Initialize BPM model.
 
@@ -737,6 +762,9 @@ class BPM:
             r: Radial positions (m), shape (n_sections,).
             dr: Radial widths (m), shape (n_sections,).
             chord: Chord lengths (m), shape (n_sections,).
+            c1: Distance from pitch axis to leading edge (m), shape
+                (n_sections,). If omitted, defaults to 0.25 * chord like the
+                BroadbandBPM.jl examples.
             alpha: Angle of attack (deg), shape (n_sections,).
             vi: Induced velocity (m/s), shape (n_sections,).
             u: Relative velocity (m/s), shape (n_sections,).
@@ -756,9 +784,13 @@ class BPM:
             observer_time_range: Duration for observer time grid (s).
             num_obs_times: Number of observer time steps.
             device: PyTorch device ('cpu' or 'cuda').
+            kinematics: Optional shared Kinematics object. When provided, BPM
+                uses its source-time rotations and section-center positions.
+            section_indices: Full-geometry indices for the BPM section subset,
+                required when kinematics contains more sections than BPM.
         '''
         self.device = torch.device(device)
-        self.dtype = torch.float32
+        self.dtype = torch.float64
 
         # Core arrays (move to device)
         self.frequencies = torch.as_tensor(
@@ -767,6 +799,11 @@ class BPM:
         self.r = torch.as_tensor(r, dtype=self.dtype, device=self.device)
         self.dr = torch.as_tensor(dr, dtype=self.dtype, device=self.device)
         self.chord = torch.as_tensor(chord, dtype=self.dtype, device=self.device)
+        self.c1 = (
+            0.25 * self.chord
+            if c1 is None
+            else torch.as_tensor(c1, dtype=self.dtype, device=self.device)
+        )
         self.alpha = torch.as_tensor(alpha.copy(), dtype=self.dtype, device=self.device)
         self.vi = torch.as_tensor(vi.copy(), dtype=self.dtype, device=self.device)
         self.u = torch.as_tensor(u, dtype=self.dtype, device=self.device)
@@ -797,6 +834,16 @@ class BPM:
         self.com_shift_up = torch.as_tensor(
             com_shift_up, dtype=self.dtype, device=self.device
         )
+        self.kinematics = kinematics
+        self.section_indices = (
+            None
+            if section_indices is None
+            else torch.as_tensor(
+                section_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
+        )
 
         # Observer interpolation controls
         self.observer_time_range = float(observer_time_range)
@@ -809,90 +856,71 @@ class BPM:
             self.blade_angles.shape[0],
         )
 
+    def _source_blade_angles(self) -> torch.Tensor:
+        """Return source-time blade azimuths from Kinematics or BPM inputs."""
+        if self.kinematics is None:
+            return self.omega * self.tau[:, None] + self.blade_angles[None, :]
+
+        source_times = torch.as_tensor(
+            self.kinematics.source_times,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if source_times.shape[0] < self.nt or not torch.allclose(
+            source_times[: self.nt],
+            self.tau,
+            rtol=1.0e-5,
+            atol=1.0e-7,
+        ):
+            raise ValueError(
+                "The supplied Kinematics source times do not match BPM src_times."
+            )
+        return torch.as_tensor(
+            self.kinematics.blade_angles[: self.nt],
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    @torch.inference_mode()
     def generate_trajectory_and_basis(self) -> None:
-        '''Generate blade element trajectories and local basis vectors.
+        """Generate Julia-style BPM trailing-edge source positions.
 
-        Computes global positions of all blade elements at each emission time
-        and time-varying local basis vectors (thrust, radial, tangential).
-        Stores pos_fixed and e_xl, e_yl, e_zl as instance attributes.
-        '''
-        # 1. Setup global rotation (Hub rotation around X)
-        angles = self.omega * self.tau[:, None] + self.blade_angles[None, :] # (nt, nb)
-        c, s = torch.cos(angles), torch.sin(angles)
-        z, o = torch.zeros_like(c), torch.ones_like(c)
+        BroadbandBPM.jl assumes the rotor axis is its global y-axis and rotates
+        source points in the x-z plane.  FastBEMT's Kinematics rotates about
+        global x.  The mapping used here is: Julia x -> FastBEMT z, Julia y
+        -> FastBEMT x, and Julia z -> FastBEMT y.
+        """
+        beta = self._source_blade_angles()
+        cos_beta = torch.cos(beta)
+        sin_beta = torch.sin(beta)
+        te_offset = self.chord - self.c1
 
-        # R_g2b: Global -> Blade (nt, nb, 3, 3)
-        R_g2b = torch.stack([
-            torch.stack([o, z, z], dim=-1),   # Row 0: Axial
-            torch.stack([z, c, s], dim=-1),   # Row 1: Spanwise
-            torch.stack([z, -s, c], dim=-1)   # Row 2: Tangential
-        ], dim=-2)
+        x_fast = torch.zeros(
+            (self.nt, self.ns, self.nb),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        y_fast = (
+            cos_beta[:, None, :] * self.r[None, :, None]
+            + sin_beta[:, None, :] * te_offset[None, :, None]
+        )
+        z_fast = (
+            sin_beta[:, None, :] * self.r[None, :, None]
+            - cos_beta[:, None, :] * te_offset[None, :, None]
+        )
 
-        # 2. Setup airfoil rotation (Twist around Y)
-        ct, st = torch.cos(self.twist_rad), torch.sin(self.twist_rad)  # Use real angle of the TE wrt horizontal
-        zt, ot = torch.zeros_like(ct), torch.ones_like(ct)
-
-        # R_b2a: Blade -> Airfoil (ns, 3, 3) 
-        # X_af = Backwards Chord, Z_af = Upward Normal
-        R_b2TE = torch.stack([
-            torch.stack([-st, zt, -ct], dim=-1), # Row 0: New X (TE)
-            torch.stack([zt,  ot, zt],  dim=-1), # Row 1: New Y (Span)
-            torch.stack([ct,  zt, -st], dim=-1)  # Row 2: New Z (Normal)
-        ], dim=-2)
-
-        # Inflow angle reference for LE frame
-        ci, si = torch.cos(self.twist_rad - torch.deg2rad(self.alpha)), torch.sin(self.twist_rad - torch.deg2rad(self.alpha))
-
-        R_b2LE = torch.stack([
-            torch.stack([-si, zt, -ci], dim=-1), # Row 0: New X (TE)
-            torch.stack([zt,  ot, zt],  dim=-1), # Row 1: New Y (Span)
-            torch.stack([ci,  zt, -si], dim=-1)  # Row 2: New Z (Normal)
-        ], dim=-2)
-
-        # 3. Total Rotation Matrix: Global -> Airfoil (nt, nb, ns, 3, 3)
-        self.R_g2TE = torch.matmul(R_g2b[:, :, None, ...], R_b2TE[None, None, ...])
-        self.R_g2LE = torch.matmul(R_g2b[:, :, None, ...], R_b2LE[None, None, ...])
-
-        # 4. Compute Global Positions (pos_fixed)
-        # The positions of the sections at radius r
-        # In airfoil frame, the 'center' of the section is at (0, r, 0)
-        # because r is the spanwise distance.
-        pos_airfoil_TE = torch.stack([
-            self.chord * 0.5,              
-            self.r, 
-            torch.zeros_like(self.r)
-        ], dim=-1) # (ns, 3)
-
-        pos_airfoil_LE = torch.stack([
-            - self.chord * 0.5,                    
-            self.r, 
-            torch.zeros_like(self.r)
-        ], dim=-1) # (ns, 3)
-
-        com_shift_blade_frame = torch.stack([
-            self.com_shift_up,                       
-            torch.zeros_like(self.r), 
-            self.com_shift_forward
-        ], dim=-1) # (ns, 3)
-
-        # Add the local chordwise/thickness shifts (if any)
-        # pos_af_total = pos_airfoil_center + pos_airfoil_offsets
-        pos_blade_TE = torch.einsum('skj,sj->sk', R_b2TE.transpose(-1, -2), pos_airfoil_TE) + com_shift_blade_frame
-        pos_blade_LE = torch.einsum('skj,sj->sk', R_b2LE.transpose(-1, -2), pos_airfoil_LE) + com_shift_blade_frame
-
-        # Global positions shape: (nt, ns, nb, 3)
-        self.pos_fixed_TE = torch.einsum('tbkj,sj->tsbk', R_g2b.transpose(-1, -2), pos_blade_TE)
-        self.pos_fixed_LE = torch.einsum('tbkj,sj->tsbk', R_g2b.transpose(-1, -2), pos_blade_LE)
+        self.pos_fixed_TE = torch.stack([x_fast, y_fast, z_fast], dim=-1)
+        self.beta_fixed = beta[:, None, :, None].expand(-1, self.ns, -1, 1).contiguous()
 
 
+    @torch.inference_mode()
     def get_emission_geometry(
         self, r_obs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute acoustic directivity factors and distances to observer.
 
-        Calculates the spatial relationship between blade elements and observer,
-        including distance magnitude and directivity patterns for leading edge (LE),
-        trailing edge (TE), and dipole (low-frequency) acoustic sources.
+        Calculates the spatial relationship between blade elements and observer
+        with the same axis convention as BroadbandBPM.jl's observer_location.
 
         Args:
             r_obs: Observer positions of shape (n_obs, 3) in global frame (x, y, z).
@@ -900,57 +928,58 @@ class BPM:
         Returns:
             Tuple of four tensors, each shape (time, section, blade, n_obs):
                 - r_mag: Distance from source to observer (m)
-                - dh_te: Trailing edge directivity factor (dimensionless)
-                - dh_le: Leading edge directivity factor (dimensionless)
+                - dh_te: High-frequency directivity factor (dimensionless)
+                - dh_le: Alias of dh_te for compatibility with component APIs
                 - dl: Low-frequency directivity factor (dimensionless)
         """
-        # r_vec: (nt, ns, nb, n_obs, 3)
         r_vec_TE = r_obs[None, None, None, :, :] - self.pos_fixed_TE
-        r_mag_TE = torch.linalg.norm(r_vec_TE, dim=-1)
-        unit_r_TE_fixed = r_vec_TE / r_mag_TE[..., None]
+        xe_d = r_vec_TE[..., 2]
+        ye_d = r_vec_TE[..., 0]
+        ze_d = r_vec_TE[..., 1]
 
-        r_vec_LE = r_obs[None, None, None, :, :] - self.pos_fixed_LE
-        r_mag_LE = torch.linalg.norm(r_vec_LE, dim=-1)
-        unit_r_LE_fixed = r_vec_LE / r_mag_LE[..., None]
+        beta = self.beta_fixed.squeeze(-1)
+        theta_rot = torch.pi - beta
+        cos_theta = torch.cos(theta_rot)
+        sin_theta = torch.sin(theta_rot)
+        xe = cos_theta * xe_d + sin_theta * ze_d
+        ze = -sin_theta * xe_d + cos_theta * ze_d
 
-        # 2. Project unit_r into the Airfoil Frame using our combined rotation matrix
-        # self.R_g2af shape: (nt, nb, ns, 3, 3) -> Reordered or handled via einsum
-        # unit_r shape: (nt, ns, nb, n_obs, 3)
-        # Row 0 of R_g2af is local X (TE), Row 1 is local Y (Span), Row 2 is local Z (Normal)
+        r_mag_TE = torch.sqrt(ye_d**2 + xe**2 + ze**2)
+        theta_TE = torch.atan2(torch.sqrt(ye_d**2 + ze**2), xe)
+        phi_TE = torch.atan2(ye_d, ze)
 
-        unit_r_TE_airfoil = torch.einsum('tbsij,tsbni->tsbnj', self.R_g2TE, unit_r_TE_fixed)
-        unit_r_LE_airfoil = torch.einsum('tbsij,tsbni->tsbnj', self.R_g2LE, unit_r_LE_fixed)
+        phi_abs = torch.abs(phi_TE)
+        phi_sign = torch.where(
+            phi_TE >= 0.0,
+            torch.ones_like(phi_TE),
+            -torch.ones_like(phi_TE),
+        )
+        phi_abs_deg = torch.rad2deg(phi_abs)
+        phi_small = phi_sign * torch.deg2rad(0.1 * phi_abs_deg**2 + 2.5)
+        phi_large = phi_sign * torch.deg2rad(
+            -0.1 * (phi_abs_deg - 180.0) ** 2 + 177.5
+        )
+        phi_TE = torch.where(
+            phi_abs < torch.deg2rad(torch.tensor(5.0, dtype=self.dtype, device=self.device)),
+            phi_small,
+            torch.where(
+                phi_abs > torch.deg2rad(torch.tensor(175.0, dtype=self.dtype, device=self.device)),
+                phi_large,
+                phi_TE,
+            ),
+        )
 
-        r_x_TE = unit_r_TE_airfoil[..., 0]  # Projection on Trailing Edge axis
-        r_y_TE = unit_r_TE_airfoil[..., 1]  # Projection on Spanwise axis
-        r_z_TE = unit_r_TE_airfoil[..., 2]  # Projection on Normal axis
-
-        r_x_LE = unit_r_LE_airfoil[..., 0]  # Projection on Leading Edge axis
-        r_y_LE = unit_r_LE_airfoil[..., 1]  # Projection on Spanwise axis
-        r_z_LE = unit_r_LE_airfoil[..., 2]  # Projection on Normal axis
-
-        # 3. Convert to BPM Angles
-        phi_TE = torch.atan2(r_z_TE, r_y_TE)
-        theta_TE = torch.atan2(r_y_TE * torch.cos(phi_TE) + r_z_TE * torch.sin(phi_TE), r_x_TE)
-
-        phi_LE = torch.atan2(r_z_LE, r_y_LE)
-        theta_LE = torch.atan2(r_y_LE * torch.cos(phi_LE) + r_z_LE * torch.sin(phi_LE), r_x_LE)
-
-        # 4. Mach & Doppler
         m = self.m[None, :, None, None] # (1, ns, 1, 1)
 
-        # 6. Directivity Factors
-        # Note: We use sin_phi_sq (the projection into the xy plane) 
-        # to account for the roll-off toward the wing tips.
         dh_te = (2 * torch.sin(theta_TE / 2)**2 * torch.sin(phi_TE)**2) / (
             (1.0 + m * torch.cos(theta_TE)) * (1.0 + 0.2 * m * torch.cos(theta_TE)) ** 2
         )
 
-        dh_le = (2 * torch.cos(theta_LE / 2)**2 * torch.sin(phi_LE)**2) / (1.0 + m * torch.cos(theta_LE))**3
         dl = (torch.sin(theta_TE)**2 * torch.sin(phi_TE)**2) / (1.0 + m * torch.cos(theta_TE))**4
 
-        return (r_mag_LE + r_mag_TE) / 2, dh_te, dh_le, dl
+        return r_mag_TE, dh_te, dh_te, dl
 
+    @torch.inference_mode()
     def run_forward_bpm(
         self,
         observer_positions: np.ndarray,
@@ -987,8 +1016,8 @@ class BPM:
         self.pos_fixed_TE = self.interpolate_positions(
             bpm_output_times, bpm_obs_times, self.pos_fixed_TE
         )
-        self.pos_fixed_LE = self.interpolate_positions(
-            bpm_output_times, bpm_obs_times, self.pos_fixed_LE
+        self.beta_fixed = self.interpolate_positions(
+            bpm_output_times, bpm_obs_times, self.beta_fixed
         )
 
         # 1. Geometry and Base Values at Emission Time
@@ -1000,16 +1029,34 @@ class BPM:
         self.base_val_le = (m5_dr * dh_le) / r_mag_sq
         self.base_val_low = (m5_dr * dl) / r_mag_sq
 
-        # 2. Compute raw SPP tensors (5D: n_freq, nt, ns, nb, n_obs).
-        components_raw = {
-            "tbl": self.tbl_noise(alpha_stall=alpha_stall).sum(dim=(2, 3)),
-            "lbl": self.lbl_noise().sum(dim=(2, 3)),
-            "teb": self.teb_noise().sum(dim=(2, 3)),
-            "ti": self.ti_noise(lt=lt, i=i).sum(dim=(2, 3)),
-            "tv": self.tv_noise().sum(dim=(2, 3)),
+        # 2. Compute raw SPP tensors and collapse section/blade dimensions.
+        components_raw = self.compute_noise_components(
+            lt=lt,
+            i=i,
+            alpha_stall=alpha_stall,
+        )
+        return {
+            name: component.sum(dim=(2, 3))
+            for name, component in components_raw.items()
         }
-        return components_raw
 
+    @torch.inference_mode()
+    def compute_noise_components(
+        self,
+        lt: float,
+        i: float,
+        alpha_stall: float = 15.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute all BPM component tensors before section/blade summation."""
+        return {
+            "tbl": self.tbl_noise(alpha_stall=alpha_stall),
+            "lbl": self.lbl_noise(),
+            "teb": self.teb_noise(),
+            "ti": self.ti_noise(lt=lt, i=i),
+            "tv": self.tv_noise(),
+        }
+
+    @torch.inference_mode()
     def ti_noise(self, lt: float, i: float) -> torch.Tensor:
         """Compute turbulence ingestion (TI) broadband noise.
 
@@ -1023,61 +1070,21 @@ class BPM:
         Returns:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
-        # Use consistent shape: (nf, 1, ns, 1, 1) for all per-section parameters.
-        # Base values: (nt, ns, nb, n_obs) -> (1, nt, ns, nb, n_obs).
-        bv_le = self.base_val_le[None, :, :, :, :]
-        bv_low = self.base_val_low[None, :, :, :, :]
-
-        # Frequency-dependent parameters.
-        f_co = 10.0 * self.u / (np.pi * self.chord)  # (ns,)
-        k1_val = 2.0 * np.pi * self.frequencies[:, None] / self.u[None, :]  # (nf, ns)
-
-        k1_bar = k1_val * self.chord[None, :] * 0.5  # (nf, ns)
-
-        # Reshape for 5D: (nf, 1, ns, 1, 1).
-        f_co_5d = f_co[None, None, :, None, None]
-        freq_2d = self.frequencies[:, None, None, None, None]
-
-        # Selectivity based on frequency.
-        bv_ti = torch.where(freq_2d < f_co_5d, bv_low, bv_le)
-
-        # Mach and compressibility: (ns,) -> (nf, 1, ns, 1, 1).
-        beta_sq = 1.0 - self.m**2  # (ns,)
-
-        # LFC correction factor.
-        k1_beta = k1_bar / beta_sq[None, :]  # (nf, ns)
-        denom = 2.0 * np.pi * k1_beta + 1.0 / (1.0 + 2.4 * k1_beta)
-        s_sq = 1.0 / denom
-        lfc = 10.0 * s_sq * self.m[None, :] * (k1_bar ** 2) / beta_sq[None, :]
-        lfc_term = torch.clamp(lfc / (1.0 + lfc), min=1e-15)  # (nf, ns)
-        lfc_5d = lfc_term[:, None, :, None, None]
-
-        # Spectral power density.
-        k1_hat = k1_val / (3.0 / (4.0 * lt))  # (nf, ns)
-        phi_term = (k1_hat**3) / ((1.0 + k1_hat**2) ** (7.0 / 3.0))  # (nf, ns)
-
-        # Alpha term.
-        alpha_sq = (self.alpha**2)[None, None, :, None, None]  # (1, 1, ns, 1, 1)
-
-        inner_val = (
-            (self.rho**2)
-            * (self.a_inf**4)
-            * lt
-            * 0.5
-            * (i**2)
-            * phi_term.view(self.frequencies.shape[0], 1, self.ns, 1, 1)
-            * bv_ti
+        return _ti_component.compute_ti_noise(
+            frequencies=self.frequencies,
+            chord=self.chord,
+            alpha=self.alpha,
+            u=self.u,
+            m=self.m,
+            rho=self.rho,
+            a_inf=self.a_inf,
+            base_val_le=self.base_val_le,
+            base_val_low=self.base_val_low,
+            lt=lt,
+            i=i,
         )
 
-        spl_ti = (
-            10.0 * torch.log10(torch.clamp(inner_val, min=1e-20))
-            + 78.4
-            + 10.0 * torch.log10(1.0 + 9.0 * alpha_sq)
-            + 10.0 * torch.log10(lfc_5d)
-        )
-
-        return 10.0 ** (spl_ti / 10.0)  # (nf, nt, ns, nb, n_obs)
-
+    @torch.inference_mode()
     def teb_noise(self, h: Optional[float] = None) -> torch.Tensor:
         """Compute trailing edge bluntness (TEB) broadband noise.
 
@@ -1090,35 +1097,19 @@ class BPM:
         Returns:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
-        h_val = (
-            (self.chord * 1e-5) if h is None else torch.full_like(self.chord, h)
-        )  # (ns,)
+        return _teb_component.compute_teb_noise(
+            frequencies=self.frequencies,
+            chord=self.chord,
+            u=self.u,
+            m=self.m,
+            delta_p=self.delta_p,
+            delta_s=self.delta_s,
+            psi=self.psi,
+            base_val_te=self.base_val_te,
+            h=h,
+        )
 
-        delta_avg = (self.delta_p + self.delta_s) * 0.5  # (ns,)
-        psi = self.psi  # (ns,)
-        m = self.m  # (ns,)
-
-        # Expand to (1, 1, ns, 1, 1) for broadcasting.
-        h_5d = h_val[None, None, :, None, None]
-        delta_avg_5d = delta_avg[None, None, :, None, None]
-        psi_5d = psi[None, None, :, None, None]
-        m_5d = m[None, None, :, None, None]
-
-        q = h_5d / delta_avg_5d
-
-        # st() returns (nf, ns), expand to (nf, 1, ns, 1, 1).
-        st_3p = st(self.frequencies, h_val, self.u)[:, None, :, None, None]
-        st_3p_pk = st_peak_3prime(q, psi_5d)
-        eta = torch.log10(st_3p / st_3p_pk)
-
-        # base_val_te: (nt, ns, nb, n_obs) -> (1, nt, ns, nb, n_obs).
-        bv_te = self.base_val_te[None, :, :, :, :]
-        log_h_bv = 10 * torch.log10((h_5d * bv_te * torch.sqrt(m_5d)) + 1e-12)
-
-        spl_teb = log_h_bv + g4(q, psi_5d) + g5_tot(q, eta, psi_5d)
-
-        return 10 ** (spl_teb / 10)  # (nf, nt, ns, nb, n_obs)
-
+    @torch.inference_mode()
     def lbl_noise(self) -> torch.Tensor:
         """Compute laminar boundary layer (LBL) broadband noise.
 
@@ -1128,25 +1119,16 @@ class BPM:
         Returns:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
-        # Expand to (1, 1, ns, 1, 1) for broadcasting.
-        delta_p_5d = self.delta_p[None, None, :, None, None]
-        re_c_5d = self.re_c[None, None, :, None, None]
-        alpha_5d = self.alpha[None, None, :, None, None]
+        return _lbl_component.compute_lbl_noise(
+            frequencies=self.frequencies,
+            alpha=self.alpha,
+            u=self.u,
+            re_c=self.re_c,
+            delta_p=self.delta_p,
+            base_val_le=self.base_val_le,
+        )
 
-        # st() returns (nf, ns), expand to (nf, 1, ns, 1, 1).
-        e = st(self.frequencies, self.delta_p, self.u)[
-            :, None, :, None, None
-        ] / st_peak_prime(re_c_5d, alpha_5d)
-        d = re_c_5d / re_c0(alpha_5d)
-
-        # base_val_le: (nt, ns, nb, n_obs) -> (1, nt, ns, nb, n_obs).
-        bv_le = self.base_val_le[None, :, :, :, :]
-
-        log_dp_bv = 10 * torch.log10((delta_p_5d * bv_le) + 1e-12)
-        spl_lbl = log_dp_bv + g1(e) + g2(d) + g3(alpha_5d)
-
-        return 10 ** (spl_lbl / 10)  # (nf, nt, ns, nb, n_obs)
-
+    @torch.inference_mode()
     def tbl_noise(self, alpha_stall: float = 15.0) -> torch.Tensor:
         """Compute turbulent boundary layer (TBL) broadband noise.
 
@@ -1161,63 +1143,21 @@ class BPM:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
 
-        # Expand to (1, 1, ns, 1, 1) for broadcasting.
-        m_5d = self.m[None, None, :, None, None]
-        alpha_5d = self.alpha[None, None, :, None, None]
-        re_c_5d = self.re_c[None, None, :, None, None]
-        delta_p_5d = self.delta_p[None, None, :, None, None]
-        delta_s_5d = self.delta_s[None, None, :, None, None]
-        chord_5d = self.chord[None, None, :, None, None]
-
-        # Compute parameters (broadcasting handles nt, nb, and n_obs dims).
-        st_1 = st1(m_5d)
-        st_2 = st2(m_5d, alpha_5d)
-        k_1 = k1(re_c_5d)
-        k_2 = k2(re_c_5d, m_5d, alpha_5d)
-
-        # st() expects (n_freq, ns). Result: (nf, 1, ns, 1, 1).
-        st_p = st(self.frequencies, self.delta_p, self.u)[:, None, :, None, None]
-        st_s = st(self.frequencies, self.delta_s, self.u)[:, None, :, None, None]
-
-        # Trailing edge corrections.
-        log_st_s_st1 = torch.abs(torch.log10(st_s / st_1))
-        log_st_p_st1 = torch.abs(torch.log10(st_p / st_1))
-        log_st_s_st2 = torch.abs(torch.log10(st_s / st_2))
-
-        as_val = tbl_te_a(log_st_s_st1, re_c_5d)
-        ap = tbl_te_a(log_st_p_st1, re_c_5d)
-        b = tbl_te_b(log_st_s_st2, re_c_5d)
-        a_prime = tbl_te_a(log_st_s_st2, 3 * re_c_5d)
-
-        # Base values: (nt, ns, nb, n_obs) -> (1, nt, ns, nb, n_obs).
-        bv_te = self.base_val_te[None, :, :, :, :]
-        bv_low = self.base_val_low[None, :, :, :, :]
-
-        log_ds_bv_te = 10 * torch.log10((delta_s_5d * bv_te) + 1e-12)
-        log_dp_bv_te = 10 * torch.log10((delta_p_5d * bv_te) + 1e-12)
-        log_ds_bv_low = 10 * torch.log10((delta_s_5d * bv_low) + 1e-12)
-
-        # SPL components.
-        delta_k1_val = delta_k1((re_c_5d / chord_5d * delta_p_5d), alpha_5d)
-        alpha_mask = alpha_5d < alpha_stall
-
-        spl_s = torch.where(
-            alpha_mask,
-            log_ds_bv_te + as_val + k_1 - 3,
-            torch.full_like(as_val, -torch.inf),
-        )
-        spl_p = torch.where(
-            alpha_mask,
-            log_dp_bv_te + ap + k_1 - 3 + delta_k1_val,
-            torch.full_like(ap, -torch.inf),
-        )
-        spl_a = torch.where(
-            alpha_mask, log_ds_bv_te + b + k_2, log_ds_bv_low + a_prime + k_2
+        return _tbl_component.compute_tbl_noise(
+            frequencies=self.frequencies,
+            chord=self.chord,
+            alpha=self.alpha,
+            u=self.u,
+            re_c=self.re_c,
+            m=self.m,
+            delta_p=self.delta_p,
+            delta_s=self.delta_s,
+            base_val_te=self.base_val_te,
+            base_val_low=self.base_val_low,
+            alpha_stall=alpha_stall,
         )
 
-        # Final raw SPP: (nf, nt, ns, nb, n_obs).
-        return 10 ** (spl_s / 10) + 10 ** (spl_p / 10) + 10 ** (spl_a / 10)
-
+    @torch.inference_mode()
     def tv_noise(self) -> torch.Tensor:
         """Compute tip vortex (TV) broadband noise.
 
@@ -1227,50 +1167,18 @@ class BPM:
         Returns:
             Raw spectral power density tensor of shape (n_freq, nt, ns, nb, n_obs).
         """
-        # Tip-specific parameters.
-        chord_tip = self.chord[-2]
-        alpha_tip = self.alpha[-2]
-        m_tip = self.m[-2]
-
-        l_tip = calc_l_tip(chord_tip, alpha_tip)
-        m_max = m_tip * (1 + 0.036 * alpha_tip)
-
-        # Strouhal: ensure shape (nf, 1, 1, 1, 1) regardless of st() return shape.
-        st_freq = st(self.frequencies, l_tip, (self.a_inf * m_max).unsqueeze(0))
-        st_2p = st_freq[:, :1, None, None, None]  # 2D -> (nf, 1, 1, 1, 1)
-
-        # Directivity: extract tip section and expand to (1, nt, 1, nb, n_obs).
-        bv_te_tip = self.base_val_te[:, -1:, :, :][None, :, :, :, :]
-
-        # Mach and geometry factor.
-        m_factor = m_tip**2 * m_max**3 * l_tip**2
-        log_st = torch.log10(torch.abs(st_2p) + 1e-12)
-
-        # spl_tip: (nf, 1, nt, 1, nb, n_obs) broadcasts to (nf, nt, 1, nb, n_obs).
-        spl_tip = (
-            10 * torch.log10(m_factor * bv_te_tip + 1e-12)
-            - 30.5 * (log_st + 0.3) ** 2
-            + 126
+        return _tv_component.compute_tv_noise(
+            frequencies=self.frequencies,
+            r=self.r,
+            dr=self.dr,
+            chord=self.chord,
+            alpha=self.alpha,
+            m=self.m,
+            a_inf=self.a_inf,
+            base_val_te=self.base_val_te,
         )
 
-        # Place into full 5D output tensor (nf, nt, ns, nb, n_obs).
-        spp_full = torch.zeros(
-            (
-                self.frequencies.shape[0],
-                self.nt,
-                self.ns,
-                self.nb,
-                self.base_val_te.shape[-1],
-            ),
-            device=self.device,
-            dtype=self.dtype,
-        )
-
-        # Assign to the last radial station (-1).
-        spp_full[:, :, -1, :, :] = 10 ** (spl_tip.squeeze(2) / 10)
-
-        return spp_full
-
+    @torch.inference_mode()
     def interpolate_positions(
         self,
         x_new: torch.Tensor,
@@ -1302,14 +1210,16 @@ class BPM:
         idx = torch.searchsorted(x_old_p, x_new_p)
         idx = torch.clamp(idx, 1, nt - 1)
 
+        coord_count = y_old.shape[-1]
+
         # Prepare y_old for broadcasting.
-        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()  # (3, n_sec, n_b, nt)
+        y_old_p = y_old.permute(3, 1, 2, 0).contiguous()  # (coord, n_sec, n_b, nt)
 
         # Expand y to add n_obs, then gather bracketing points.
         y_old_exp = y_old_p.unsqueeze(1).expand(-1, n_obs, -1, -1, -1)
 
         # Expand idx to match coordinate dimension.
-        idx_exp = idx.unsqueeze(0).expand(3, -1, -1, -1, -1)
+        idx_exp = idx.unsqueeze(0).expand(coord_count, -1, -1, -1, -1)
 
         y0 = torch.gather(y_old_exp, 4, idx_exp - 1)
         y1 = torch.gather(y_old_exp, 4, idx_exp)

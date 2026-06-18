@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from os import PathLike
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
 
 import numpy as np
@@ -280,7 +281,8 @@ class Propeller:
         self,
         observer_positions: np.ndarray,
         bemt: BEMT,
-        loads: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        loads: Optional[Union[str, PathLike[str]]] = None,
+        load_source_times: Optional[Union[str, PathLike[str]]] = None,
         lt: int = 1,
         i: float = 0.01,
         alpha_stall: float = 15.0,
@@ -296,11 +298,14 @@ class Propeller:
         Args:
             observer_positions: Observer coordinates, shape (n_observers, 3) in meters.
             bemt: Aerodynamic analysis providing the section loads.
-            loads: Optional blade-frame loading per unit span on the fluid in
+            loads: Optional path to a ``.pt`` file containing blade-frame
+                loading per unit span on the fluid in
                 ``(axial, radial, tangential)`` components with shape
                 ``(n_sections, 3)`` or
-                ``(n_times, n_blades, n_sections, 3)``. BEMT loading is
-                used when None.
+                ``(n_times, n_blades, n_sections, 3)``. BEMT loading is used
+                when None.
+            load_source_times: Path to a CSV timestamp table for ``loads``.
+                Required when ``loads`` is provided.
             lt: Turbulent length scale
             i: Turbulence intensity for BPM (dimensionless).
             alpha_stall: Stall angle for BPM separation noise (degrees).
@@ -311,6 +316,10 @@ class Propeller:
         '''
         if bemt.propeller is not self:
             raise ValueError("The BEMT analysis belongs to a different propeller.")
+        if loads is None and load_source_times is not None:
+            raise ValueError("load_source_times is only used when loads is provided.")
+        if loads is not None and load_source_times is None:
+            raise ValueError("load_source_times is required when loads is provided.")
 
         operating_rpm, operating_v_inf = bemt.resolve_operating_point(
             rpm,
@@ -326,6 +335,7 @@ class Propeller:
                 loadings=bemt if loads is None else loads,
                 rpm=operating_rpm,
                 v_inf=operating_v_inf if loads is None else None,
+                source_times=None if loads is None else load_source_times,
                 label="F1A.__init__",
             )
         self.kinematics = self.f1a.kinematics
@@ -414,6 +424,8 @@ class Propeller:
                 num_obs_times=self.simulation.num_obs_times
                 // self.simulation.revolutions,
                 device=self.device,
+                kinematics=self.f1a.kinematics,
+                section_indices=np.flatnonzero(section_mask),
                 label="BPM.__init__",
             )
 

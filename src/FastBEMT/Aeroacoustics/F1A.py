@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from os import PathLike
+from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
+import pandas as pd
 import torch
 
 from .Utils import (
@@ -19,6 +22,7 @@ if TYPE_CHECKING:
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+PathInput = Union[str, PathLike[str]]
 
 
 class F1A:
@@ -27,14 +31,19 @@ class F1A:
     Args:
         propeller: Propeller containing geometry and simulation settings.
         environment: Acoustic environment stored by ``propeller``.
-        loadings: Either a BEMT analysis or direct blade-frame force per
-            unit span on the fluid with shape ``(S, 3)`` or
-            ``(T, B, S, 3)`` and ``(axial, radial, tangential)``
-            components. ``S`` must match the full Propeller geometry.
+        loadings: Either a BEMT analysis or a path to a ``.pt`` file
+            containing direct blade-frame force per unit span on the fluid
+            with shape ``(S, 3)`` or ``(T, B, S, 3)`` and
+            ``(axial, radial, tangential)`` components. ``S`` must match the
+            full Propeller geometry.
         rpm: Operating RPM. Optional for a single-point BEMT analysis and
             required for direct loadings.
         v_inf: BEMT freestream velocity. Required with ``rpm`` when
             selecting from a multi-point BEMT analysis.
+        source_times: Path to a CSV table containing source emission
+            timestamps in seconds for direct loadings. Required for direct
+            loading files and not allowed with BEMT loadings. The timestamp
+            length must match the first dimension of unsteady direct loadings.
 
     Observer-dependent source tensors use dimension order
     ``(O, T, B, S, ...)``.
@@ -44,10 +53,11 @@ class F1A:
         self,
         propeller: Propeller,
         environment: Environment,
-        loadings: BEMT | ArrayLike,
+        loadings: BEMT | PathInput,
         *,
         rpm: float | None = None,
         v_inf: float | None = None,
+        source_times: PathInput | None = None,
     ) -> None:
         self.propeller = propeller
         self.environment = environment
@@ -60,10 +70,18 @@ class F1A:
         self.dtype = propeller.dtype
         self.rho = propeller.rho_tensor
         self.a_inf = propeller.a_inf_tensor
+        self.loadings_path: Path | None = None
+        self.source_times_path: Path | None = None
 
         from ..Aerodynamics.BEMT import BEMT
 
+        direct_loadings: torch.Tensor | None = None
+        direct_source_times: torch.Tensor | None = None
         if isinstance(loadings, BEMT):
+            if source_times is not None:
+                raise ValueError(
+                    "source_times is only supported for direct F1A loadings."
+                )
             if loadings.propeller is not propeller:
                 raise ValueError(
                     "The BEMT analysis belongs to a different propeller."
@@ -88,15 +106,30 @@ class F1A:
                 )
             self.v_inf = None
             solution = None
+            self.loadings_path = self._required_file_path(
+                loadings,
+                name="loadings",
+                suffix=".pt",
+            )
+            self.source_times_path = self._required_file_path(
+                source_times,
+                name="source_times",
+                suffix=".csv",
+            )
+            direct_loadings = self._load_direct_loadings(self.loadings_path)
+            direct_source_times = self._load_source_times(
+                self.source_times_path
+            )
 
         existing_kinematics = propeller.kinematics
-        if (
-            existing_kinematics is not None
-            and existing_kinematics.rpm == self.rpm
-        ):
+        if self._kinematics_matches(existing_kinematics, direct_source_times):
             self.kinematics = existing_kinematics
         else:
-            self.kinematics = Kinematics(propeller, rpm=self.rpm)
+            self.kinematics = Kinematics(
+                propeller,
+                rpm=self.rpm,
+                source_times=direct_source_times,
+            )
         propeller.kinematics = self.kinematics
         self.nt = self.kinematics.nt
         self.nb = self.kinematics.nb
@@ -168,11 +201,9 @@ class F1A:
                 dim=-1,
             )
         else:
-            loads_full = torch.as_tensor(
-                loadings,
-                dtype=self.dtype,
-                device=self.device,
-            )
+            if direct_loadings is None:
+                raise RuntimeError("Direct F1A loadings were not loaded.")
+            loads_full = direct_loadings
             steady_shape = (section_count, 3)
             unsteady_shape = (
                 self.nt,
@@ -266,6 +297,164 @@ class F1A:
         self.oaspl: torch.Tensor | None = None
         self.source_p_m: torch.Tensor | None = None
         self.source_p_d: torch.Tensor | None = None
+
+    def _kinematics_matches(
+        self,
+        kinematics: Kinematics | None,
+        source_times: torch.Tensor | None,
+    ) -> bool:
+        """Return whether cached kinematics match RPM and source-time grid."""
+        if kinematics is None or kinematics.rpm != self.rpm:
+            return False
+        uses_custom_source_times = getattr(
+            kinematics,
+            "uses_custom_source_times",
+            False,
+        )
+        if source_times is None:
+            return not uses_custom_source_times
+        if not uses_custom_source_times:
+            return False
+
+        if source_times.shape != kinematics.source_times.shape:
+            return False
+        return torch.allclose(
+            source_times,
+            kinematics.source_times,
+            rtol=1.0e-6,
+            atol=1.0e-9,
+        )
+
+    def _required_file_path(
+        self,
+        value: object,
+        *,
+        name: str,
+        suffix: str,
+    ) -> Path:
+        """Validate a required direct-input path."""
+        if value is None:
+            raise ValueError(
+                f"{name} is required for direct F1A loadings and must be a "
+                f"path to a {suffix} file."
+            )
+        if not isinstance(value, (str, PathLike)):
+            raise TypeError(
+                f"{name} must be a path to a {suffix} file for direct F1A "
+                f"loadings; got {type(value).__name__}."
+            )
+
+        path = Path(value)
+        if path.suffix.lower() != suffix:
+            raise ValueError(
+                f"{name} must point to a {suffix} file; got '{path}'."
+            )
+        if not path.is_file():
+            raise FileNotFoundError(f"{name} file not found: {path}")
+        return path
+
+    def _load_direct_loadings(self, path: Path) -> torch.Tensor:
+        """Load direct F1A loadings from a ``.pt`` file."""
+        loaded = torch.load(path, map_location=self.device)
+        if isinstance(loaded, dict):
+            if "loadings" in loaded:
+                loaded = loaded["loadings"]
+            else:
+                tensor_items = [
+                    value
+                    for value in loaded.values()
+                    if isinstance(value, (torch.Tensor, np.ndarray))
+                ]
+                if len(tensor_items) != 1:
+                    raise ValueError(
+                        "Direct F1A loading files that contain a dictionary "
+                        "must have a 'loadings' tensor or exactly one tensor "
+                        f"value; got keys {list(loaded.keys())}."
+                    )
+                loaded = tensor_items[0]
+
+        if not isinstance(loaded, (torch.Tensor, np.ndarray)):
+            raise TypeError(
+                "Direct F1A loading files must contain a torch.Tensor or "
+                f"numpy.ndarray; got {type(loaded).__name__}."
+            )
+
+        return torch.as_tensor(
+            loaded,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _load_source_times(self, path: Path) -> torch.Tensor:
+        """Load a one-dimensional source-time vector from a CSV table."""
+        series = self._source_time_series_from_csv(path)
+        source_times = pd.to_numeric(series, errors="coerce")
+        if source_times.isna().any():
+            raise ValueError(
+                f"Timestamp CSV '{path}' contains non-numeric values in "
+                f"column '{series.name}'."
+            )
+
+        return torch.as_tensor(
+            source_times.to_numpy(dtype=np.float64),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _source_time_series_from_csv(self, path: Path) -> pd.Series:
+        """Select the timestamp column from a CSV file."""
+        table = pd.read_csv(path)
+        if table.shape[1] == 0:
+            raise ValueError(f"Timestamp CSV '{path}' has no columns.")
+
+        if table.shape[1] == 1 and self._looks_numeric(table.columns[0]):
+            table = pd.read_csv(path, header=None)
+            series = table.iloc[:, 0]
+            series.name = "time"
+            return series
+
+        preferred_columns = {
+            "t",
+            "time",
+            "times",
+            "time_s",
+            "time_sec",
+            "time_seconds",
+            "source_time",
+            "source_times",
+            "source_time_s",
+            "timestamp",
+            "timestamps",
+            "seconds",
+        }
+        for column in table.columns:
+            normalized = str(column).strip().lower().replace(" ", "_")
+            if normalized in preferred_columns:
+                return table[column]
+
+        if table.shape[1] == 1:
+            return table.iloc[:, 0]
+
+        numeric_columns = []
+        for column in table.columns:
+            converted = pd.to_numeric(table[column], errors="coerce")
+            if not converted.empty and not converted.isna().any():
+                numeric_columns.append(column)
+        if len(numeric_columns) == 1:
+            return table[numeric_columns[0]]
+
+        raise ValueError(
+            f"Timestamp CSV '{path}' must contain a recognized timestamp "
+            "column such as 'time_s', 'time', 't', or a single numeric column."
+        )
+
+    @staticmethod
+    def _looks_numeric(value: object) -> bool:
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def _initialize_loading(self) -> None:
         """Rotate loads and form their complete source-time derivative."""

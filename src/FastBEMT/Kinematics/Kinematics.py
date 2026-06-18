@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -21,40 +23,76 @@ class Kinematics:
     Args:
         propeller: Propeller containing geometry and simulation settings.
         rpm: Rotational speed in revolutions per minute.
+        source_times: Optional source emission timestamps in seconds. When
+            omitted, the propeller simulation grid is configured from its
+            revolutions and timesteps-per-revolution settings.
     """
 
-    def __init__(self, propeller: Propeller, rpm: float) -> None:
+    def __init__(
+        self,
+        propeller: Propeller,
+        rpm: float,
+        source_times: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
         self.propeller = propeller
         self.rpm = float(rpm)
         self.dtype: torch.dtype = propeller.dtype
         self.device: torch.device = torch.device(propeller.device)
 
         self.n_blades = propeller.n_blades
-        propeller.simulation.configure_operating_point(self.rpm, self.n_blades)
+        self.uses_custom_source_times = source_times is not None
 
-        simulation = propeller.simulation
-        if (
-            simulation.omega is None
-            or simulation.src_times is None
-            or simulation.blade_angles is None
-        ):
-            raise RuntimeError("The simulation operating point was not configured.")
+        if source_times is None:
+            propeller.simulation.configure_operating_point(
+                self.rpm,
+                self.n_blades,
+            )
 
-        self.omega = torch.tensor(
-            simulation.omega,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.source_times = torch.as_tensor(
-            simulation.src_times,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.blade_phase_offsets = torch.as_tensor(
-            simulation.blade_angles,
-            dtype=self.dtype,
-            device=self.device,
-        )
+            simulation = propeller.simulation
+            if (
+                simulation.omega is None
+                or simulation.src_times is None
+                or simulation.blade_angles is None
+            ):
+                raise RuntimeError(
+                    "The simulation operating point was not configured."
+                )
+
+            self.omega = torch.tensor(
+                simulation.omega,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.source_times = torch.as_tensor(
+                simulation.src_times,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.blade_phase_offsets = torch.as_tensor(
+                simulation.blade_angles,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        else:
+            if not math.isfinite(self.rpm) or self.rpm <= 0.0:
+                raise ValueError("rpm must be finite and greater than zero.")
+            self.omega = torch.tensor(
+                2.0 * math.pi * self.rpm / 60.0,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.source_times = self._validate_source_times(source_times)
+            self.blade_phase_offsets = (
+                2.0
+                * math.pi
+                / self.n_blades
+                * torch.arange(
+                    self.n_blades,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+            self._mirror_custom_times_to_simulation()
 
         self.radial_positions = propeller.section_radius
         self.twist_rad = propeller.section_twist_rad
@@ -69,6 +107,81 @@ class Kinematics:
                 "The configured blade angles do not match geometry['n_blades']."
             )
         self._compute()
+
+    def _validate_source_times(
+        self,
+        source_times: np.ndarray | torch.Tensor,
+    ) -> torch.Tensor:
+        """Return validated one-dimensional source timestamps."""
+        source_times_tensor = torch.as_tensor(
+            source_times,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if source_times_tensor.ndim != 1:
+            raise ValueError("source_times must be one-dimensional.")
+        if source_times_tensor.numel() == 0:
+            raise ValueError("source_times must contain at least one timestamp.")
+        if not bool(torch.isfinite(source_times_tensor).all().item()):
+            raise ValueError("source_times must contain only finite values.")
+        if source_times_tensor.numel() > 1 and not bool(
+            torch.all(source_times_tensor[1:] > source_times_tensor[:-1]).item()
+        ):
+            raise ValueError("source_times must be strictly increasing.")
+        return source_times_tensor.contiguous()
+
+    def _mirror_custom_times_to_simulation(self) -> None:
+        """Keep the shared Simulation timing fields consistent enough to inspect."""
+        simulation = self.propeller.simulation
+        simulation.rpm = self.rpm
+        simulation.omega = float(self.omega.item())
+        simulation.src_times = self.source_times
+        simulation.num_src_times = int(self.source_times.shape[0])
+        simulation.blade_angles = self.blade_phase_offsets
+        simulation.num_obs_times = int(self.source_times.shape[0])
+
+        if self.source_times.numel() == 1:
+            simulation.revolutions = 1
+            simulation.dt = None
+            simulation.duration = 0.0
+            simulation.observer_time_range = 0.0
+            simulation.src_times_one_rotation = self.source_times
+            simulation.num_obs_times_per_rev = 1
+            simulation.blade_passing_period = (
+                2.0 * math.pi / float(self.omega.item()) / self.n_blades
+            )
+            return
+
+        time_deltas = torch.diff(self.source_times)
+        median_dt = torch.median(time_deltas).item()
+        source_duration = (
+            self.source_times[-1] - self.source_times[0]
+        ).item()
+        rotation_period = 2.0 * math.pi / float(self.omega.item())
+        estimated_revolutions = max(
+            1,
+            int(round(source_duration / rotation_period)),
+        )
+        first_rotation_end = self.source_times[0] + rotation_period
+        first_rotation_mask = self.source_times < (
+            first_rotation_end - 0.5 * median_dt
+        )
+        first_rotation_count = int(first_rotation_mask.sum().item())
+        if first_rotation_count <= 0:
+            first_rotation_count = min(
+                int(self.source_times.shape[0]),
+                max(1, int(round(rotation_period / median_dt))),
+            )
+
+        simulation.dt = float(median_dt)
+        simulation.revolutions = estimated_revolutions
+        simulation.duration = float(source_duration)
+        simulation.observer_time_range = float(source_duration)
+        simulation.blade_passing_period = rotation_period / self.n_blades
+        simulation.num_obs_times_per_rev = first_rotation_count
+        simulation.src_times_one_rotation = self.source_times[
+            :first_rotation_count
+        ]
 
     def _compute(self) -> None:
         """Compute rotations, section positions, and their time derivatives."""
