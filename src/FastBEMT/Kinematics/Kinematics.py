@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,10 @@ class Kinematics:
         source_times: Optional source emission timestamps in seconds. When
             omitted, the propeller simulation grid is configured from its
             revolutions and timesteps-per-revolution settings.
+        section_geometry: Optional one-dimensional section data overriding the
+            propeller section grid. Expected keys are ``"r"`` plus either
+            ``"twist_rad"`` or ``"twist"``, ``"com_shift_forward"``, and
+            ``"com_shift_up"``.
     """
 
     def __init__(
@@ -33,6 +38,7 @@ class Kinematics:
         propeller: Propeller,
         rpm: float,
         source_times: np.ndarray | torch.Tensor | None = None,
+        section_geometry: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     ) -> None:
         self.propeller = propeller
         self.rpm = float(rpm)
@@ -41,6 +47,7 @@ class Kinematics:
 
         self.n_blades = propeller.n_blades
         self.uses_custom_source_times = source_times is not None
+        self.uses_custom_section_geometry = section_geometry is not None
 
         if source_times is None:
             propeller.simulation.configure_operating_point(
@@ -94,19 +101,79 @@ class Kinematics:
             )
             self._mirror_custom_times_to_simulation()
 
-        self.radial_positions = propeller.section_radius
-        self.twist_rad = propeller.section_twist_rad
-        self.com_shift_forward = propeller.section_com_shift_forward
-        self.com_shift_up = propeller.section_com_shift_up
+        if section_geometry is None:
+            self.radial_positions = propeller.section_radius
+            self.twist_rad = propeller.section_twist_rad
+            self.com_shift_forward = propeller.section_com_shift_forward
+            self.com_shift_up = propeller.section_com_shift_up
+        else:
+            self.radial_positions = self._section_geometry_tensor(
+                section_geometry,
+                "r",
+            )
+            if "twist_rad" in section_geometry:
+                self.twist_rad = self._section_geometry_tensor(
+                    section_geometry,
+                    "twist_rad",
+                )
+            elif "twist" in section_geometry:
+                self.twist_rad = torch.deg2rad(
+                    self._section_geometry_tensor(section_geometry, "twist")
+                )
+            else:
+                raise ValueError(
+                    "section_geometry must contain 'twist_rad' or 'twist'."
+                )
+            self.com_shift_forward = self._section_geometry_tensor(
+                section_geometry,
+                "com_shift_forward",
+            )
+            self.com_shift_up = self._section_geometry_tensor(
+                section_geometry,
+                "com_shift_up",
+            )
+
+            expected_shape = self.radial_positions.shape
+            for name, values in (
+                ("twist", self.twist_rad),
+                ("com_shift_forward", self.com_shift_forward),
+                ("com_shift_up", self.com_shift_up),
+            ):
+                if values.shape != expected_shape:
+                    raise ValueError(
+                        "section_geometry arrays must all match the shape of "
+                        f"'r' {expected_shape}; '{name}' has shape {values.shape}."
+                    )
 
         self.nt = int(self.source_times.shape[0])
-        self.ns = propeller.n_sections
+        self.ns = int(self.radial_positions.shape[0])
         self.nb = int(self.blade_phase_offsets.shape[0])
         if self.nb != self.n_blades:
             raise ValueError(
                 "The configured blade angles do not match geometry['n_blades']."
             )
         self._compute()
+
+    def _section_geometry_tensor(
+        self,
+        section_geometry: Mapping[str, np.ndarray | torch.Tensor],
+        name: str,
+    ) -> torch.Tensor:
+        """Return a validated one-dimensional custom section array."""
+        if name not in section_geometry:
+            raise ValueError(f"section_geometry must contain '{name}'.")
+        values = torch.as_tensor(
+            section_geometry[name],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if values.ndim != 1:
+            raise ValueError(f"section_geometry['{name}'] must be one-dimensional.")
+        if values.numel() == 0:
+            raise ValueError(f"section_geometry['{name}'] must not be empty.")
+        if not bool(torch.isfinite(values).all().item()):
+            raise ValueError(f"section_geometry['{name}'] must be finite.")
+        return values.contiguous()
 
     def _validate_source_times(
         self,

@@ -4,7 +4,7 @@ import matplotlib as mpl
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import torch
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Tuple, Union
 from .Stress import BladeStressCalculator
 
 if TYPE_CHECKING:
@@ -111,6 +111,236 @@ class Plotter:
         plt.tight_layout()
         plt.show()
 
+    @staticmethod
+    def combine_level_maps(
+        *levels: Union[np.ndarray, torch.Tensor],
+    ) -> np.ndarray:
+        """Log-sum overall level maps in dB."""
+        if not levels:
+            raise ValueError("At least one level map is required.")
+
+        total_power: np.ndarray | None = None
+        for level in levels:
+            if isinstance(level, torch.Tensor):
+                level_array = level.detach().cpu().numpy()
+            else:
+                level_array = np.asarray(level)
+            power = 10.0 ** (level_array.astype(float) / 10.0)
+            total_power = power if total_power is None else total_power + power
+
+        return 10.0 * np.log10(np.maximum(total_power, np.finfo(float).tiny))
+
+    @staticmethod
+    def _level_array(levels: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        """Convert level data to a NumPy array without changing values."""
+        if isinstance(levels, torch.Tensor):
+            return levels.detach().cpu().numpy()
+        return np.asarray(levels)
+
+    @staticmethod
+    def _map_grid(
+        levels: Union[np.ndarray, torch.Tensor],
+        *,
+        grid_size: int,
+        mirror: bool,
+    ) -> np.ndarray:
+        """Reshape a flat map and apply the same mirroring as acoustic maps."""
+        level_array = Plotter._level_array(levels)
+        expected_size = grid_size * grid_size
+        if level_array.size != expected_size:
+            raise ValueError(
+                f"levels must contain {expected_size} values; "
+                f"got {level_array.size}."
+            )
+
+        level_grid = level_array.reshape(grid_size, grid_size)
+        if mirror:
+            return np.vstack([level_grid[::-1, :], level_grid[1:, :]])
+        return level_grid
+
+    @staticmethod
+    def _contour_levels(
+        contour_levels: Optional[Union[float, Iterable[float]]],
+    ) -> Tuple[float, ...]:
+        """Normalize contour input to zero or more finite levels."""
+        if contour_levels is None:
+            return ()
+        if isinstance(contour_levels, (str, bytes)):
+            raise TypeError(
+                "contour_levels must be a number or an iterable of numbers."
+            )
+
+        try:
+            levels = np.asarray(contour_levels, dtype=float)
+        except (TypeError, ValueError) as exc:
+            try:
+                levels = np.asarray(tuple(contour_levels), dtype=float)
+            except TypeError:
+                raise TypeError(
+                    "contour_levels must be a number or an iterable of numbers."
+                ) from exc
+            except ValueError as value_exc:
+                raise TypeError(
+                    "contour_levels must be a number or an iterable of numbers."
+                ) from value_exc
+
+        if levels.ndim == 0:
+            normalized = (float(levels),)
+        elif levels.ndim == 1:
+            normalized = tuple(float(level) for level in levels)
+        else:
+            raise ValueError(
+                "contour_levels must be a number or a one-dimensional "
+                "iterable of numbers."
+            )
+
+        if not all(np.isfinite(normalized)):
+            raise ValueError("contour_levels must contain only finite values.")
+        return normalized
+
+    def plot_acoustic_maps(
+        self,
+        levels_by_title: Mapping[str, Union[np.ndarray, torch.Tensor]],
+        *,
+        grid_size: int = 26,
+        domain_size: float = 5.0,
+        metric: str = "oaspl",
+        columns: int = 3,
+        figsize: Optional[Tuple[float, float]] = None,
+        cmap: str = "magma",
+        contour_levels: Optional[Union[float, Iterable[float]]] = None,
+        mirror: bool = True,
+        save_path: Optional[str] = None,
+    ) -> None:
+        """Plot one or more acoustic level maps with shared map styling."""
+        metric = metric.lower()
+        if metric not in {"ospl", "oaspl"}:
+            raise ValueError("metric must be 'ospl' or 'oaspl'.")
+        if not levels_by_title:
+            raise ValueError("levels_by_title must contain at least one map.")
+
+        titles = list(levels_by_title)
+        maps = [
+            self._map_grid(
+                levels_by_title[title],
+                grid_size=grid_size,
+                mirror=mirror,
+            )
+            for title in titles
+        ]
+        contour_level_values = self._contour_levels(contour_levels)
+
+        columns = max(1, min(int(columns), len(maps)))
+        rows = int(np.ceil(len(maps) / columns))
+        if figsize is None:
+            figsize = (4.2 * columns, 3.2 * rows)
+        fig, axes = plt.subplots(
+            rows,
+            columns,
+            figsize=figsize,
+            constrained_layout=True,
+            squeeze=False,
+        )
+
+        vmin = 0.0
+        vmax = max(
+            10.0,
+            np.ceil(max(float(np.nanmax(values)) for values in maps) / 10.0)
+            * 10.0,
+        )
+
+        x_range_plot = np.linspace(-domain_size, domain_size, grid_size)
+        y_count = 2 * grid_size - 1 if mirror else grid_size
+        y_range_plot = np.linspace(-domain_size, domain_size, y_count)
+        x_plot, y_plot = np.meshgrid(x_range_plot, y_range_plot)
+        smooth_levels = np.linspace(vmin, vmax, 1000)
+
+        angles = np.linspace(-np.pi, np.pi, 100)
+        disk_radius = 10.0 * self.propeller.geometry["tip_radius"]
+        image = None
+        label_coords = [
+            (2.0, 2.0),
+            (2.0, 1.0),
+            (2.0, 3.0),
+            (2.0, 3.0),
+            (2.0, 3.0),
+            (2.0, 3.0),
+        ]
+
+        for axis, title, level_map in zip(axes.flat, titles, maps):
+            axis.contourf(
+                y_plot,
+                x_plot,
+                level_map,
+                levels=smooth_levels,
+                cmap=cmap,
+            )
+            image = axis.pcolormesh(
+                y_plot,
+                x_plot,
+                level_map,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                shading="gouraud",
+                zorder=1,
+            )
+            axis.plot(
+                disk_radius * np.cos(angles),
+                disk_radius * np.sin(angles),
+                "--",
+                c="g",
+                linewidth=1,
+            )
+
+            if contour_level_values:
+                for index, level in enumerate(contour_level_values):
+                    coord = label_coords[index % len(label_coords)]
+                    contour = axis.contour(
+                        y_plot,
+                        x_plot,
+                        level_map,
+                        levels=[level],
+                        colors="white",
+                        linewidths=0.8,
+                        alpha=0.5,
+                    )
+                    axis.clabel(
+                        contour,
+                        inline=True,
+                        fontsize=12,
+                        fmt="%1.0f dB",
+                        manual=[coord],
+                    )
+
+            axis.set_title(title, fontsize=12)
+            axis.set_xlabel("r [m]", fontsize=12)
+            axis.set_ylabel("Z [m]", fontsize=12)
+            axis.tick_params(axis="both", labelsize=12)
+            axis.grid(True, alpha=0.15, color="white")
+
+        for axis in axes.flat[len(maps):]:
+            axis.set_axis_off()
+
+        colorbar = fig.colorbar(
+            image,
+            ax=axes,
+            shrink=1,
+            aspect=10,
+            pad=0.05,
+            ticks=np.arange(vmin, vmax + 10.0, 10.0),
+        )
+        colorbar_label = (
+            "OASPL [dB(A)]" if metric == "oaspl" else "OSPL [dB]"
+        )
+        colorbar.set_label(colorbar_label, fontsize=12)
+        colorbar.ax.tick_params(labelsize=12)
+
+        if save_path is not None:
+            plt.savefig(save_path, dpi=200)
+
+        plt.show()
+
     def plot_acoustic_map(
         self,
         grid_size: int = 26,
@@ -120,7 +350,7 @@ class Plotter:
         levels: Optional[Union[np.ndarray, torch.Tensor]] = None,
         figsize: Tuple[float, float] = (4.5, 2),
         cmap: str = 'magma',
-        contour_levels: Optional[Tuple[float]] = None,
+        contour_levels: Optional[Union[float, Iterable[float]]] = None,
         mirror: Optional[bool] = True,
         save_path: Optional[str] = None,
     ) -> None:
@@ -143,6 +373,8 @@ class Plotter:
                 propeller.
             figsize: Figure size tuple (width, height) in inches.
             cmap: Colormap name (default 'magma').
+            contour_levels: Optional contour level or iterable of contour
+                levels in dB.
             save_path: Optional path to save figure as PDF.
         '''
         noise_type = noise_type.lower()
@@ -171,7 +403,9 @@ class Plotter:
                     f"Propeller has no {spectrum_name} data to plot."
                 )
 
-            overall_level = self.propeller.calc_oaspl(
+            from ..Aeroacoustics.Utils import third_octave_spectrum_to_overall_level
+
+            overall_level = third_octave_spectrum_to_overall_level(
                 spectrum,
                 self.propeller.third_octave_freqs,
                 weighted=metric == 'oaspl',
@@ -182,91 +416,18 @@ class Plotter:
         else:
             overall_level = np.asarray(levels)
 
-        expected_size = grid_size * grid_size
-        if overall_level.size != expected_size:
-            raise ValueError(
-                f"levels must contain {expected_size} values; "
-                f"got {overall_level.size}."
-            )
-        overall_level = overall_level.reshape(grid_size, grid_size)
-
-        if mirror:
-            overall_level_full = np.vstack([
-                overall_level[::-1, :],
-                overall_level[1:, :],
-            ])
-        else:
-            overall_level_full = overall_level
-
-        # Create figure
-        fig, ax = plt.subplots(figsize=figsize)
-        
-        vmin = 0.0
-        vmax = max(
-            10.0,
-            np.ceil(np.nanmax(overall_level_full) / 10.0) * 10.0,
-        )
-        
-        # Create full grid for plotting
-        x_range_plot = np.linspace(-domain_size, domain_size, grid_size)
-        y_range_plot = np.linspace(-domain_size, domain_size, 2 * grid_size - 1)
-        X_plot, Y_plot = np.meshgrid(x_range_plot, y_range_plot)
-
-        # Plot with smooth coloring
-        smooth_levels = np.linspace(vmin, vmax, 1000)
-        ax.contourf(
-            Y_plot,
-            X_plot,
-            overall_level_full,
-            levels=smooth_levels,
+        self.plot_acoustic_maps(
+            {noise_type.upper(): overall_level},
+            grid_size=grid_size,
+            domain_size=domain_size,
+            metric=metric,
+            columns=1,
+            figsize=figsize,
             cmap=cmap,
+            contour_levels=contour_levels,
+            mirror=bool(mirror),
+            save_path=save_path,
         )
-        im = ax.pcolormesh(
-            Y_plot, X_plot, overall_level_full,
-            cmap=cmap,
-            vmin=vmin, vmax=vmax,
-            shading='gouraud',
-            zorder=1,
-        )
-        
-        # Add colorbar
-        cbar = fig.colorbar(
-            im, ax=ax, shrink=1, aspect=10, pad=0.05,
-            ticks=np.arange(vmin, vmax + 10, 10),
-        )
-        colorbar_label = (
-            'OASPL [dB(A)]' if metric == 'oaspl' else 'OSPL [dB]'
-        )
-        cbar.set_label(colorbar_label, fontsize=12)
-        cbar.ax.tick_params(labelsize=12)
-        
-        # Add propeller disk circle
-        angles = np.linspace(-np.pi, np.pi, 100)
-        r_disk = 10 * self.propeller.geometry['tip_radius']
-        ax.plot(r_disk * np.cos(angles), r_disk * np.sin(angles), '--', c='g', linewidth=1)
-        
-        # Add contour lines if requested
-        if contour_levels:
-            label_coords = [(2.0, 2.0), (2.0, 1.0), (2.0, 3.0), (2.0, 3.0), (2.0, 3.0), (2.0, 3.0)]
-            
-            for level, coord in zip(contour_levels, label_coords):
-                cntr = ax.contour(
-                    Y_plot, X_plot, overall_level_full,
-                    levels=[level], colors='white',
-                    linewidths=0.8, alpha=0.5,
-                )
-                ax.clabel(cntr, inline=True, fontsize=12, fmt='%1.0f dB', manual=[coord])
-        
-        ax.set_xlabel('r [m]', fontsize=12)
-        ax.set_ylabel('Z [m]', fontsize=12)
-        ax.tick_params(axis='both', labelsize=12)
-        ax.grid(True, alpha=0.15, color='white')
-        plt.tight_layout()
-        
-        if save_path is not None:
-            plt.savefig(save_path, dpi=200)
-        
-        plt.show()
 
     def plot_stress_distribution(
         self,

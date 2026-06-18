@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from os import PathLike
+from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
+import pandas as pd
 import torch
 
 from .Utils import (
@@ -18,6 +22,7 @@ if TYPE_CHECKING:
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+PathInput = Union[str, PathLike[str]]
 
 
 class F1A:
@@ -25,14 +30,25 @@ class F1A:
 
     Args:
         propeller: Propeller containing geometry and simulation settings.
-        bemt: BEMT analysis providing steady section loads.
+        bemt: Optional BEMT analysis providing steady section loads. Omit this
+            when using direct loading files.
         kinematics: Optional shared propeller kinematics. When omitted, F1A
             reuses ``propeller.kinematics`` if it matches the RPM, otherwise it
             creates one.
         rpm: Operating RPM. Optional for a single-point BEMT analysis and
-            required for multi-point BEMT analyses.
+            required for multi-point BEMT analyses or direct loadings.
         v_inf: BEMT freestream velocity. Required with ``rpm`` when
             selecting from a multi-point BEMT analysis.
+        loadings: Optional path to a ``.pt`` file containing direct blade-frame
+            force per unit span with shape ``(S, 3)`` or ``(T, B, S, 3)``.
+        source_times: CSV path containing source emission timestamps for direct
+            loadings. Required whenever ``loadings`` is provided.
+        loading_geometry: Section dictionary for direct loadings. It must
+            contain ``"r"`` and ``"dr"`` arrays matching the loading section
+            count. F1A overwrites its acoustic section radii and widths with
+            these values and resamples chord, twist, COM shift, and
+            cross-sectional area from the propeller geometry at the supplied
+            radii.
 
     Observer-dependent source tensors use dimension order
     ``(O, T, B, S, ...)``.
@@ -41,11 +57,14 @@ class F1A:
     def __init__(
         self,
         propeller: Propeller,
-        bemt: BEMT,
+        bemt: BEMT | PathInput | None = None,
         *,
         kinematics: Kinematics | None = None,
         rpm: float | None = None,
         v_inf: float | None = None,
+        loadings: PathInput | None = None,
+        source_times: PathInput | None = None,
+        loading_geometry: Mapping[str, ArrayLike] | None = None,
     ) -> None:
         self.propeller = propeller
         self.environment = propeller.environment
@@ -54,129 +73,265 @@ class F1A:
         self.dtype = propeller.dtype
         self.rho = propeller.rho_tensor
         self.a_inf = propeller.a_inf_tensor
+        self.loadings_path: Path | None = None
+        self.source_times_path: Path | None = None
 
         from ..Aerodynamics.BEMT import BEMT
 
-        if not isinstance(bemt, BEMT):
-            raise TypeError("bemt must be a FastBEMT Aerodynamics.BEMT object.")
-        if bemt.propeller is not propeller:
-            raise ValueError("The BEMT analysis belongs to a different propeller.")
-        if bemt.environment is not self.environment:
-            raise ValueError("F1A and BEMT must use the same environment.")
-        self.bemt = bemt
-        self.rpm, self.v_inf = bemt.resolve_operating_point(rpm, v_inf)
-        solution = bemt.solution_for(self.rpm, self.v_inf)
-
-        if kinematics is not None:
-            if not self._kinematics_matches(kinematics):
+        if bemt is not None and not isinstance(bemt, BEMT):
+            if loadings is not None:
                 raise ValueError(
-                    "The supplied Kinematics object must belong to this propeller "
-                    "and operating RPM."
+                    "Specify direct F1A loadings either as the second "
+                    "positional argument or with loadings=, not both."
                 )
-            self.kinematics = kinematics
-        elif self._kinematics_matches(propeller.kinematics):
-            self.kinematics = propeller.kinematics
-        else:
-            self.kinematics = Kinematics(propeller, rpm=self.rpm)
-        propeller.kinematics = self.kinematics
-        self.nt = self.kinematics.nt
-        self.nb = self.kinematics.nb
+            loadings = bemt
+            bemt = None
 
-        section_mask = propeller.f1a_geometry_mask.copy()
-        d_t = np.asarray(solution["d_t"].values, dtype=np.float64)
-        d_q = np.asarray(solution["d_q"].values, dtype=np.float64)
-        section_mask &= np.isfinite(d_t) & np.isfinite(d_q)
-        if not np.any(section_mask):
-            raise ValueError("No valid blade sections available for F1A.")
-        all_sections_selected = bool(np.all(section_mask))
-        selected_sections = (
-            propeller.f1a_geometry_mask_tensor
-            if all_sections_selected
-            else torch.as_tensor(
-                section_mask,
+        using_direct_loadings = loadings is not None
+        if using_direct_loadings == (bemt is not None):
+            raise ValueError("Specify exactly one of bemt or direct loadings.")
+
+        if using_direct_loadings:
+            self.bemt: BEMT | None = None
+            if rpm is None:
+                raise ValueError("rpm is required for direct F1A loadings.")
+            self.rpm = float(rpm)
+            if not np.isfinite(self.rpm) or self.rpm <= 0.0:
+                raise ValueError("rpm must be finite and greater than zero.")
+            if v_inf is not None:
+                raise ValueError(
+                    "v_inf is only used when F1A loadings come from BEMT."
+                )
+            self.v_inf = None
+
+            self.loadings_path = self._required_file_path(
+                loadings,
+                name="loadings",
+                suffix=".pt",
+            )
+            self.source_times_path = self._required_file_path(
+                source_times,
+                name="source_times",
+                suffix=".csv",
+            )
+            direct_source_times = self._load_source_times(
+                self.source_times_path
+            )
+            direct_geometry = self._direct_loading_geometry(loading_geometry)
+            direct_loadings = self._load_direct_loadings(self.loadings_path)
+            loads, direct_geometry, section_mask = (
+                self._select_direct_load_sections(
+                    direct_loadings,
+                    direct_geometry,
+                    direct_source_times,
+                )
+            )
+
+            kinematic_geometry = {
+                "r": direct_geometry["r"],
+                "twist": direct_geometry["twist"],
+                "com_shift_forward": direct_geometry["com_shift_forward"],
+                "com_shift_up": direct_geometry["com_shift_up"],
+            }
+            if kinematics is not None:
+                if not self._kinematics_matches(
+                    kinematics,
+                    source_times=direct_source_times,
+                    section_radius=direct_geometry["r"],
+                ):
+                    raise ValueError(
+                        "The supplied Kinematics object must belong to this "
+                        "propeller, operating RPM, source-time grid, and "
+                        "direct-loading section grid."
+                    )
+                self.kinematics = kinematics
+            else:
+                self.kinematics = Kinematics(
+                    propeller,
+                    rpm=self.rpm,
+                    source_times=direct_source_times,
+                    section_geometry=kinematic_geometry,
+                )
+            self.nt = self.kinematics.nt
+            self.nb = self.kinematics.nb
+
+            self.section_mask = section_mask
+            self._uses_all_sections = True
+            self._selected_sections = torch.ones(
+                direct_geometry["r"].shape,
                 dtype=torch.bool,
                 device=self.device,
             )
-        )
-        d_t_tensor = torch.as_tensor(
-            d_t,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        d_q_tensor = torch.as_tensor(
-            d_q,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        section_width = (
-            propeller.section_width
-            if all_sections_selected
-            else propeller.section_width[selected_sections]
-        )
-        section_radius = (
-            propeller.section_radius
-            if all_sections_selected
-            else propeller.section_radius[selected_sections]
-        )
-        axial_load = (
-            (
-                d_t_tensor
-                if all_sections_selected
-                else d_t_tensor[selected_sections]
+            self.r = torch.as_tensor(
+                direct_geometry["r"],
+                dtype=self.dtype,
+                device=self.device,
             )
-            / section_width
-            / self.nb
-        )
-        tangential_load = (
-            (
-                d_q_tensor
-                if all_sections_selected
-                else d_q_tensor[selected_sections]
+            self.dr = torch.as_tensor(
+                direct_geometry["dr"],
+                dtype=self.dtype,
+                device=self.device,
             )
-            / section_width
-            / section_radius
-            / self.nb
-        )
-        loads = torch.stack(
-            (
-                axial_load,
-                torch.zeros_like(axial_load),
-                -tangential_load,
-            ),
-            dim=-1,
-        )
-
-        self.section_mask = section_mask
-        self._selected_sections = selected_sections
-        self._uses_all_sections = all_sections_selected
-        if all_sections_selected:
-            self.r = propeller.section_radius
-            self.dr = propeller.section_width
-            self.area = propeller.section_area
-            self.chord = propeller.section_chord
-            self.twist_rad = propeller.section_twist_rad
-            self.com_shift_forward = propeller.section_com_shift_forward
-            self.com_shift_up = propeller.section_com_shift_up
-            self.thickness_strength = propeller.f1a_thickness_strength
-            self.dipole_strength = propeller.f1a_dipole_strength
+            self.area = torch.as_tensor(
+                direct_geometry["area"],
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.chord = torch.as_tensor(
+                direct_geometry["chord"],
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.twist_rad = torch.deg2rad(
+                torch.as_tensor(
+                    direct_geometry["twist"],
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+            self.com_shift_forward = torch.as_tensor(
+                direct_geometry["com_shift_forward"],
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.com_shift_up = torch.as_tensor(
+                direct_geometry["com_shift_up"],
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.thickness_strength = (
+                self.rho * self.area * self.dr / (4.0 * np.pi)
+            )
+            self.dipole_strength = self.dr / (4.0 * np.pi * self.a_inf)
         else:
-            self.r = propeller.section_radius[selected_sections]
-            self.dr = propeller.section_width[selected_sections]
-            self.area = propeller.section_area[selected_sections]
-            self.chord = propeller.section_chord[selected_sections]
-            self.twist_rad = propeller.section_twist_rad[selected_sections]
-            self.com_shift_forward = propeller.section_com_shift_forward[
-                selected_sections
-            ]
-            self.com_shift_up = propeller.section_com_shift_up[
-                selected_sections
-            ]
-            self.thickness_strength = propeller.f1a_thickness_strength[
-                selected_sections
-            ]
-            self.dipole_strength = propeller.f1a_dipole_strength[
-                selected_sections
-            ]
+            if not isinstance(bemt, BEMT):
+                raise TypeError("bemt must be a FastBEMT Aerodynamics.BEMT object.")
+            if source_times is not None:
+                raise ValueError(
+                    "source_times is only supported for direct F1A loadings."
+                )
+            if loading_geometry is not None:
+                raise ValueError(
+                    "loading_geometry is only supported for direct F1A loadings."
+                )
+            if bemt.propeller is not propeller:
+                raise ValueError("The BEMT analysis belongs to a different propeller.")
+            if bemt.environment is not self.environment:
+                raise ValueError("F1A and BEMT must use the same environment.")
+            self.bemt = bemt
+            self.rpm, self.v_inf = bemt.resolve_operating_point(rpm, v_inf)
+            solution = bemt.solution_for(self.rpm, self.v_inf)
+
+            if kinematics is not None:
+                if not self._kinematics_matches(kinematics):
+                    raise ValueError(
+                        "The supplied Kinematics object must belong to this "
+                        "propeller and operating RPM."
+                    )
+                self.kinematics = kinematics
+            elif self._kinematics_matches(propeller.kinematics):
+                self.kinematics = propeller.kinematics
+            else:
+                self.kinematics = Kinematics(propeller, rpm=self.rpm)
+            propeller.kinematics = self.kinematics
+            self.nt = self.kinematics.nt
+            self.nb = self.kinematics.nb
+
+            section_mask = propeller.f1a_geometry_mask.copy()
+            d_t = np.asarray(solution["d_t"].values, dtype=np.float64)
+            d_q = np.asarray(solution["d_q"].values, dtype=np.float64)
+            section_mask &= np.isfinite(d_t) & np.isfinite(d_q)
+            if not np.any(section_mask):
+                raise ValueError("No valid blade sections available for F1A.")
+            all_sections_selected = bool(np.all(section_mask))
+            selected_sections = (
+                propeller.f1a_geometry_mask_tensor
+                if all_sections_selected
+                else torch.as_tensor(
+                    section_mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            )
+            d_t_tensor = torch.as_tensor(
+                d_t,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            d_q_tensor = torch.as_tensor(
+                d_q,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            section_width = (
+                propeller.section_width
+                if all_sections_selected
+                else propeller.section_width[selected_sections]
+            )
+            section_radius = (
+                propeller.section_radius
+                if all_sections_selected
+                else propeller.section_radius[selected_sections]
+            )
+            axial_load = (
+                (
+                    d_t_tensor
+                    if all_sections_selected
+                    else d_t_tensor[selected_sections]
+                )
+                / section_width
+                / self.nb
+            )
+            tangential_load = (
+                (
+                    d_q_tensor
+                    if all_sections_selected
+                    else d_q_tensor[selected_sections]
+                )
+                / section_width
+                / section_radius
+                / self.nb
+            )
+            loads = torch.stack(
+                (
+                    axial_load,
+                    torch.zeros_like(axial_load),
+                    -tangential_load,
+                ),
+                dim=-1,
+            )
+
+            self.section_mask = section_mask
+            self._selected_sections = selected_sections
+            self._uses_all_sections = all_sections_selected
+            if all_sections_selected:
+                self.r = propeller.section_radius
+                self.dr = propeller.section_width
+                self.area = propeller.section_area
+                self.chord = propeller.section_chord
+                self.twist_rad = propeller.section_twist_rad
+                self.com_shift_forward = propeller.section_com_shift_forward
+                self.com_shift_up = propeller.section_com_shift_up
+                self.thickness_strength = propeller.f1a_thickness_strength
+                self.dipole_strength = propeller.f1a_dipole_strength
+            else:
+                self.r = propeller.section_radius[selected_sections]
+                self.dr = propeller.section_width[selected_sections]
+                self.area = propeller.section_area[selected_sections]
+                self.chord = propeller.section_chord[selected_sections]
+                self.twist_rad = propeller.section_twist_rad[selected_sections]
+                self.com_shift_forward = propeller.section_com_shift_forward[
+                    selected_sections
+                ]
+                self.com_shift_up = propeller.section_com_shift_up[
+                    selected_sections
+                ]
+                self.thickness_strength = propeller.f1a_thickness_strength[
+                    selected_sections
+                ]
+                self.dipole_strength = propeller.f1a_dipole_strength[
+                    selected_sections
+                ]
         self.ns = int(self.r.shape[0])
         self.loads = loads
 
@@ -203,13 +358,340 @@ class F1A:
     def _kinematics_matches(
         self,
         kinematics: Kinematics | None,
+        *,
+        source_times: torch.Tensor | None = None,
+        section_radius: np.ndarray | torch.Tensor | None = None,
     ) -> bool:
-        """Return whether cached kinematics match this propeller and RPM."""
+        """Return whether cached kinematics match this F1A source grid."""
         if kinematics is None:
             return False
         if kinematics.propeller is not self.propeller:
             return False
-        return np.isclose(float(kinematics.rpm), float(self.rpm))
+        if not np.isclose(float(kinematics.rpm), float(self.rpm)):
+            return False
+
+        uses_custom_source_times = getattr(
+            kinematics,
+            "uses_custom_source_times",
+            False,
+        )
+        if source_times is None:
+            if uses_custom_source_times:
+                return False
+        else:
+            if not uses_custom_source_times:
+                return False
+            if kinematics.source_times.shape != source_times.shape:
+                return False
+            if not torch.allclose(
+                kinematics.source_times,
+                source_times,
+                rtol=1.0e-6,
+                atol=1.0e-9,
+            ):
+                return False
+
+        uses_custom_section_geometry = getattr(
+            kinematics,
+            "uses_custom_section_geometry",
+            False,
+        )
+        if section_radius is None:
+            return not uses_custom_section_geometry
+
+        section_radius_tensor = torch.as_tensor(
+            section_radius,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if kinematics.radial_positions.shape != section_radius_tensor.shape:
+            return False
+        return torch.allclose(
+            kinematics.radial_positions,
+            section_radius_tensor,
+            rtol=1.0e-6,
+            atol=1.0e-9,
+        )
+
+    def _required_file_path(
+        self,
+        value: object,
+        *,
+        name: str,
+        suffix: str,
+    ) -> Path:
+        """Validate a required direct-input path."""
+        if value is None:
+            raise ValueError(
+                f"{name} is required for direct F1A loadings and must be a "
+                f"path to a {suffix} file."
+            )
+        if not isinstance(value, (str, PathLike)):
+            raise TypeError(
+                f"{name} must be a path to a {suffix} file for direct F1A "
+                f"loadings; got {type(value).__name__}."
+            )
+
+        path = Path(value)
+        if path.suffix.lower() != suffix:
+            raise ValueError(
+                f"{name} must point to a {suffix} file; got '{path}'."
+            )
+        if not path.is_file():
+            raise FileNotFoundError(f"{name} file not found: {path}")
+        return path
+
+    def _load_direct_loadings(self, path: Path) -> torch.Tensor:
+        """Load direct F1A loadings from a ``.pt`` file."""
+        loaded = torch.load(path, map_location=self.device)
+        if isinstance(loaded, dict):
+            if "loadings" in loaded:
+                loaded = loaded["loadings"]
+            else:
+                tensor_items = [
+                    value
+                    for value in loaded.values()
+                    if isinstance(value, (torch.Tensor, np.ndarray))
+                ]
+                if len(tensor_items) != 1:
+                    raise ValueError(
+                        "Direct F1A loading files that contain a dictionary "
+                        "must have a 'loadings' tensor or exactly one tensor "
+                        f"value; got keys {list(loaded.keys())}."
+                    )
+                loaded = tensor_items[0]
+
+        if not isinstance(loaded, (torch.Tensor, np.ndarray)):
+            raise TypeError(
+                "Direct F1A loading files must contain a torch.Tensor or "
+                f"numpy.ndarray; got {type(loaded).__name__}."
+            )
+
+        return torch.as_tensor(
+            loaded,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _load_source_times(self, path: Path) -> torch.Tensor:
+        """Load a one-dimensional source-time vector from a CSV table."""
+        series = self._source_time_series_from_csv(path)
+        source_times = pd.to_numeric(series, errors="coerce")
+        if source_times.isna().any():
+            raise ValueError(
+                f"Timestamp CSV '{path}' contains non-numeric values in "
+                f"column '{series.name}'."
+            )
+
+        return torch.as_tensor(
+            source_times.to_numpy(dtype=np.float64),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _source_time_series_from_csv(self, path: Path) -> pd.Series:
+        """Select the timestamp column from a CSV file."""
+        table = pd.read_csv(path)
+        if table.shape[1] == 0:
+            raise ValueError(f"Timestamp CSV '{path}' has no columns.")
+
+        if table.shape[1] == 1 and self._looks_numeric(table.columns[0]):
+            table = pd.read_csv(path, header=None)
+            series = table.iloc[:, 0]
+            series.name = "time"
+            return series
+
+        preferred_columns = {
+            "t",
+            "time",
+            "times",
+            "time_s",
+            "time_sec",
+            "time_seconds",
+            "source_time",
+            "source_times",
+            "source_time_s",
+            "timestamp",
+            "timestamps",
+            "seconds",
+        }
+        for column in table.columns:
+            normalized = str(column).strip().lower().replace(" ", "_")
+            if normalized in preferred_columns:
+                return table[column]
+
+        if table.shape[1] == 1:
+            return table.iloc[:, 0]
+
+        numeric_columns = []
+        for column in table.columns:
+            converted = pd.to_numeric(table[column], errors="coerce")
+            if not converted.empty and not converted.isna().any():
+                numeric_columns.append(column)
+        if len(numeric_columns) == 1:
+            return table[numeric_columns[0]]
+
+        raise ValueError(
+            f"Timestamp CSV '{path}' must contain a recognized timestamp "
+            "column such as 'time_s', 'time', 't', or a single numeric column."
+        )
+
+    @staticmethod
+    def _looks_numeric(value: object) -> bool:
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _geometry_vector(
+        self,
+        geometry: Mapping[str, ArrayLike],
+        name: str,
+    ) -> np.ndarray:
+        """Return a one-dimensional finite geometry vector."""
+        if name not in geometry:
+            raise ValueError(f"loading_geometry must contain '{name}'.")
+        values = np.asarray(geometry[name], dtype=np.float64)
+        if values.ndim != 1:
+            raise ValueError(f"loading_geometry['{name}'] must be one-dimensional.")
+        if values.size == 0:
+            raise ValueError(f"loading_geometry['{name}'] must not be empty.")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"loading_geometry['{name}'] must be finite.")
+        return values
+
+    def _direct_loading_geometry(
+        self,
+        loading_geometry: Mapping[str, ArrayLike] | None,
+    ) -> dict[str, np.ndarray]:
+        """Build direct-loading section geometry on the supplied radial grid."""
+        if loading_geometry is None:
+            raise ValueError(
+                "loading_geometry with 'r' and 'dr' is required for direct "
+                "F1A loadings."
+            )
+        if not isinstance(loading_geometry, Mapping):
+            raise TypeError("loading_geometry must be a dictionary-like object.")
+
+        r = self._geometry_vector(loading_geometry, "r")
+        dr = self._geometry_vector(loading_geometry, "dr")
+        if dr.shape != r.shape:
+            raise ValueError(
+                "loading_geometry['dr'] must have the same shape as "
+                f"loading_geometry['r'] {r.shape}; got {dr.shape}."
+            )
+        if np.any(np.abs(r) <= 1.0e-12):
+            raise ValueError("loading_geometry['r'] must not contain zero radii.")
+        if np.any(dr <= 0.0):
+            raise ValueError("loading_geometry['dr'] must be greater than zero.")
+
+        source = self.propeller.section_geometry_np
+        source_r = np.asarray(source["r"], dtype=np.float64)
+        source_mask = (
+            np.isfinite(source_r)
+            & np.isfinite(source["chord"])
+            & np.isfinite(source["twist"])
+            & np.isfinite(source["area"])
+            & np.isfinite(source["com_shift_forward"])
+            & np.isfinite(source["com_shift_up"])
+        )
+        if np.count_nonzero(source_mask) < 2:
+            raise ValueError(
+                "Propeller geometry needs at least two finite sections to "
+                "resample direct F1A loading geometry."
+            )
+
+        order = np.argsort(source_r[source_mask])
+        source_r_sorted = source_r[source_mask][order]
+        if np.any(np.diff(source_r_sorted) <= 0.0):
+            raise ValueError(
+                "Propeller section radii must be strictly increasing for "
+                "direct F1A loading geometry resampling."
+            )
+
+        radial_tolerance = max(
+            1.0e-9,
+            1.0e-6 * float(np.ptp(source_r_sorted)),
+        )
+        if (
+            np.min(r) < source_r_sorted[0] - radial_tolerance
+            or np.max(r) > source_r_sorted[-1] + radial_tolerance
+        ):
+            raise ValueError(
+                "loading_geometry['r'] must lie inside the propeller radial "
+                f"range [{source_r_sorted[0]:.9g}, {source_r_sorted[-1]:.9g}]."
+            )
+
+        direct_geometry = {
+            "r": r.copy(),
+            "dr": dr.copy(),
+        }
+        for name in (
+            "chord",
+            "twist",
+            "area",
+            "com_shift_forward",
+            "com_shift_up",
+        ):
+            source_values = np.asarray(source[name], dtype=np.float64)[source_mask]
+            direct_geometry[name] = np.interp(
+                r,
+                source_r_sorted,
+                source_values[order],
+            )
+        return direct_geometry
+
+    def _select_direct_load_sections(
+        self,
+        loadings: torch.Tensor,
+        geometry: dict[str, np.ndarray],
+        source_times: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, np.ndarray], np.ndarray]:
+        """Drop invalid direct-loading sections and align geometry to loads."""
+        section_count = int(geometry["r"].shape[0])
+        steady_shape = (section_count, 3)
+        unsteady_shape = (
+            int(source_times.numel()),
+            self.propeller.n_blades,
+            section_count,
+            3,
+        )
+        if tuple(loadings.shape) not in (steady_shape, unsteady_shape):
+            raise ValueError(
+                "Direct F1A loadings must have shape "
+                f"{steady_shape} or {unsteady_shape}; "
+                f"got {tuple(loadings.shape)}."
+            )
+
+        section_mask = np.ones(section_count, dtype=bool)
+        for values in geometry.values():
+            section_mask &= np.isfinite(values)
+
+        if loadings.ndim == 2:
+            finite_load_sections = torch.isfinite(loadings).all(dim=1).cpu().numpy()
+        else:
+            finite_load_sections = (
+                torch.isfinite(loadings).all(dim=(0, 1, 3)).cpu().numpy()
+            )
+        section_mask &= finite_load_sections
+        if not np.any(section_mask):
+            raise ValueError("No valid blade sections available for direct F1A.")
+
+        section_mask_tensor = torch.as_tensor(
+            section_mask,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        if loadings.ndim == 2:
+            selected_loadings = loadings[section_mask_tensor, :]
+        else:
+            selected_loadings = loadings[:, :, section_mask_tensor, :]
+        selected_geometry = {
+            name: values[section_mask]
+            for name, values in geometry.items()
+        }
+        return selected_loadings.contiguous(), selected_geometry, section_mask
 
     def _initialize_loading(self) -> None:
         """Rotate loads and form their complete source-time derivative."""
