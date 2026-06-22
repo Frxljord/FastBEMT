@@ -23,7 +23,7 @@ def _repo_root() -> Path:
 
 def load_propeller_dict(name: str | Path) -> list[tuple[str, dict[str, Any]]]:
     """Load one propeller pickle, or all pickles in a dataset directory."""
-    path = _repo_root() / "Datasets" / name
+    path = _resolve_propeller_path(name)
     if path.is_dir():
         return [
             (pkl_file.stem, _load_pickle(pkl_file))
@@ -33,6 +33,32 @@ def load_propeller_dict(name: str | Path) -> list[tuple[str, dict[str, Any]]]:
     if not path.suffix:
         path = path.with_suffix(".pkl")
     return [(path.stem, _load_pickle(path))]
+
+
+def _resolve_propeller_path(name: str | Path) -> Path:
+    """Resolve propeller geometry paths from repo or legacy dataset roots."""
+    raw_path = Path(name)
+    root = _repo_root()
+    candidates = (
+        (raw_path,)
+        if raw_path.is_absolute()
+        else (
+            root / raw_path,
+            Path.cwd() / raw_path,
+            root / "Datasets" / raw_path,
+        )
+    )
+
+    for candidate in candidates:
+        if candidate.is_dir() or candidate.is_file():
+            return candidate
+        if not candidate.suffix:
+            pkl_candidate = candidate.with_suffix(".pkl")
+            if pkl_candidate.is_file():
+                return pkl_candidate
+
+    candidate = candidates[0]
+    return candidate if candidate.suffix else candidate.with_suffix(".pkl")
 
 
 def _load_pickle(path: Path) -> dict[str, Any]:

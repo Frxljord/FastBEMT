@@ -20,8 +20,18 @@ def _one_sided_rms_spectrum(
     pressure: torch.Tensor,
     sample_spacing: float,
     time_dim: int,
+    frequency_bin_width: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return frequencies and one-sided RMS pressure amplitudes."""
+    """Return frequencies and one-sided RMS pressure amplitudes.
+    
+    Args:
+        pressure: Time-domain acoustic pressure.
+        sample_spacing: Time between samples in seconds.
+        time_dim: Dimension containing time samples.
+        frequency_bin_width: Target frequency bin width in Hz. If provided,
+            the pressure signal will be zero-padded to achieve the desired
+            resolution. Default is None (use native FFT resolution).
+    """
     pressure = torch.as_tensor(pressure)
     if not pressure.is_floating_point():
         pressure = pressure.to(torch.get_default_dtype())
@@ -35,6 +45,23 @@ def _one_sided_rms_spectrum(
     sample_spacing = float(sample_spacing)
     if not math.isfinite(sample_spacing) or sample_spacing <= 0.0:
         raise ValueError("sample_spacing must be finite and greater than zero.")
+    
+    # Enforce frequency bin width if specified
+    if frequency_bin_width is not None:
+        frequency_bin_width = float(frequency_bin_width)
+        if not math.isfinite(frequency_bin_width) or frequency_bin_width <= 0.0:
+            raise ValueError("frequency_bin_width must be finite and greater than zero.")
+        # Required duration: T = 1 / frequency_bin_width
+        # Required samples: N = ceil(T / sample_spacing)
+        required_duration = 1.0 / frequency_bin_width
+        required_sample_count = math.ceil(required_duration / sample_spacing)
+        # Pad to required sample count if necessary
+        if required_sample_count > sample_count:
+            pad_amount = required_sample_count - sample_count
+            pad_spec = [0, 0] * pressure.ndim
+            pad_spec[2 * (pressure.ndim - 1 - time_dim) + 1] = pad_amount
+            pressure = torch.nn.functional.pad(pressure, pad_spec)
+            sample_count = required_sample_count
 
     frequencies = torch.fft.rfftfreq(
         sample_count,
@@ -115,6 +142,7 @@ def time_domain_to_spl_spectrum(
     p_ref: float = 20.0e-6,
     *,
     time_dim: int = -1,
+    frequency_bin_width: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert pressure histories to a one-sided RMS SPL spectrum.
 
@@ -123,6 +151,8 @@ def time_domain_to_spl_spectrum(
         sample_spacing: Time between samples in seconds.
         p_ref: Reference acoustic pressure in Pa.
         time_dim: Dimension containing time samples.
+        frequency_bin_width: Target frequency bin width in Hz. Pressure signals
+            will be zero-padded to achieve this resolution. Default is 20 Hz.
 
     Returns:
         ``(frequencies, spl)`` where ``frequencies`` is one-dimensional and
@@ -133,6 +163,7 @@ def time_domain_to_spl_spectrum(
         pressure,
         sample_spacing,
         time_dim,
+        frequency_bin_width=frequency_bin_width,
     )
     return frequencies, _rms_amplitude_to_spl(rms_amplitude, p_ref)
 
