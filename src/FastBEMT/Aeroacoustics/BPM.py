@@ -3,11 +3,12 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
+from ._common import ArrayLike, normalize_observer_batch_size, observer_tensor
 from .Utils import (
     a_weighting_db,
     power_ratio_to_spl,
@@ -18,9 +19,6 @@ from ..Kinematics import Kinematics
 if TYPE_CHECKING:
     from ..Aerodynamics.BEMT import BEMT
     from ..Propeller import Propeller
-
-
-ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
 def _load_bpm_component(name: str) -> ModuleType:
@@ -54,14 +52,14 @@ class BPM:
         propeller: Propeller,
         bemt: BEMT,
         *,
-        kinematics: Optional[Kinematics] = None,
-        rpm: Optional[float] = None,
-        v_inf: Optional[float] = None,
+        kinematics: Kinematics | None = None,
+        rpm: float | None = None,
+        v_inf: float | None = None,
         lt: float = 1.0,
         i: float = 0.01,
         alpha_stall: float = 15.0,
-        trailing_edge_offset: Optional[ArrayLike] = None,
-        c1: Optional[ArrayLike] = None,
+        trailing_edge_offset: ArrayLike | None = None,
+        c1: ArrayLike | None = None,
     ) -> None:
         from ..Aerodynamics.BEMT import BEMT
 
@@ -148,26 +146,26 @@ class BPM:
             geometry["chord"],
         )
 
-        self.observers: Optional[torch.Tensor] = None
-        self.observer_times: Optional[torch.Tensor] = None
-        self.t: Optional[torch.Tensor] = None
-        self.observer_rotations: Optional[int] = None
-        self.observer_time_range: Optional[float] = None
-        self.num_observer_times: Optional[int] = None
-        self.sample_spacing: Optional[float] = None
-        self.source_rotation_repetitions: Optional[int] = None
-        self.base_val_te: Optional[torch.Tensor] = None
-        self.base_val_le: Optional[torch.Tensor] = None
-        self.base_val_low: Optional[torch.Tensor] = None
+        self.observers: torch.Tensor | None = None
+        self.observer_times: torch.Tensor | None = None
+        self.t: torch.Tensor | None = None
+        self.observer_rotations: int | None = None
+        self.observer_time_range: float | None = None
+        self.num_observer_times: int | None = None
+        self.sample_spacing: float | None = None
+        self.source_rotation_repetitions: int | None = None
+        self.base_val_te: torch.Tensor | None = None
+        self.base_val_le: torch.Tensor | None = None
+        self.base_val_low: torch.Tensor | None = None
         self.component_p2: dict[str, torch.Tensor] = {}
         self.component_spl: dict[str, torch.Tensor] = {}
-        self.spl: Optional[torch.Tensor] = None
-        self.spl_a: Optional[torch.Tensor] = None
-        self.ospl: Optional[torch.Tensor] = None
-        self.oaspl: Optional[torch.Tensor] = None
-        self.source_component_p2: Optional[dict[str, torch.Tensor]] = None
+        self.spl: torch.Tensor | None = None
+        self.spl_a: torch.Tensor | None = None
+        self.ospl: torch.Tensor | None = None
+        self.oaspl: torch.Tensor | None = None
+        self.source_component_p2: dict[str, torch.Tensor] | None = None
 
-    def _kinematics_matches(self, kinematics: Optional[Kinematics]) -> bool:
+    def _kinematics_matches(self, kinematics: Kinematics | None) -> bool:
         if kinematics is None:
             return False
         if kinematics.propeller is not self.propeller:
@@ -247,8 +245,8 @@ class BPM:
 
     def _trailing_edge_offset(
         self,
-        trailing_edge_offset: Optional[ArrayLike],
-        c1: Optional[ArrayLike],
+        trailing_edge_offset: ArrayLike | None,
+        c1: ArrayLike | None,
         full_chord: np.ndarray,
     ) -> torch.Tensor:
         selected_chord = full_chord[self.section_mask].astype(np.float64, copy=False)
@@ -273,13 +271,13 @@ class BPM:
     def run(
         self,
         observers: ArrayLike,
-        observer_time_range: Optional[float] = None,
-        num_observer_times: Optional[int] = None,
+        observer_time_range: float | None = None,
+        num_observer_times: int | None = None,
         *,
-        lt: Optional[float] = None,
-        i: Optional[float] = None,
-        alpha_stall: Optional[float] = None,
-        observer_batch_size: Optional[int] = None,
+        lt: float | None = None,
+        i: float | None = None,
+        alpha_stall: float | None = None,
+        observer_batch_size: int | None = None,
         retain_source_terms: bool = False,
     ) -> None:
         """Compute BPM component and total third-octave spectra.
@@ -295,14 +293,18 @@ class BPM:
                 time. Results are merged onto this object in observer order.
             retain_source_terms: Keep uncombined source component powers.
         """
-        observer_tensor = self._observer_tensor(observers)
-        batch_size = self._normalize_observer_batch_size(
+        observer_values = observer_tensor(
+            observers,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        batch_size = normalize_observer_batch_size(
             observer_batch_size,
-            observer_count=int(observer_tensor.shape[0]),
+            observer_count=int(observer_values.shape[0]),
         )
         if batch_size is None:
             self._run_observer_batch(
-                observer_tensor,
+                observer_values,
                 observer_time_range=observer_time_range,
                 num_observer_times=num_observer_times,
                 lt=lt,
@@ -313,8 +315,8 @@ class BPM:
             return
 
         batch_results = []
-        for start in range(0, int(observer_tensor.shape[0]), batch_size):
-            observer_batch = observer_tensor[start : start + batch_size]
+        for start in range(0, int(observer_values.shape[0]), batch_size):
+            observer_batch = observer_values[start : start + batch_size]
             self._run_observer_batch(
                 observer_batch,
                 observer_time_range=observer_time_range,
@@ -331,47 +333,20 @@ class BPM:
             )
 
         self._merge_batch_results(
-            observer_tensor,
+            observer_values,
             batch_results,
             retain_source_terms=retain_source_terms,
         )
-
-    def _observer_tensor(self, observers: ArrayLike) -> torch.Tensor:
-        observer_tensor = torch.as_tensor(
-            observers,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        if observer_tensor.ndim == 1:
-            observer_tensor = observer_tensor.unsqueeze(0)
-        if observer_tensor.ndim != 2 or observer_tensor.shape[1] != 3:
-            raise ValueError("observers must have shape (O, 3).")
-        return observer_tensor.contiguous()
-
-    @staticmethod
-    def _normalize_observer_batch_size(
-        observer_batch_size: Optional[int],
-        *,
-        observer_count: int,
-    ) -> Optional[int]:
-        if observer_batch_size is None:
-            return None
-        batch_size = int(observer_batch_size)
-        if batch_size <= 0:
-            raise ValueError("observer_batch_size must be greater than zero.")
-        if batch_size >= observer_count:
-            return None
-        return batch_size
 
     def _run_observer_batch(
         self,
         observers: torch.Tensor,
         *,
-        observer_time_range: Optional[float],
-        num_observer_times: Optional[int],
-        lt: Optional[float],
-        i: Optional[float],
-        alpha_stall: Optional[float],
+        observer_time_range: float | None,
+        num_observer_times: int | None,
+        lt: float | None,
+        i: float | None,
+        alpha_stall: float | None,
         retain_source_terms: bool,
     ) -> None:
         self._reset_results()
@@ -444,7 +419,7 @@ class BPM:
             for name, values in band_power.items()
         }
 
-        total_band_power: Optional[torch.Tensor] = None
+        total_band_power: torch.Tensor | None = None
         for values in band_power.values():
             total_band_power = (
                 values
@@ -716,8 +691,8 @@ class BPM:
     def _observer_output_times(
         self,
         observer_times: torch.Tensor,
-        observer_time_range: Optional[float],
-        num_observer_times: Optional[int],
+        observer_time_range: float | None,
+        num_observer_times: int | None,
     ) -> torch.Tensor:
         requested_time_range = (
             self.propeller.simulation.observer_time_range

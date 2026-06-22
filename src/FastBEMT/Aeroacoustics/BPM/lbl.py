@@ -1,32 +1,12 @@
 """Auxiliary correlations for BPM laminar boundary-layer noise."""
 
-from typing import Sequence, Union
-
 import torch
 
-
-def _torch_select(
-    conditions: Sequence[torch.Tensor],
-    choices: Sequence[Union[torch.Tensor, float]],
-    default_value: float = 0.0,
-) -> torch.Tensor:
-    """Torch-based conditional selection similar to np.select."""
-    result = torch.full_like(conditions[0], default_value, dtype=conditions[0].dtype)
-    for cond, choice in zip(reversed(conditions), reversed(choices)):
-        if not isinstance(choice, torch.Tensor):
-            choice = torch.tensor(choice, dtype=result.dtype, device=result.device)
-        result = torch.where(cond, choice, result)
-    return result
-
-
-def st(f: torch.Tensor, l: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-    """Compute Strouhal number: St = f * l / u."""
-    return f[:, None] * l / u[None, :]
-
-
-def safe_log10(value: torch.Tensor) -> torch.Tensor:
-    """Compute log10 with a tiny clamp instead of additive bias."""
-    return torch.log10(torch.clamp(value, min=torch.finfo(value.dtype).tiny))
+from FastBEMT.Aeroacoustics._bpm_common import (
+    safe_log10,
+    st,
+    torch_select as _torch_select,
+)
 
 
 def st1_prime(re_c: torch.Tensor) -> torch.Tensor:

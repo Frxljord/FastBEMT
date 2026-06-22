@@ -3,12 +3,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import torch
 
+from ._common import (
+    ArrayLike,
+    PathInput,
+    normalize_observer_batch_size,
+    observer_tensor,
+)
 from .Utils import (
     a_weighting_db,
     spl_spectrum_to_overall_level,
@@ -19,10 +25,6 @@ from ..Kinematics import Kinematics
 if TYPE_CHECKING:
     from ..Aerodynamics.BEMT import BEMT
     from ..Propeller import Propeller
-
-
-ArrayLike = Union[np.ndarray, torch.Tensor]
-PathInput = Union[str, PathLike[str]]
 
 
 class F1A:
@@ -39,17 +41,22 @@ class F1A:
             required for multi-point BEMT analyses or direct loadings.
         v_inf: BEMT freestream velocity. Required with ``rpm`` when
             selecting from a multi-point BEMT analysis.
-        loadings: Optional path to a ``.pt`` file containing direct blade-frame
+        loadings: Optional path to a ``.pt`` file containing direct global-frame
             force per unit span with shape ``(S, 3)`` or ``(T, B, S, 3)``.
+            Direct loading files are interpreted as forces on the blade, so
+            F1A flips their sign before acoustic use.
         source_times: CSV path containing source emission timestamps for direct
             loadings. Required whenever ``loadings`` is provided.
-        loading_geometry: Section dictionary for direct loadings. It must
-            contain ``"r"`` and ``"dr"`` arrays matching the loading section
-            count. F1A overwrites its acoustic section radii and widths with
+        last_rotations: Optional number of final rotor revolutions to keep from
+            direct loading files. Use this to discard startup transients before
+            F1A builds kinematics and differentiates the load history.
+        loading_geometry: Section dictionary or CSV path for direct loadings.
+            It must provide ``"r"`` and ``"dr"`` arrays matching the loading
+            section count. CSV files may use columns such as ``r_mid_m`` and
+            ``dr_m``. F1A overwrites its acoustic section radii and widths with
             these values and resamples chord, twist, COM shift, and
             cross-sectional area from the propeller geometry at the supplied
             radii.
-
     Observer-dependent source tensors use dimension order
     ``(O, T, B, S, ...)``.
     """
@@ -64,7 +71,8 @@ class F1A:
         v_inf: float | None = None,
         loadings: PathInput | None = None,
         source_times: PathInput | None = None,
-        loading_geometry: Mapping[str, ArrayLike] | None = None,
+        last_rotations: float | None = None,
+        loading_geometry: Mapping[str, ArrayLike] | PathInput | None = None,
     ) -> None:
         self.propeller = propeller
         self.environment = propeller.environment
@@ -75,6 +83,7 @@ class F1A:
         self.a_inf = propeller.a_inf_tensor
         self.loadings_path: Path | None = None
         self.source_times_path: Path | None = None
+        self.loading_geometry_path: Path | None = None
 
         from ..Aerodynamics.BEMT import BEMT
 
@@ -119,6 +128,13 @@ class F1A:
             )
             direct_geometry = self._direct_loading_geometry(loading_geometry)
             direct_loadings = self._load_direct_loadings(self.loadings_path)
+            direct_loadings, direct_source_times = (
+                self._trim_direct_loading_history(
+                    direct_loadings,
+                    direct_source_times,
+                    last_rotations,
+                )
+            )
             loads, direct_geometry, section_mask = (
                 self._select_direct_load_sections(
                     direct_loadings,
@@ -126,6 +142,7 @@ class F1A:
                     direct_source_times,
                 )
             )
+            loads = -loads
 
             kinematic_geometry = {
                 "r": direct_geometry["r"],
@@ -213,6 +230,10 @@ class F1A:
             if loading_geometry is not None:
                 raise ValueError(
                     "loading_geometry is only supported for direct F1A loadings."
+                )
+            if last_rotations is not None:
+                raise ValueError(
+                    "last_rotations is only supported for direct F1A loadings."
                 )
             if bemt.propeller is not propeller:
                 raise ValueError("The BEMT analysis belongs to a different propeller.")
@@ -489,6 +510,50 @@ class F1A:
             device=self.device,
         )
 
+    def _trim_direct_loading_history(
+        self,
+        loadings: torch.Tensor,
+        source_times: torch.Tensor,
+        last_rotations: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep only the final direct-loading rotations, when requested."""
+        if last_rotations is None:
+            return loadings, source_times
+
+        rotations = float(last_rotations)
+        if not np.isfinite(rotations) or rotations <= 0.0:
+            raise ValueError("last_rotations must be finite and greater than zero.")
+
+        if loadings.ndim == 4 and loadings.shape[0] != source_times.numel():
+            raise ValueError(
+                "Unsteady direct F1A loadings must have the same number of "
+                "time samples as source_times before last_rotations trimming; "
+                f"got {loadings.shape[0]} and {source_times.numel()}."
+            )
+
+        rotation_period = 60.0 / self.rpm
+        window = torch.as_tensor(
+            rotations * rotation_period,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        tolerance = torch.as_tensor(
+            max(1.0e-12, 1.0e-7 * rotation_period),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        start_time = source_times[-1] - window
+        keep = source_times >= (start_time - tolerance)
+        if not bool(keep.any().item()):
+            raise ValueError(
+                "last_rotations did not retain any direct F1A source samples."
+            )
+
+        trimmed_times = source_times[keep].contiguous()
+        if loadings.ndim == 4:
+            loadings = loadings[keep, ...].contiguous()
+        return loadings, trimmed_times
+
     def _source_time_series_from_csv(self, path: Path) -> pd.Series:
         """Select the timestamp column from a CSV file."""
         table = pd.read_csv(path)
@@ -563,16 +628,28 @@ class F1A:
 
     def _direct_loading_geometry(
         self,
-        loading_geometry: Mapping[str, ArrayLike] | None,
+        loading_geometry: Mapping[str, ArrayLike] | PathInput | None,
     ) -> dict[str, np.ndarray]:
         """Build direct-loading section geometry on the supplied radial grid."""
         if loading_geometry is None:
             raise ValueError(
-                "loading_geometry with 'r' and 'dr' is required for direct "
-                "F1A loadings."
+                "loading_geometry with 'r' and 'dr', or a loading geometry "
+                "CSV path, is required for direct F1A loadings."
+            )
+        if isinstance(loading_geometry, (str, PathLike)):
+            self.loading_geometry_path = self._required_file_path(
+                loading_geometry,
+                name="loading_geometry",
+                suffix=".csv",
+            )
+            loading_geometry = self._load_loading_geometry_csv(
+                self.loading_geometry_path
             )
         if not isinstance(loading_geometry, Mapping):
-            raise TypeError("loading_geometry must be a dictionary-like object.")
+            raise TypeError(
+                "loading_geometry must be a dictionary-like object or a path "
+                "to a .csv file."
+            )
 
         r = self._geometry_vector(loading_geometry, "r")
         dr = self._geometry_vector(loading_geometry, "dr")
@@ -642,6 +719,95 @@ class F1A:
             )
         return direct_geometry
 
+    def _load_loading_geometry_csv(self, path: Path) -> dict[str, np.ndarray]:
+        """Load direct-loading section radii and widths from a CSV table."""
+        table = pd.read_csv(path)
+        if table.shape[1] == 0:
+            raise ValueError(f"Loading geometry CSV '{path}' has no columns.")
+
+        r_column = self._csv_column_by_alias(
+            table,
+            path,
+            purpose="section radius",
+            aliases=(
+                "r_mid_m",
+                "r_m",
+                "r",
+                "radius_m",
+                "radius",
+                "radial_position_m",
+                "radial_position",
+                "section_radius_m",
+                "section_radius",
+                "element_radius_m",
+                "element_radius",
+            ),
+        )
+        dr_column = self._csv_column_by_alias(
+            table,
+            path,
+            purpose="section width",
+            aliases=(
+                "dr_m",
+                "dr",
+                "width_m",
+                "width",
+                "section_width_m",
+                "section_width",
+                "delta_r_m",
+                "delta_r",
+                "span_width_m",
+                "span_width",
+                "element_width_m",
+                "element_width",
+            ),
+        )
+        return {
+            "r": self._numeric_csv_column(table, path, r_column),
+            "dr": self._numeric_csv_column(table, path, dr_column),
+        }
+
+    def _csv_column_by_alias(
+        self,
+        table: pd.DataFrame,
+        path: Path,
+        *,
+        purpose: str,
+        aliases: tuple[str, ...],
+    ) -> str:
+        normalized_aliases = {
+            self._normalize_csv_column_name(alias)
+            for alias in aliases
+        }
+        for column in table.columns:
+            if self._normalize_csv_column_name(column) in normalized_aliases:
+                return column
+        raise ValueError(
+            f"Loading geometry CSV '{path}' must contain a {purpose} column. "
+            f"Recognized names include {', '.join(aliases[:4])}."
+        )
+
+    @staticmethod
+    def _normalize_csv_column_name(value: object) -> str:
+        normalized = str(value).strip().lower()
+        for old, new in ((" ", "_"), ("-", "_"), (".", "_")):
+            normalized = normalized.replace(old, new)
+        return normalized
+
+    @staticmethod
+    def _numeric_csv_column(
+        table: pd.DataFrame,
+        path: Path,
+        column: str,
+    ) -> np.ndarray:
+        values = pd.to_numeric(table[column], errors="coerce")
+        if values.isna().any():
+            raise ValueError(
+                f"Loading geometry CSV '{path}' contains non-numeric values "
+                f"in column '{column}'."
+            )
+        return values.to_numpy(dtype=np.float64)
+
     def _select_direct_load_sections(
         self,
         loadings: torch.Tensor,
@@ -694,7 +860,14 @@ class F1A:
         return selected_loadings.contiguous(), selected_geometry, section_mask
 
     def _initialize_loading(self) -> None:
-        """Rotate loads and form their complete source-time derivative."""
+        """Form global-frame load vectors and source-time derivatives."""
+        if self.bemt is None:
+            self._initialize_global_frame_loading()
+            return
+        self._initialize_blade_frame_loading()
+
+    def _initialize_blade_frame_loading(self) -> None:
+        """Rotate blade-frame loads and form their complete derivative."""
         blade_to_global_rotation = (
             self.kinematics.blade_to_global_rotation_matrix
         )
@@ -735,6 +908,30 @@ class F1A:
             )
         self.f1dot = self.f1dot.contiguous()
 
+    def _initialize_global_frame_loading(self) -> None:
+        """Use inertial load vectors and differentiate them directly."""
+        if self.loads.ndim == 2:
+            self.f0dot = (
+                self.loads[None, None, :, :]
+                .expand(self.nt, self.nb, -1, -1)
+                .contiguous()
+            )
+            self.f1dot = torch.zeros_like(self.f0dot)
+            return
+
+        self.f0dot = self.loads.contiguous()
+        if self.nt == 1:
+            self.f1dot = torch.zeros_like(self.f0dot)
+            return
+
+        edge_order = 2 if self.nt >= 3 else 1
+        self.f1dot = torch.gradient(
+            self.loads,
+            spacing=(self.kinematics.source_times,),
+            dim=(0,),
+            edge_order=edge_order,
+        )[0].contiguous()
+
     @torch.inference_mode()
     def run(
         self,
@@ -768,7 +965,11 @@ class F1A:
         ``frequencies`` has shape ``(F,)``; ``spl`` and ``spl_a`` have shape
         ``(O, F)``; ``ospl`` and ``oaspl`` have shape ``(O,)``.
         """
-        observer_tensor = self._observer_tensor(observers)
+        observer_values = observer_tensor(
+            observers,
+            dtype=self.dtype,
+            device=self.device,
+        )
         requested_observer_count = (
             self.nt
             if num_observer_times is None
@@ -780,13 +981,13 @@ class F1A:
         if not np.isfinite(requested_time_range) or requested_time_range <= 0.0:
             raise ValueError("observer_time_range must be finite and positive.")
 
-        batch_size = self._normalize_observer_batch_size(
+        batch_size = normalize_observer_batch_size(
             observer_batch_size,
-            observer_count=int(observer_tensor.shape[0]),
+            observer_count=int(observer_values.shape[0]),
         )
         if batch_size is None:
             self._run_observer_batch(
-                observer_tensor,
+                observer_values,
                 requested_time_range=requested_time_range,
                 requested_observer_count=requested_observer_count,
                 retain_source_terms=retain_source_terms,
@@ -794,14 +995,14 @@ class F1A:
             return
 
         observer_rotations = self._observer_rotations_for_batches(
-            observer_tensor,
+            observer_values,
             requested_time_range=requested_time_range,
             requested_observer_count=requested_observer_count,
             batch_size=batch_size,
         )
         batch_results = []
-        for start in range(0, int(observer_tensor.shape[0]), batch_size):
-            observer_batch = observer_tensor[start : start + batch_size]
+        for start in range(0, int(observer_values.shape[0]), batch_size):
+            observer_batch = observer_values[start : start + batch_size]
             self._run_observer_batch(
                 observer_batch,
                 requested_time_range=requested_time_range,
@@ -816,7 +1017,7 @@ class F1A:
             )
 
         self._merge_batch_results(
-            observer_tensor,
+            observer_values,
             batch_results,
             retain_source_terms=retain_source_terms,
         )
@@ -838,33 +1039,6 @@ class F1A:
         self.oaspl = None
         self.source_p_m = None
         self.source_p_d = None
-
-    def _observer_tensor(self, observers: ArrayLike) -> torch.Tensor:
-        observer_tensor = torch.as_tensor(
-            observers,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        if observer_tensor.ndim == 1:
-            observer_tensor = observer_tensor.unsqueeze(0)
-        if observer_tensor.ndim != 2 or observer_tensor.shape[1] != 3:
-            raise ValueError("observers must have shape (O, 3).")
-        return observer_tensor.contiguous()
-
-    @staticmethod
-    def _normalize_observer_batch_size(
-        observer_batch_size: int | None,
-        *,
-        observer_count: int,
-    ) -> int | None:
-        if observer_batch_size is None:
-            return None
-        batch_size = int(observer_batch_size)
-        if batch_size <= 0:
-            raise ValueError("observer_batch_size must be greater than zero.")
-        if batch_size >= observer_count:
-            return None
-        return batch_size
 
     def _observer_rotations_for_batches(
         self,

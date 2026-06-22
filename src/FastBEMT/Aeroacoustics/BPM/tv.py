@@ -3,6 +3,8 @@
 import numpy as np
 import torch
 
+from FastBEMT.Aeroacoustics._bpm_common import safe_log10, st
+
 try:
     from scipy.interpolate import Akima1DInterpolator
 except Exception:  # pragma: no cover - scipy is a project dependency.
@@ -11,16 +13,6 @@ except Exception:  # pragma: no cover - scipy is a project dependency.
 
 ASPECT_DATA = np.array([2.0, 2.67, 4.0, 6.0, 12.0, 24.0])
 ARATIO_DATA = np.array([0.54, 0.62, 0.71, 0.79, 0.89, 0.95])
-
-
-def st(f: torch.Tensor, l: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-    """Compute Strouhal number: St = f * l / u."""
-    return f[:, None] * l / u[None, :]
-
-
-def safe_log10(value: torch.Tensor) -> torch.Tensor:
-    """Compute log10 with a tiny clamp instead of additive bias."""
-    return torch.log10(torch.clamp(value, min=torch.finfo(value.dtype).tiny))
 
 
 def calc_l_tip(chord: torch.Tensor, alpha_tip: torch.Tensor) -> torch.Tensor:

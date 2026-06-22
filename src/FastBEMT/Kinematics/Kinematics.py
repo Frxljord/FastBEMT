@@ -309,7 +309,7 @@ class Kinematics:
             ],
             dim=-1,
         )
-        # REPLACE THIS WITH TRUE COM
+        # Sections are currently represented at the airfoil-frame origin.
         self.section_position_airfoil_frame = torch.stack(
             [
                 torch.zeros_like(self.radial_positions),
@@ -353,25 +353,3 @@ class Kinematics:
             self.section_acc,
             dim=-1,
         ).contiguous()
-
-        # Compact aliases for callers that already use the aeroacoustic names.
-        self.R_g2b = self.global_to_blade_rotation_matrix
-        self.R_b2g = self.blade_to_global_rotation_matrix
-        self.R_b2a = self.blade_to_airfoil_rotation_matrix
-        self.R_a2b = self.airfoil_to_blade_rotation_matrix
-        self.section_position_in_airfoil_frame = (
-            self.section_position_airfoil_frame
-        )
-        self.section_position_in_blade_frame = self.section_position_blade_frame
-        self.section_position_in_global_frame = (
-            self.section_position_global_frame
-        )
-        self.section_velocity = self.section_vel
-        self.section_acceleration = self.section_acc
-        self.section_jerk = self.section_jerk
-        self.pos_airfoil = self.section_position_airfoil_frame
-        self.pos_blade = self.section_position_blade_frame
-        self.pos_fixed = self.section_position_global_frame
-        self.vel_fixed = self.section_vel
-        self.acc_fixed = self.section_acc
-        self.jerk_fixed = self.section_jerk

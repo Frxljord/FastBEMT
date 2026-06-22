@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Union
-
 import numpy as np
 import pyfar as pf
 import torch
@@ -9,6 +7,8 @@ import torch
 from .Kinematics import Kinematics
 from .Utils.Environment import Environment
 from .Utils.Simulation import Simulation
+
+GeometryDict = dict[str, np.ndarray | int | float | list]
 
 
 class Propeller:
@@ -21,7 +21,7 @@ class Propeller:
 
     def __init__(
         self,
-        geometry: Dict[str, Union[np.ndarray, int, float, list]],
+        geometry: GeometryDict,
         environment: Environment,
         simulation: Simulation,
     ) -> None:
@@ -35,8 +35,8 @@ class Propeller:
         self.calculate_boat_tail_angle()
 
         # COM shift: positive in forward direction (+x), positive upward (+z).
-        self.com_shift_up: List[float] = [s[1] for s in self.geometry["COM_shift"]]
-        self.com_shift_forward: List[float] = [
+        self.com_shift_up: list[float] = [s[1] for s in self.geometry["COM_shift"]]
+        self.com_shift_forward: list[float] = [
             -s[0] for s in self.geometry["COM_shift"]
         ]
         self._initialize_geometry_cache()
@@ -51,7 +51,7 @@ class Propeller:
             device=self.device,
         )
 
-        self.kinematics: Optional[Kinematics] = None
+        self.kinematics: Kinematics | None = None
 
     def _initialize_geometry_cache(self) -> None:
         """Validate and cache immutable section data on the compute device."""
@@ -192,7 +192,7 @@ class Propeller:
 
     def section_areas(self) -> None:
         """Calculate airfoil cross-sectional areas with the shoelace formula."""
-        areas: List[float] = []
+        areas: list[float] = []
         for idx, coords in enumerate(self.geometry["airfoil"]):
             x = coords[:, 0]
             y = coords[:, 1]
@@ -204,7 +204,7 @@ class Propeller:
 
     def calculate_boat_tail_angle(self) -> None:
         """Calculate trailing-edge boat-tail angle for each airfoil section."""
-        angles: List[float] = []
+        angles: list[float] = []
         for coords in self.geometry["airfoil"]:
             leading_edge_index = np.argmin(coords[:, 0])
             upper = coords[: leading_edge_index + 1]
