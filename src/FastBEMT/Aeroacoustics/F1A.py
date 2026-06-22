@@ -146,9 +146,10 @@ class F1A:
 
             kinematic_geometry = {
                 "r": direct_geometry["r"],
+                "chord": direct_geometry["chord"],
                 "twist": direct_geometry["twist"],
-                "com_shift_forward": direct_geometry["com_shift_forward"],
-                "com_shift_up": direct_geometry["com_shift_up"],
+                "sweep": direct_geometry["sweep"],
+                "rake": direct_geometry["rake"],
             }
             if kinematics is not None:
                 if not self._kinematics_matches(
@@ -206,13 +207,13 @@ class F1A:
                     device=self.device,
                 )
             )
-            self.com_shift_forward = torch.as_tensor(
-                direct_geometry["com_shift_forward"],
+            self.sweep = torch.as_tensor(
+                direct_geometry["sweep"],
                 dtype=self.dtype,
                 device=self.device,
             )
-            self.com_shift_up = torch.as_tensor(
-                direct_geometry["com_shift_up"],
+            self.rake = torch.as_tensor(
+                direct_geometry["rake"],
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -331,8 +332,8 @@ class F1A:
                 self.area = propeller.section_area
                 self.chord = propeller.section_chord
                 self.twist_rad = propeller.section_twist_rad
-                self.com_shift_forward = propeller.section_com_shift_forward
-                self.com_shift_up = propeller.section_com_shift_up
+                self.sweep = propeller.section_sweep
+                self.rake = propeller.section_rake
                 self.thickness_strength = propeller.f1a_thickness_strength
                 self.dipole_strength = propeller.f1a_dipole_strength
             else:
@@ -341,12 +342,8 @@ class F1A:
                 self.area = propeller.section_area[selected_sections]
                 self.chord = propeller.section_chord[selected_sections]
                 self.twist_rad = propeller.section_twist_rad[selected_sections]
-                self.com_shift_forward = propeller.section_com_shift_forward[
-                    selected_sections
-                ]
-                self.com_shift_up = propeller.section_com_shift_up[
-                    selected_sections
-                ]
+                self.sweep = propeller.section_sweep[selected_sections]
+                self.rake = propeller.section_rake[selected_sections]
                 self.thickness_strength = propeller.f1a_thickness_strength[
                     selected_sections
                 ]
@@ -670,8 +667,8 @@ class F1A:
             & np.isfinite(source["chord"])
             & np.isfinite(source["twist"])
             & np.isfinite(source["area"])
-            & np.isfinite(source["com_shift_forward"])
-            & np.isfinite(source["com_shift_up"])
+            & np.isfinite(source["sweep"])
+            & np.isfinite(source["rake"])
         )
         if np.count_nonzero(source_mask) < 2:
             raise ValueError(
@@ -708,8 +705,8 @@ class F1A:
             "chord",
             "twist",
             "area",
-            "com_shift_forward",
-            "com_shift_up",
+            "sweep",
+            "rake",
         ):
             source_values = np.asarray(source[name], dtype=np.float64)[source_mask]
             direct_geometry[name] = np.interp(

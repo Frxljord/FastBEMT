@@ -5,6 +5,7 @@ import pyfar as pf
 import torch
 
 from .Kinematics import Kinematics
+from .Utils.DataLoader import normalize_propeller_geometry
 from .Utils.Environment import Environment
 from .Utils.Simulation import Simulation
 
@@ -26,7 +27,7 @@ class Propeller:
         simulation: Simulation,
     ) -> None:
         """Initialize propeller geometry and cached section tensors."""
-        self.geometry = geometry
+        self.geometry = normalize_propeller_geometry(geometry)
         self.environment = environment
         self.simulation = simulation
         self.dtype = torch.float32
@@ -34,11 +35,8 @@ class Propeller:
         self.section_areas()
         self.calculate_boat_tail_angle()
 
-        # COM shift: positive in forward direction (+x), positive upward (+z).
-        self.com_shift_up: list[float] = [s[1] for s in self.geometry["COM_shift"]]
-        self.com_shift_forward: list[float] = [
-            -s[0] for s in self.geometry["COM_shift"]
-        ]
+        self.sweep = np.asarray(self.geometry["sweep"]).tolist()
+        self.rake = np.asarray(self.geometry["rake"]).tolist()
         self._initialize_geometry_cache()
 
         octave_freqs = pf.dsp.filter.fractional_octave_frequencies(
@@ -78,13 +76,13 @@ class Propeller:
                 dtype=np.float64,
                 copy=True,
             ),
-            "com_shift_forward": np.array(
-                self.com_shift_forward,
+            "sweep": np.array(
+                self.sweep,
                 dtype=np.float64,
                 copy=True,
             ),
-            "com_shift_up": np.array(
-                self.com_shift_up,
+            "rake": np.array(
+                self.rake,
                 dtype=np.float64,
                 copy=True,
             ),
@@ -116,8 +114,8 @@ class Propeller:
             & np.isfinite(section_arrays["chord"])
             & np.isfinite(section_arrays["twist"])
             & np.isfinite(section_arrays["area"])
-            & np.isfinite(section_arrays["com_shift_forward"])
-            & np.isfinite(section_arrays["com_shift_up"])
+            & np.isfinite(section_arrays["sweep"])
+            & np.isfinite(section_arrays["rake"])
         )
         self.bpm_geometry_mask = (
             self.f1a_geometry_mask
@@ -160,13 +158,13 @@ class Propeller:
             dtype=self.dtype,
             device=self.device,
         )
-        self.section_com_shift_forward = torch.tensor(
-            section_arrays["com_shift_forward"],
+        self.section_sweep = torch.tensor(
+            section_arrays["sweep"],
             dtype=self.dtype,
             device=self.device,
         )
-        self.section_com_shift_up = torch.tensor(
-            section_arrays["com_shift_up"],
+        self.section_rake = torch.tensor(
+            section_arrays["rake"],
             dtype=self.dtype,
             device=self.device,
         )
@@ -193,7 +191,7 @@ class Propeller:
     def section_areas(self) -> None:
         """Calculate airfoil cross-sectional areas with the shoelace formula."""
         areas: list[float] = []
-        for idx, coords in enumerate(self.geometry["airfoil"]):
+        for idx, coords in enumerate(self.geometry["airfoils"]):
             x = coords[:, 0]
             y = coords[:, 1]
             area_normalized = 0.5 * np.abs(
@@ -205,7 +203,7 @@ class Propeller:
     def calculate_boat_tail_angle(self) -> None:
         """Calculate trailing-edge boat-tail angle for each airfoil section."""
         angles: list[float] = []
-        for coords in self.geometry["airfoil"]:
+        for coords in self.geometry["airfoils"]:
             leading_edge_index = np.argmin(coords[:, 0])
             upper = coords[: leading_edge_index + 1]
             lower = coords[leading_edge_index:]

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 LevelArray = np.ndarray | torch.Tensor
 FigureSize = tuple[float, float]
+ACOUSTIC_MAP_MIN_DB = -80.0
 
 
 class Plotter:
@@ -246,7 +247,7 @@ class Plotter:
             shrink=1,
             aspect=10,
             pad=0.05,
-            ticks=np.arange(0.0, image.norm.vmax + 10.0, 10.0),
+            ticks=np.arange(image.norm.vmin, image.norm.vmax + 10.0, 10.0),
         )
         colorbar.set_label(
             "OASPL [dB(A)]" if metric == "oaspl" else "OSPL [dB]",
@@ -274,23 +275,28 @@ class Plotter:
             10.0,
             np.ceil(max(float(np.nanmax(values)) for values in maps) / 10.0) * 10.0,
         )
+        vmin = max(
+            ACOUSTIC_MAP_MIN_DB,
+            np.floor(min(float(np.nanmin(values)) for values in maps) / 10.0) * 10.0,
+        )
         x_range = np.linspace(-domain_size, domain_size, grid_size)
         y_count = 2 * grid_size - 1 if mirror else grid_size
         y_range = np.linspace(-domain_size, domain_size, y_count)
         x_plot, y_plot = np.meshgrid(x_range, y_range)
-        smooth_levels = np.linspace(0.0, vmax, 1000)
+        smooth_levels = np.linspace(vmin, vmax, 1000)
         disk_angles = np.linspace(-np.pi, np.pi, 100)
         disk_radius = 10.0 * self.propeller.geometry["tip_radius"]
         image = None
 
         for axis, title, level_map in zip(axes.flat, titles, maps):
-            axis.contourf(y_plot, x_plot, level_map, levels=smooth_levels, cmap=cmap)
+            display_map = np.maximum(level_map, vmin)
+            axis.contourf(y_plot, x_plot, display_map, levels=smooth_levels, cmap=cmap)
             image = axis.pcolormesh(
                 y_plot,
                 x_plot,
-                level_map,
+                display_map,
                 cmap=cmap,
-                vmin=0.0,
+                vmin=vmin,
                 vmax=vmax,
                 shading="gouraud",
                 zorder=1,
@@ -462,7 +468,7 @@ class Plotter:
         radius = np.asarray(geom["r"])
         chord = np.asarray(geom["chord"])
         twist = np.radians(np.asarray(geom["twist"]))
-        airfoils = geom["airfoil"]
+        airfoils = geom["airfoils"]
         sigma_total = self._combined_stress(sigma_c, sigma_b)
 
         n_sections = len(radius)
@@ -533,16 +539,8 @@ class Plotter:
         x_local = x_local - x_com
         z_local = z_local - z_com
 
-        if hasattr(self.propeller, "com_shift_forward"):
-            x_local = (
-                x_local
-                + self.propeller.com_shift_forward[section_index] * chord[section_index]
-            )
-        if hasattr(self.propeller, "com_shift_up"):
-            z_local = (
-                z_local
-                + self.propeller.com_shift_up[section_index] * chord[section_index]
-            )
+        x_local = x_local - self.propeller.sweep[section_index] * chord[section_index]
+        z_local = z_local + self.propeller.rake[section_index] * chord[section_index]
 
         cos_twist = np.cos(twist[section_index])
         sin_twist = np.sin(twist[section_index])

@@ -29,8 +29,8 @@ class Kinematics:
             revolutions and timesteps-per-revolution settings.
         section_geometry: Optional one-dimensional section data overriding the
             propeller section grid. Expected keys are ``"r"`` plus either
-            ``"twist_rad"`` or ``"twist"``, ``"com_shift_forward"``, and
-            ``"com_shift_up"``.
+            ``"twist_rad"`` or ``"twist"``, ``"chord"``, ``"sweep"``, and
+            ``"rake"``.
     """
 
     def __init__(
@@ -103,13 +103,18 @@ class Kinematics:
 
         if section_geometry is None:
             self.radial_positions = propeller.section_radius
+            self.chord = propeller.section_chord
             self.twist_rad = propeller.section_twist_rad
-            self.com_shift_forward = propeller.section_com_shift_forward
-            self.com_shift_up = propeller.section_com_shift_up
+            self.sweep = propeller.section_sweep
+            self.rake = propeller.section_rake
         else:
             self.radial_positions = self._section_geometry_tensor(
                 section_geometry,
                 "r",
+            )
+            self.chord = self._section_geometry_tensor(
+                section_geometry,
+                "chord",
             )
             if "twist_rad" in section_geometry:
                 self.twist_rad = self._section_geometry_tensor(
@@ -124,20 +129,21 @@ class Kinematics:
                 raise ValueError(
                     "section_geometry must contain 'twist_rad' or 'twist'."
                 )
-            self.com_shift_forward = self._section_geometry_tensor(
+            self.sweep = self._section_geometry_tensor(
                 section_geometry,
-                "com_shift_forward",
+                "sweep",
             )
-            self.com_shift_up = self._section_geometry_tensor(
+            self.rake = self._section_geometry_tensor(
                 section_geometry,
-                "com_shift_up",
+                "rake",
             )
 
             expected_shape = self.radial_positions.shape
             for name, values in (
+                ("chord", self.chord),
                 ("twist", self.twist_rad),
-                ("com_shift_forward", self.com_shift_forward),
-                ("com_shift_up", self.com_shift_up),
+                ("sweep", self.sweep),
+                ("rake", self.rake),
             ):
                 if values.shape != expected_shape:
                     raise ValueError(
@@ -301,31 +307,31 @@ class Kinematics:
             dim=-2,
         )
 
-        self.airfoil_shift_blade_frame = torch.stack(
+        self.airfoil_origin_blade_frame = torch.stack(
             [
-                self.com_shift_up,
+                self.rake,
                 self.radial_positions,
-                self.com_shift_forward,
+                -self.sweep,
             ],
             dim=-1,
         )
-        # Sections are currently represented at the airfoil-frame origin.
         self.section_position_airfoil_frame = torch.stack(
             [
-                torch.zeros_like(self.radial_positions),
+                0.75 * self.chord,
                 torch.zeros_like(self.radial_positions),
                 torch.zeros_like(self.radial_positions),
             ],
             dim=-1,
         )
-        self.section_position_blade_frame = (
+        self.airfoil_shift_blade_frame = (
             torch.einsum(
                 "sij,sj->si",
                 self.airfoil_to_blade_rotation_matrix,
                 self.section_position_airfoil_frame,
             )
-            + self.airfoil_shift_blade_frame
+            + self.airfoil_origin_blade_frame
         )
+        self.section_position_blade_frame = self.airfoil_shift_blade_frame
         self.section_position_global_frame = torch.einsum(
             "tbij,sj->tbsi",
             self.blade_to_global_rotation_matrix,

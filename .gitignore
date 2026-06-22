@@ -21,3 +21,4 @@ AcousticAnalogies.jl-main
 BroadbandBPM.jl-master
 Validation/f1a_equivalence
 Validation/bpm_10x7e_broadbandbpm
+Examples/animate_kinematics_frames.py

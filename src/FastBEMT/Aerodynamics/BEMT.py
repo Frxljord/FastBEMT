@@ -137,7 +137,7 @@ class BEMT:
 
         self._airfoils = [
             asb.Airfoil(coordinates=coordinates)
-            for coordinates in self.propeller.geometry["airfoil"]
+            for coordinates in self.propeller.geometry["airfoils"]
         ]
         self.solution_data = self._solve()
         self.performance = self._integrate_performance()
@@ -198,25 +198,39 @@ class BEMT:
         """Create fresh section solvers for the active RPM."""
         geometry = self.propeller.geometry
         omega = 2.0 * np.pi * rpm / 60.0
+        prop_radius = float(geometry["tip_radius"])
+        hub_radius = float(geometry["hub_radius"])
         sections: list[SectionForces | None] = []
 
         for index, airfoil in enumerate(self._airfoils):
+            section_radius = float(geometry["r"][index])
             section_width = float(geometry["dr"][index])
-            if section_width <= 0.0:
+            section_chord = float(geometry["chord"][index])
+            section_twist = float(geometry["twist"][index])
+            if (
+                not np.isfinite(section_radius)
+                or abs(section_radius) <= 1.0e-12
+                or section_radius >= prop_radius - 1.0e-12
+                or not np.isfinite(section_width)
+                or section_width <= 0.0
+                or not np.isfinite(section_chord)
+                or section_chord <= 0.0
+                or not np.isfinite(section_twist)
+            ):
                 sections.append(None)
                 continue
 
             sections.append(
                 SectionForces(
                     airfoil=airfoil,
-                    r=float(geometry["r"][index]),
+                    r=section_radius,
                     dr=section_width,
-                    chord=float(geometry["chord"][index]),
-                    theta=float(np.radians(geometry["twist"][index])),
+                    chord=section_chord,
+                    theta=float(np.radians(section_twist)),
                     environment=self.environment,
                     omega=omega,
-                    prop_radius=float(geometry["tip_radius"]),
-                    hub_radius=float(geometry["hub_radius"]),
+                    prop_radius=prop_radius,
+                    hub_radius=hub_radius,
                     n_blades=int(geometry["n_blades"]),
                 )
             )

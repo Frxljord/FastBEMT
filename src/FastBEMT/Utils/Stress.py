@@ -48,7 +48,7 @@ class BladeStressCalculator:
         r = np.asarray(self.geometry["r"])
         d_t = np.asarray(d_t_list)
         d_q = np.asarray(d_q_list)
-        n_sections = len(self.geometry["airfoil"])
+        n_sections = len(self.geometry["airfoils"])
 
         drag_like_load = np.divide(d_q, r, out=np.zeros_like(d_q), where=r != 0)
         thrust_cumulative = np.cumsum(d_t[::-1])[::-1]
@@ -70,7 +70,7 @@ class BladeStressCalculator:
 
         stresses = []
         for section_index in range(n_sections):
-            airfoil = self.geometry["airfoil"][section_index]
+            airfoil = self.geometry["airfoils"][section_index]
             chord = self.geometry["chord"][section_index]
             x_coords = airfoil[:, 0] * chord
             z_coords = airfoil[:, 1] * chord
