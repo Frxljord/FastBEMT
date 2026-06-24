@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 import torch
 
 from ._common import (
@@ -41,22 +40,15 @@ class F1A:
             required for multi-point BEMT analyses or direct loadings.
         v_inf: BEMT freestream velocity. Required with ``rpm`` when
             selecting from a multi-point BEMT analysis.
-        loadings: Optional path to a ``.pt`` file containing direct global-frame
-            force per unit span with shape ``(S, 3)`` or ``(T, B, S, 3)``.
-            Direct loading files are interpreted as forces on the blade, so
-            F1A flips their sign before acoustic use.
-        source_times: CSV path containing source emission timestamps for direct
-            loadings. Required whenever ``loadings`` is provided.
+        loadings: Optional path to a ``.pt`` dictionary containing direct
+            global-frame force per unit span and section geometry. The required
+            format is ``{"loadings": tensor, "sections": dict}``, where
+            ``loadings`` has shape ``(T, B, S, 4)`` with source time in channel
+            0 and force components in channels 1:4, and ``sections`` contains
+            ``r_mid_m`` and ``dr_m``.
         last_rotations: Optional number of final rotor revolutions to keep from
             direct loading files. Use this to discard startup transients before
             F1A builds kinematics and differentiates the load history.
-        loading_geometry: Section dictionary or CSV path for direct loadings.
-            It must provide ``"r"`` and ``"dr"`` arrays matching the loading
-            section count. CSV files may use columns such as ``r_mid_m`` and
-            ``dr_m``. F1A overwrites its acoustic section radii and widths with
-            these values and resamples chord, twist, COM shift, and
-            cross-sectional area from the propeller geometry at the supplied
-            radii.
     Observer-dependent source tensors use dimension order
     ``(O, T, B, S, ...)``.
     """
@@ -70,9 +62,7 @@ class F1A:
         rpm: float | None = None,
         v_inf: float | None = None,
         loadings: PathInput | None = None,
-        source_times: PathInput | None = None,
         last_rotations: float | None = None,
-        loading_geometry: Mapping[str, ArrayLike] | PathInput | None = None,
     ) -> None:
         self.propeller = propeller
         self.environment = propeller.environment
@@ -82,8 +72,6 @@ class F1A:
         self.rho = propeller.rho_tensor
         self.a_inf = propeller.a_inf_tensor
         self.loadings_path: Path | None = None
-        self.source_times_path: Path | None = None
-        self.loading_geometry_path: Path | None = None
 
         from ..Aerodynamics.BEMT import BEMT
 
@@ -118,16 +106,10 @@ class F1A:
                 name="loadings",
                 suffix=".pt",
             )
-            self.source_times_path = self._required_file_path(
-                source_times,
-                name="source_times",
-                suffix=".csv",
+            direct_loadings, direct_source_times, direct_sections = (
+                self._load_direct_loadings(self.loadings_path)
             )
-            direct_source_times = self._load_source_times(
-                self.source_times_path
-            )
-            direct_geometry = self._direct_loading_geometry(loading_geometry)
-            direct_loadings = self._load_direct_loadings(self.loadings_path)
+            direct_geometry = self._direct_loading_geometry(direct_sections)
             direct_loadings, direct_source_times = (
                 self._trim_direct_loading_history(
                     direct_loadings,
@@ -224,14 +206,6 @@ class F1A:
         else:
             if not isinstance(bemt, BEMT):
                 raise TypeError("bemt must be a FastBEMT Aerodynamics.BEMT object.")
-            if source_times is not None:
-                raise ValueError(
-                    "source_times is only supported for direct F1A loadings."
-                )
-            if loading_geometry is not None:
-                raise ValueError(
-                    "loading_geometry is only supported for direct F1A loadings."
-                )
             if last_rotations is not None:
                 raise ValueError(
                     "last_rotations is only supported for direct F1A loadings."
@@ -459,53 +433,92 @@ class F1A:
             raise FileNotFoundError(f"{name} file not found: {path}")
         return path
 
-    def _load_direct_loadings(self, path: Path) -> torch.Tensor:
-        """Load direct F1A loadings from a ``.pt`` file."""
-        loaded = torch.load(path, map_location=self.device)
-        if isinstance(loaded, dict):
-            if "loadings" in loaded:
-                loaded = loaded["loadings"]
-            else:
-                tensor_items = [
-                    value
-                    for value in loaded.values()
-                    if isinstance(value, (torch.Tensor, np.ndarray))
-                ]
-                if len(tensor_items) != 1:
-                    raise ValueError(
-                        "Direct F1A loading files that contain a dictionary "
-                        "must have a 'loadings' tensor or exactly one tensor "
-                        f"value; got keys {list(loaded.keys())}."
-                    )
-                loaded = tensor_items[0]
-
-        if not isinstance(loaded, (torch.Tensor, np.ndarray)):
+    def _load_direct_loadings(
+        self,
+        path: Path,
+    ) -> tuple[torch.Tensor, torch.Tensor, Mapping[str, ArrayLike]]:
+        """Load the direct F1A dictionary format from ``.pt``."""
+        loaded = torch.load(path, map_location="cpu")
+        if not isinstance(loaded, Mapping):
             raise TypeError(
-                "Direct F1A loading files must contain a torch.Tensor or "
-                f"numpy.ndarray; got {type(loaded).__name__}."
+                "Direct F1A loading files must contain a dictionary with "
+                "'loadings' and 'sections' entries; got "
+                f"{type(loaded).__name__}."
             )
-
-        return torch.as_tensor(
-            loaded,
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-    def _load_source_times(self, path: Path) -> torch.Tensor:
-        """Load a one-dimensional source-time vector from a CSV table."""
-        series = self._source_time_series_from_csv(path)
-        source_times = pd.to_numeric(series, errors="coerce")
-        if source_times.isna().any():
+        missing_keys = [
+            key
+            for key in ("loadings", "sections")
+            if key not in loaded
+        ]
+        if missing_keys:
             raise ValueError(
-                f"Timestamp CSV '{path}' contains non-numeric values in "
-                f"column '{series.name}'."
+                "Direct F1A loading dictionaries must contain "
+                f"{', '.join(missing_keys)}."
             )
 
-        return torch.as_tensor(
-            source_times.to_numpy(dtype=np.float64),
+        loaded_loadings = loaded["loadings"]
+        if not isinstance(loaded_loadings, (torch.Tensor, np.ndarray)):
+            raise TypeError(
+                "Direct F1A loading dictionary entry 'loadings' must be a "
+                f"torch.Tensor or numpy.ndarray; got {type(loaded_loadings).__name__}."
+            )
+        loadings = torch.as_tensor(
+            loaded_loadings,
             dtype=self.dtype,
             device=self.device,
         )
+        loadings, source_times = self._split_direct_loading_table(
+            loadings,
+            path,
+        )
+        sections = loaded["sections"]
+        if not isinstance(sections, Mapping):
+            raise TypeError(
+                "Direct F1A loading dictionary entry 'sections' must be a "
+                f"dictionary; got {type(sections).__name__}."
+            )
+        return loadings, source_times, sections
+
+    def _split_direct_loading_table(
+        self,
+        loadings: torch.Tensor,
+        path: Path,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split ``(T, B, S, 4)`` into source times and force channels."""
+        if loadings.ndim != 4 or loadings.shape[-1] != 4:
+            raise ValueError(
+                "Direct F1A loading dictionary entry 'loadings' must have "
+                f"shape (T, B, S, 4); got {tuple(loadings.shape)} in '{path}'."
+            )
+        source_times = loadings[..., 0][:, 0, 0]
+        if not self._is_broadcast_source_time_channel(
+            loadings[..., 0],
+            source_times,
+        ):
+            raise ValueError(
+                "Direct F1A loading dictionary entry 'loadings' must store "
+                "source time in channel 0, broadcast over blade and section."
+            )
+        return (
+            loadings[..., 1:4].contiguous(),
+            source_times.contiguous(),
+        )
+
+    def _is_broadcast_source_time_channel(
+        self,
+        channel: torch.Tensor,
+        candidate: torch.Tensor,
+    ) -> bool:
+        if candidate.ndim != 1 or candidate.numel() == 0:
+            return False
+        if not bool(torch.isfinite(candidate).all().item()):
+            return False
+        if candidate.numel() > 1 and not bool(
+            torch.all(candidate[1:] > candidate[:-1]).item()
+        ):
+            return False
+        reference = candidate[:, None, None].expand_as(channel)
+        return bool(torch.allclose(channel, reference, rtol=1.0e-6, atol=1.0e-8))
 
     def _trim_direct_loading_history(
         self,
@@ -551,61 +564,6 @@ class F1A:
             loadings = loadings[keep, ...].contiguous()
         return loadings, trimmed_times
 
-    def _source_time_series_from_csv(self, path: Path) -> pd.Series:
-        """Select the timestamp column from a CSV file."""
-        table = pd.read_csv(path)
-        if table.shape[1] == 0:
-            raise ValueError(f"Timestamp CSV '{path}' has no columns.")
-
-        if table.shape[1] == 1 and self._looks_numeric(table.columns[0]):
-            table = pd.read_csv(path, header=None)
-            series = table.iloc[:, 0]
-            series.name = "time"
-            return series
-
-        preferred_columns = {
-            "t",
-            "time",
-            "times",
-            "time_s",
-            "time_sec",
-            "time_seconds",
-            "source_time",
-            "source_times",
-            "source_time_s",
-            "timestamp",
-            "timestamps",
-            "seconds",
-        }
-        for column in table.columns:
-            normalized = str(column).strip().lower().replace(" ", "_")
-            if normalized in preferred_columns:
-                return table[column]
-
-        if table.shape[1] == 1:
-            return table.iloc[:, 0]
-
-        numeric_columns = []
-        for column in table.columns:
-            converted = pd.to_numeric(table[column], errors="coerce")
-            if not converted.empty and not converted.isna().any():
-                numeric_columns.append(column)
-        if len(numeric_columns) == 1:
-            return table[numeric_columns[0]]
-
-        raise ValueError(
-            f"Timestamp CSV '{path}' must contain a recognized timestamp "
-            "column such as 'time_s', 'time', 't', or a single numeric column."
-        )
-
-    @staticmethod
-    def _looks_numeric(value: object) -> bool:
-        try:
-            float(value)
-        except (TypeError, ValueError):
-            return False
-        return True
-
     def _geometry_vector(
         self,
         geometry: Mapping[str, ArrayLike],
@@ -613,52 +571,35 @@ class F1A:
     ) -> np.ndarray:
         """Return a one-dimensional finite geometry vector."""
         if name not in geometry:
-            raise ValueError(f"loading_geometry must contain '{name}'.")
+            raise ValueError(
+                "Direct F1A loading dictionary entry 'sections' must contain "
+                f"'{name}'."
+            )
         values = np.asarray(geometry[name], dtype=np.float64)
         if values.ndim != 1:
-            raise ValueError(f"loading_geometry['{name}'] must be one-dimensional.")
+            raise ValueError(f"sections['{name}'] must be one-dimensional.")
         if values.size == 0:
-            raise ValueError(f"loading_geometry['{name}'] must not be empty.")
+            raise ValueError(f"sections['{name}'] must not be empty.")
         if not np.all(np.isfinite(values)):
-            raise ValueError(f"loading_geometry['{name}'] must be finite.")
+            raise ValueError(f"sections['{name}'] must be finite.")
         return values
 
     def _direct_loading_geometry(
         self,
-        loading_geometry: Mapping[str, ArrayLike] | PathInput | None,
+        sections: Mapping[str, ArrayLike],
     ) -> dict[str, np.ndarray]:
-        """Build direct-loading section geometry on the supplied radial grid."""
-        if loading_geometry is None:
-            raise ValueError(
-                "loading_geometry with 'r' and 'dr', or a loading geometry "
-                "CSV path, is required for direct F1A loadings."
-            )
-        if isinstance(loading_geometry, (str, PathLike)):
-            self.loading_geometry_path = self._required_file_path(
-                loading_geometry,
-                name="loading_geometry",
-                suffix=".csv",
-            )
-            loading_geometry = self._load_loading_geometry_csv(
-                self.loading_geometry_path
-            )
-        if not isinstance(loading_geometry, Mapping):
-            raise TypeError(
-                "loading_geometry must be a dictionary-like object or a path "
-                "to a .csv file."
-            )
-
-        r = self._geometry_vector(loading_geometry, "r")
-        dr = self._geometry_vector(loading_geometry, "dr")
+        """Build direct-loading section geometry from embedded section data."""
+        r = self._geometry_vector(sections, "r_mid_m")
+        dr = self._geometry_vector(sections, "dr_m")
         if dr.shape != r.shape:
             raise ValueError(
-                "loading_geometry['dr'] must have the same shape as "
-                f"loading_geometry['r'] {r.shape}; got {dr.shape}."
+                "sections['dr_m'] must have the same shape as "
+                f"sections['r_mid_m'] {r.shape}; got {dr.shape}."
             )
         if np.any(np.abs(r) <= 1.0e-12):
-            raise ValueError("loading_geometry['r'] must not contain zero radii.")
+            raise ValueError("sections['r_mid_m'] must not contain zero radii.")
         if np.any(dr <= 0.0):
-            raise ValueError("loading_geometry['dr'] must be greater than zero.")
+            raise ValueError("sections['dr_m'] must be greater than zero.")
 
         source = self.propeller.section_geometry_np
         source_r = np.asarray(source["r"], dtype=np.float64)
@@ -693,7 +634,7 @@ class F1A:
             or np.max(r) > source_r_sorted[-1] + radial_tolerance
         ):
             raise ValueError(
-                "loading_geometry['r'] must lie inside the propeller radial "
+                "sections['r_mid_m'] must lie inside the propeller radial "
                 f"range [{source_r_sorted[0]:.9g}, {source_r_sorted[-1]:.9g}]."
             )
 
@@ -716,95 +657,6 @@ class F1A:
             )
         return direct_geometry
 
-    def _load_loading_geometry_csv(self, path: Path) -> dict[str, np.ndarray]:
-        """Load direct-loading section radii and widths from a CSV table."""
-        table = pd.read_csv(path)
-        if table.shape[1] == 0:
-            raise ValueError(f"Loading geometry CSV '{path}' has no columns.")
-
-        r_column = self._csv_column_by_alias(
-            table,
-            path,
-            purpose="section radius",
-            aliases=(
-                "r_mid_m",
-                "r_m",
-                "r",
-                "radius_m",
-                "radius",
-                "radial_position_m",
-                "radial_position",
-                "section_radius_m",
-                "section_radius",
-                "element_radius_m",
-                "element_radius",
-            ),
-        )
-        dr_column = self._csv_column_by_alias(
-            table,
-            path,
-            purpose="section width",
-            aliases=(
-                "dr_m",
-                "dr",
-                "width_m",
-                "width",
-                "section_width_m",
-                "section_width",
-                "delta_r_m",
-                "delta_r",
-                "span_width_m",
-                "span_width",
-                "element_width_m",
-                "element_width",
-            ),
-        )
-        return {
-            "r": self._numeric_csv_column(table, path, r_column),
-            "dr": self._numeric_csv_column(table, path, dr_column),
-        }
-
-    def _csv_column_by_alias(
-        self,
-        table: pd.DataFrame,
-        path: Path,
-        *,
-        purpose: str,
-        aliases: tuple[str, ...],
-    ) -> str:
-        normalized_aliases = {
-            self._normalize_csv_column_name(alias)
-            for alias in aliases
-        }
-        for column in table.columns:
-            if self._normalize_csv_column_name(column) in normalized_aliases:
-                return column
-        raise ValueError(
-            f"Loading geometry CSV '{path}' must contain a {purpose} column. "
-            f"Recognized names include {', '.join(aliases[:4])}."
-        )
-
-    @staticmethod
-    def _normalize_csv_column_name(value: object) -> str:
-        normalized = str(value).strip().lower()
-        for old, new in ((" ", "_"), ("-", "_"), (".", "_")):
-            normalized = normalized.replace(old, new)
-        return normalized
-
-    @staticmethod
-    def _numeric_csv_column(
-        table: pd.DataFrame,
-        path: Path,
-        column: str,
-    ) -> np.ndarray:
-        values = pd.to_numeric(table[column], errors="coerce")
-        if values.isna().any():
-            raise ValueError(
-                f"Loading geometry CSV '{path}' contains non-numeric values "
-                f"in column '{column}'."
-            )
-        return values.to_numpy(dtype=np.float64)
-
     def _select_direct_load_sections(
         self,
         loadings: torch.Tensor,
@@ -813,17 +665,16 @@ class F1A:
     ) -> tuple[torch.Tensor, dict[str, np.ndarray], np.ndarray]:
         """Drop invalid direct-loading sections and align geometry to loads."""
         section_count = int(geometry["r"].shape[0])
-        steady_shape = (section_count, 3)
         unsteady_shape = (
             int(source_times.numel()),
             self.propeller.n_blades,
             section_count,
             3,
         )
-        if tuple(loadings.shape) not in (steady_shape, unsteady_shape):
+        if tuple(loadings.shape) != unsteady_shape:
             raise ValueError(
                 "Direct F1A loadings must have shape "
-                f"{steady_shape} or {unsteady_shape}; "
+                f"{unsteady_shape} after splitting time channel 0; "
                 f"got {tuple(loadings.shape)}."
             )
 
@@ -831,12 +682,9 @@ class F1A:
         for values in geometry.values():
             section_mask &= np.isfinite(values)
 
-        if loadings.ndim == 2:
-            finite_load_sections = torch.isfinite(loadings).all(dim=1).cpu().numpy()
-        else:
-            finite_load_sections = (
-                torch.isfinite(loadings).all(dim=(0, 1, 3)).cpu().numpy()
-            )
+        finite_load_sections = (
+            torch.isfinite(loadings).all(dim=(0, 1, 3)).cpu().numpy()
+        )
         section_mask &= finite_load_sections
         if not np.any(section_mask):
             raise ValueError("No valid blade sections available for direct F1A.")
@@ -846,10 +694,7 @@ class F1A:
             dtype=torch.bool,
             device=self.device,
         )
-        if loadings.ndim == 2:
-            selected_loadings = loadings[section_mask_tensor, :]
-        else:
-            selected_loadings = loadings[:, :, section_mask_tensor, :]
+        selected_loadings = loadings[:, :, section_mask_tensor, :]
         selected_geometry = {
             name: values[section_mask]
             for name, values in geometry.items()
