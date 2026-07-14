@@ -1,11 +1,13 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
 build/
 dist/
 wheels/
 *.egg-info
-*.ruff_cache
 .tools
 
 # Virtual environments
@@ -16,7 +18,6 @@ wheels/
 
 Datasets
 Figures
-src/old
 AcousticAnalogies.jl-main
 BroadbandBPM.jl-master
 Validation/f1a_equivalence

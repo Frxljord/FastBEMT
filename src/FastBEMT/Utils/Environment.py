@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,11 +20,3 @@ class Environment:
     rho: float = 1.225
     mu: float = 1.81e-5
     p_ref: float = 2e-5
-
-    def __post_init__(self) -> None:
-        """Validate physical properties."""
-        for name in ("a_inf", "rho", "mu", "p_ref"):
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be a finite value greater than zero.")
-            object.__setattr__(self, name, value)

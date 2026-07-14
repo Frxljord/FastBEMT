@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from numbers import Real
 import warnings
 from typing import Final, NamedTuple, Sequence, TYPE_CHECKING
 
@@ -11,7 +10,6 @@ import numpy as np
 import pandas as pd
 
 from .Section import SectionForces
-from ..Utils.Environment import Environment
 
 if TYPE_CHECKING:
     from ..Propeller import Propeller
@@ -22,20 +20,20 @@ SOLUTION_COLUMNS: Final[tuple[str, ...]] = (
     "dr",
     "chord",
     "twist",
-    "phi",
-    "alpha",
-    "Cl",
-    "Cd",
-    "u",
-    "a_prime",
-    "d_t",
-    "d_q",
-    "F",
-    "W",
-    "Re",
-    "Ma",
-    "ds",
-    "dp",
+    "inflow_angle_deg",
+    "angle_of_attack_deg",
+    "normal_force_coefficient",
+    "tangential_force_coefficient",
+    "induced_velocity",
+    "tangential_induction_factor",
+    "section_thrust",
+    "section_torque",
+    "prandtl_loss_factor",
+    "relative_velocity",
+    "reynolds_number",
+    "mach_number",
+    "upper_displacement_thickness",
+    "lower_displacement_thickness",
 )
 
 PERFORMANCE_COLUMNS: Final[tuple[str, ...]] = (
@@ -46,7 +44,7 @@ PERFORMANCE_COLUMNS: Final[tuple[str, ...]] = (
     "figure_of_merit",
 )
 
-OperatingInput = Real | Sequence[float] | np.ndarray
+OperatingInput = float | Sequence[float] | np.ndarray
 
 
 class BEMTPerformance(NamedTuple):
@@ -69,7 +67,6 @@ class BEMT:
 
     Args:
         propeller: Propeller containing the blade geometry.
-        environment: Fluid and acoustic reference properties.
         rpm: One RPM value or a one-dimensional sequence of RPM values.
         v_inf: One freestream velocity or a one-dimensional sequence of
             freestream velocities. Each value is applied uniformly to all
@@ -83,45 +80,29 @@ class BEMT:
     def __init__(
         self,
         propeller: Propeller,
-        environment: Environment,
         rpm: OperatingInput,
         v_inf: OperatingInput | None = None,
         *,
         J: OperatingInput | None = None,
     ) -> None:
         self.propeller = propeller
-        self.environment = environment
-        if environment is not propeller.environment:
-            raise ValueError(
-                "BEMT environment must be the environment stored by the propeller."
-            )
+        self.environment = propeller.environment
 
-        self.rpm = self._normalize_operating_values(
-            rpm,
-            name="rpm",
-            require_positive=True,
-        )
-        self.omega = 2.0 * np.pi * self.rpm / 60.0
+        self.rpm = self._normalize_operating_values(rpm)
 
         if (v_inf is None) == (J is None):
             raise ValueError("Exactly one of v_inf and J must be provided.")
 
         if J is None:
             self.J: np.ndarray | None = None
-            self.v_inf = self._normalize_operating_values(v_inf, name="v_inf")
+            self.v_inf = self._normalize_operating_values(v_inf)
             self.operating_points = pd.MultiIndex.from_product(
                 [self.rpm, self.v_inf],
                 names=["rpm", "v_inf"],
             )
         else:
-            self.J = self._normalize_operating_values(J, name="J")
+            self.J = self._normalize_operating_values(J)
             diameter = 2.0 * float(self.propeller.geometry["tip_radius"])
-            if not np.isfinite(diameter) or diameter <= 0.0:
-                raise ValueError(
-                    "Propeller diameter must be finite and greater than zero "
-                    "when J is provided."
-                )
-
             computed_v_inf = np.multiply.outer(
                 self.rpm / 60.0 * diameter,
                 self.J,
@@ -176,10 +157,6 @@ class BEMT:
             *(float(values[column]) for column in PERFORMANCE_COLUMNS)
         )
 
-    def compute_total_forces(self) -> pd.DataFrame:
-        """Return the performance table for all operating points."""
-        return self.performance
-
     def _solve(self) -> pd.DataFrame:
         """Solve all radial sections for every operating point."""
         case_frames: list[pd.DataFrame] = []
@@ -194,44 +171,35 @@ class BEMT:
             names=["rpm", "v_inf", "section"],
         )
 
-    def _build_sections(self, rpm: float) -> list[SectionForces | None]:
+    def _build_sections(self, rpm: float) -> list[tuple[int, SectionForces]]:
         """Create fresh section solvers for the active RPM."""
         geometry = self.propeller.geometry
         omega = 2.0 * np.pi * rpm / 60.0
-        prop_radius = float(geometry["tip_radius"])
+        tip_radius = float(geometry["tip_radius"])
         hub_radius = float(geometry["hub_radius"])
-        sections: list[SectionForces | None] = []
+        sections: list[tuple[int, SectionForces]] = []
 
-        for index, airfoil in enumerate(self._airfoils):
+        for index in np.flatnonzero(self.propeller.aerodynamic_section_mask):
+            airfoil = self._airfoils[index]
             section_radius = float(geometry["r"][index])
             section_width = float(geometry["dr"][index])
             section_chord = float(geometry["chord"][index])
             section_twist = float(geometry["twist"][index])
-            if (
-                not np.isfinite(section_radius)
-                or abs(section_radius) <= 1.0e-12
-                or section_radius >= prop_radius - 1.0e-12
-                or not np.isfinite(section_width)
-                or section_width <= 0.0
-                or not np.isfinite(section_chord)
-                or section_chord <= 0.0
-                or not np.isfinite(section_twist)
-            ):
-                sections.append(None)
-                continue
-
             sections.append(
-                SectionForces(
-                    airfoil=airfoil,
-                    r=section_radius,
-                    dr=section_width,
-                    chord=section_chord,
-                    theta=float(np.radians(section_twist)),
-                    environment=self.environment,
-                    omega=omega,
-                    prop_radius=prop_radius,
-                    hub_radius=hub_radius,
-                    n_blades=int(geometry["n_blades"]),
+                (
+                    int(index),
+                    SectionForces(
+                        airfoil=airfoil,
+                        r=section_radius,
+                        dr=section_width,
+                        chord=section_chord,
+                        theta=float(np.radians(section_twist)),
+                        environment=self.environment,
+                        omega=omega,
+                        tip_radius=tip_radius,
+                        hub_radius=hub_radius,
+                        n_blades=self.propeller.n_blades,
+                    ),
                 )
             )
 
@@ -239,23 +207,26 @@ class BEMT:
 
     def _solve_operating_point(
         self,
-        sections: list[SectionForces | None],
+        sections: list[tuple[int, SectionForces]],
         v_inf: float,
     ) -> pd.DataFrame:
         """Solve one operating point, warm-starting along the blade radius."""
-        rows: list[list[float]] = []
+        rows = [
+            self._empty_section_row(section_index)
+            for section_index in range(self.propeller.n_sections)
+        ]
         previous_phi: float | None = None
 
-        for section_index in range(len(sections)):
+        for section_index, section in sections:
             row = self._solve_section(
-                sections,
+                section,
                 section_index,
                 v_inf,
                 previous_phi,
             )
             if np.isfinite(row[4]):
                 previous_phi = float(np.radians(row[4]))
-            rows.append(row)
+            rows[section_index] = row
 
         frame = pd.DataFrame(rows, columns=SOLUTION_COLUMNS)
         frame.index = pd.RangeIndex(len(frame), name="section")
@@ -263,33 +234,29 @@ class BEMT:
 
     def _solve_section(
         self,
-        sections: list[SectionForces | None],
+        section: SectionForces,
         section_index: int,
         v_inf: float,
         previous_phi: float | None,
     ) -> list[float]:
         """Solve one radial section and format its output row."""
         geometry = self.propeller.geometry
-        section = sections[section_index]
-        if section is None:
-            return self._empty_section_row(section_index)
-
         try:
             (
-                phi,
-                d_t,
-                d_q,
-                alpha,
-                u,
-                a_prime,
-                c_l,
-                c_d,
-                loss_factor,
+                inflow_angle,
+                section_thrust,
+                section_torque,
+                angle_of_attack,
+                induced_velocity,
+                tangential_induction_factor,
+                normal_force_coefficient,
+                tangential_force_coefficient,
+                prandtl_loss_factor,
                 relative_velocity,
-                reynolds,
-                mach,
-                delta_star_upper,
-                delta_star_lower,
+                reynolds_number,
+                mach_number,
+                upper_displacement_thickness,
+                lower_displacement_thickness,
             ) = section.solve(v_inf, prev_phi=previous_phi)
         except RuntimeError as error:
             warnings.warn(
@@ -304,20 +271,20 @@ class BEMT:
             float(geometry["dr"][section_index]),
             float(geometry["chord"][section_index]),
             float(geometry["twist"][section_index]),
-            float(np.degrees(phi)),
-            float(alpha),
-            float(c_l),
-            float(c_d),
-            float(u),
-            float(a_prime),
-            float(d_t),
-            float(d_q),
-            float(loss_factor),
+            float(np.degrees(inflow_angle)),
+            float(angle_of_attack),
+            float(normal_force_coefficient),
+            float(tangential_force_coefficient),
+            float(induced_velocity),
+            float(tangential_induction_factor),
+            float(section_thrust),
+            float(section_torque),
+            float(prandtl_loss_factor),
             float(relative_velocity),
-            float(reynolds),
-            float(mach),
-            float(delta_star_upper),
-            float(delta_star_lower),
+            float(reynolds_number),
+            float(mach_number),
+            float(upper_displacement_thickness),
+            float(lower_displacement_thickness),
         ]
 
     def _empty_section_row(self, section_index: int) -> list[float]:
@@ -337,8 +304,8 @@ class BEMT:
 
         for rpm, v_inf in self.operating_points:
             case = self.solution_for(float(rpm), float(v_inf))
-            thrust = float(case["d_t"].sum())
-            torque = float(case["d_q"].sum())
+            thrust = float(case["section_thrust"].sum())
+            torque = float(case["section_torque"].sum())
             revolutions_per_second = float(rpm) / 60.0
             diameter = 2.0 * float(self.propeller.geometry["tip_radius"])
             density = float(self.environment.rho)
@@ -379,7 +346,7 @@ class BEMT:
         rpm: float | None,
         v_inf: float | None,
     ) -> tuple[float, float]:
-        """Validate and return one operating-point key."""
+        """Return one operating-point key."""
         if rpm is None and v_inf is None:
             if self.has_single_operating_point:
                 point = self.operating_points[0]
@@ -391,30 +358,11 @@ class BEMT:
         if rpm is None or v_inf is None:
             raise ValueError("rpm and v_inf must be provided together.")
 
-        operating_point = (float(rpm), float(v_inf))
-        if operating_point not in self.operating_points:
-            raise KeyError(f"Operating point {operating_point} was not computed.")
-        return operating_point
+        return float(rpm), float(v_inf)
 
     @staticmethod
     def _normalize_operating_values(
         values: OperatingInput,
-        *,
-        name: str,
-        require_positive: bool = False,
     ) -> np.ndarray:
-        """Return a validated one-dimensional array of operating values."""
-        if isinstance(values, Real):
-            normalized = np.array([float(values)], dtype=float)
-        else:
-            normalized = np.asarray(values, dtype=float)
-
-        if normalized.ndim != 1 or normalized.size == 0:
-            raise ValueError(f"{name} must be a scalar or a non-empty 1D array.")
-        if not np.all(np.isfinite(normalized)):
-            raise ValueError(f"{name} must contain only finite values.")
-        if require_positive and np.any(normalized <= 0.0):
-            raise ValueError(f"{name} values must be greater than zero.")
-        if np.unique(normalized).size != normalized.size:
-            raise ValueError(f"{name} values must be unique.")
-        return normalized
+        """Return operating values as a one-dimensional float array."""
+        return np.atleast_1d(np.asarray(values, dtype=float))

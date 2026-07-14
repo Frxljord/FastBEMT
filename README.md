@@ -1,154 +1,137 @@
 # FastBEMT
 
-A fast approximate BEMT (Blade Element Momentum Theory) solver for propeller aerodynamic/aeroacoustic analysis.
+FastBEMT is a compact Blade Element Momentum Theory solver with tonal-noise,
+broadband-noise, and blade-stress utilities. NumPy/Pandas handle the aerodynamic
+solution and PyTorch handles the kinematic and acoustic tensor calculations.
 
-## Overview
+## Models
 
-FastBEMT provides a high-performance Python package for analyzing propeller aerodynamics and acoustics using Blade Element Momentum Theory combined with acoustic source models. The package leverages PyTorch for GPU acceleration, enabling efficient computation of:
+- BEMT section loads and integrated thrust, torque, coefficients, and figure of
+  merit
+- Farassat 1A compact-source thickness and loading noise
+- Brooks-Pope-Marcolini broadband noise components
+- Centrifugal and bending stress on the supplied airfoil sections
 
-- **Aerodynamic Analysis**: Blade Element Momentum Theory (BEMT) calculations with Prandtl loss corrections
-- **Tonal Noise**: Farassat 1A compact source formulation for thickness and loading noise
-- **Broadband Noise**: Brooks-Pope-Marcolini (BPM) model for broadband noise prediction
-- **Structural Analysis**: Blade stress calculations under centrifugal and bending loads
-
-## Package Structure
-
-### src/FastBEMT
-
-#### [Propeller.py](src/FastBEMT/Propeller.py)
-Propeller data and aeroacoustic workflow. Handles:
-- Propeller geometry and environmental parameters
-- F1A acoustic source computation (monopole and dipole noise)
-- BPM broadband noise prediction in third-octave bands
-- Integration of results into output acoustic spectra and time histories
-
-#### [BEMT.py](src/FastBEMT/Aerodynamics/BEMT.py)
-Complete blade element momentum theory analysis. Handles:
-- Operating-point inputs including RPM and freestream velocity
-- BEMT aerodynamic solution across blade sections
-- Section-level result storage
-- Integrated thrust, torque, coefficients, and figure of merit
-
-#### [Section.py](src/FastBEMT/Aerodynamics/Section.py)
-Blade Element Momentum Theory solver for individual propeller sections. Provides:
-- Iterative solution of momentum and blade element equations
-- Prandtl tip and hub loss factor computations
-- Airfoil coefficient interpolation using pre-built aerosandbox.Airfoil objects
-- Mach and Reynolds number effects on aerodynamic coefficients
-- Local inflow angle and force distribution calculations
-
-#### [BPM.py](src/FastBEMT/BPM.py)
-Brooks-Pope-Marcolini broadband noise prediction model (PyTorch implementation). Implements five distinct noise sources:
-- **Turbulent Boundary Layer (TBL)**: Noise from turbulent pressure fluctuations on blade surfaces including suction-side, pressure-side, and separated-flow components
-- **Laminar Boundary Layer (LBL)**: Instability noise from laminar boundary layers at low frequencies
-- **Trailing Edge Bluntness (TEB)**: Scattering of incoming vorticity by blunt trailing edges
-- **Tip Vortex (TV)**: Noise from unsteady loading fluctuations induced by tip vortex
-- **Turbulence Ingestion (TI)**: Interaction of ingested turbulence with blade surfaces
-
-Features include GPU-accelerated Strouhal number and correction factor calculations, and third-octave band spectrum generation.
-
-#### [F1A.py](src/FastBEMT/F1A.py)
-Farassat 1A acoustic formulation (PyTorch implementation) for rotating sources. Handles:
-- Thickness (monopole) source noise from blade volume displacement
-- Loading (dipole) source noise from aerodynamic forces
-- Compact source approximation for efficient far-field calculation
-- GPU-accelerated tensor operations for time-domain pressure computation
-- Observer position and blade angle handling
-
-#### [Environment.py](src/FastBEMT/Utils/Environment.py)
-Immutable physical properties:
-- Air density, speed of sound, and dynamic viscosity
-- Acoustic reference pressure
-
-#### [Simulation.py](src/FastBEMT/Utils/Simulation.py)
-Numerical and temporal settings:
-- Number of simulated revolutions and samples per revolution
-- PyTorch device specification
-- RPM-dependent source times and observer time range
-
-#### [DataLoader.py](src/FastBEMT/DataLoader.py)
-Utility functions for data input/output:
-- Loading propeller geometry dictionaries from pickle files in the Datasets directory
-- Repository root detection and path management
-- Access to project figure output directories
-
-#### [Plotter.py](src/FastBEMT/Plotter.py)
-Visualization utilities for acoustic analysis results:
-- Time-domain pressure histories for monopole, dipole, and total pressure
-- Frequency-domain acoustic spectra (Sound Pressure Level)
-- Blade passing frequency harmonic indicators
-- Overall A-weighted Sound Pressure Level (OASPL) display
-- Multi-observer comparison plots
-
-#### [Stress.py](src/FastBEMT/Stress.py)
-Blade structural analysis tools computing:
-- Centrifugal stress distribution along blade span
-- Bending stress from thrust and torque loads
-- Moment of inertia calculations for arbitrary airfoil sections
-- Combined stress field at each blade section
-
-## Requirements
-
-- Python ≥ 3.12
-- PyTorch (for GPU acceleration)
-- NumPy, SciPy (numerical computing)
-- AeroSandbox (airfoil aerodynamics)
-- Plotly, Matplotlib (visualization)
-- scikit-learn (data processing)
-- And additional dependencies as specified in pyproject.toml
+The maintained package lives under [`src/FastBEMT`](src/FastBEMT). Historical
+implementations are available through Git history rather than being shipped in
+the Python package.
 
 ## Installation
 
-```bash
+FastBEMT requires Python 3.12 or newer.
+
+```powershell
 uv sync
-pip install -e .
 ```
 
-## BEMT Sweep
+Notebook and development tools are optional:
+
+```powershell
+uv sync --extra examples
+uv sync --extra dev
+```
+
+## Geometry contract
+
+`Propeller` consumes the current PropGen-style geometry mapping. The required
+entries are:
+
+- `airfoils`: `(sections, points, 2)` normalized airfoil coordinates
+- `r`, `chord`, `twist`, `sweep`, and `rake`: one value per section
+- `hub_radius`, `tip_radius`, and `n_blades`
+
+The bundled [`Data/10x7E.pkl`](Data/10x7E.pkl) is the reference contract.
+Radial widths, airfoil areas, boat-tail angles, active hub-to-tip sections, and
+device tensors are derived once by `Propeller`.
+
+## Aerodynamic analysis
 
 ```python
-from FastBEMT import BEMT, Environment, Propeller, Simulation
-
-environment = Environment(
-    a_inf=343.0,
-    rho=1.225,
-    mu=1.81e-5,
-    p_ref=2e-5,
+from FastBEMT import (
+    BEMT,
+    Environment,
+    Propeller,
+    Simulation,
+    load_propeller_geometry,
 )
+
+geometry = load_propeller_geometry("Data/10x7E.pkl")
+environment = Environment()
 simulation = Simulation(
-    revolutions=1,
-    num_obs_times_per_rev=100,
+    revolutions=2,
+    timesteps_per_revolution=100,
     device="cpu",
 )
+propeller = Propeller(geometry, environment, simulation)
 
-propeller = Propeller(
-    geometry=geometry,
-    environment=environment,
-    simulation=simulation,
-)
-bemt = BEMT(
-    propeller=propeller,
-    environment=environment,
-    rpm=[3000, 7000],
-    v_inf=[0.0, 10.0],
-)
+bemt = BEMT(propeller, rpm=7000, v_inf=0.0)
+print(bemt.performance_for())
+section_results = bemt.solution_for()
 ```
 
-This evaluates the four-point Cartesian product. Section results are stored in
-`bemt.solution_data` with a `(rpm, v_inf, section)` MultiIndex. Integrated
-results are stored in `bemt.performance` with a `(rpm, v_inf)` MultiIndex.
-Use `bemt.solution_for(7000, 0.0)` to select one radial solution.
+`rpm` and `v_inf` may also be one-dimensional arrays; FastBEMT evaluates their
+Cartesian product. Supply advance ratio `J` instead of `v_inf` when that is the
+natural operating-point input.
 
-Alternatively, specify advance ratio `J` instead of `v_inf`:
+Section result names include units or physical meaning where ambiguity would
+otherwise be likely, for example `inflow_angle_deg`, `section_thrust`,
+`relative_velocity`, and `reynolds_number`.
+
+## Aeroacoustics
 
 ```python
-bemt = BEMT(
-    propeller=propeller,
-    environment=environment,
-    rpm=[3000, 7000],
-    J=[0.4, 0.8],
+from FastBEMT import BPM, F1A
+from FastBEMT.Aeroacoustics import semicircular_observer_array
+
+observers = semicircular_observer_array(radius=2.0, n_points=19)
+one_revolution = 60.0 / 7000.0
+
+f1a = F1A(propeller, bemt)
+f1a.run(
+    observers,
+    observer_duration=one_revolution,
+    n_observer_times=100,
+)
+
+bpm = BPM(
+    propeller,
+    bemt,
+    turbulence_length_scale=0.01,
+    turbulence_intensity=5e-4,
+)
+bpm.run(
+    observers,
+    observer_duration=one_revolution,
+    n_observer_times=100,
 )
 ```
 
-For each RPM and advance-ratio pair, the freestream velocity is computed as
-`v_inf = J * (rpm / 60) * propeller_diameter`.
+F1A also accepts the current VPM `.pt` payload through `loadings=`. That payload
+contains a finite `(time, blade, section, 4)` tensor with source time in channel
+zero and global-frame force per unit span in the remaining channels, plus
+embedded `r_mid_m` and `dr_m` section arrays.
+
+## Layout
+
+- [`Aerodynamics/BEMT.py`](src/FastBEMT/Aerodynamics/BEMT.py): operating-point
+  orchestration and integrated performance
+- [`Aerodynamics/Section.py`](src/FastBEMT/Aerodynamics/Section.py): one-section
+  aerodynamic solve
+- [`Aeroacoustics/F1A.py`](src/FastBEMT/Aeroacoustics/F1A.py): tonal noise
+- [`Aeroacoustics/BPM.py`](src/FastBEMT/Aeroacoustics/BPM.py): broadband noise
+- [`Kinematics/Kinematics.py`](src/FastBEMT/Kinematics/Kinematics.py): rotating
+  section frames and derivatives
+- [`Utils/Plotter.py`](src/FastBEMT/Utils/Plotter.py): acoustic maps and stress
+  plots
+- [`Utils/Stress.py`](src/FastBEMT/Utils/Stress.py): structural calculations
+
+## Validation
+
+The maintained automated tests are under `tests`. The tracked BEMT and stress
+notebooks retain higher-cost comparison workflows, while obsolete notebooks for
+the removed all-in-one `Propeller.run_aeroacoustics` API have been retired.
+
+```powershell
+uv run pytest
+uv run ruff check src tests
+```

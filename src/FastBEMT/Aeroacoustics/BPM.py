@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-from types import ModuleType
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from ._common import ArrayLike, normalize_observer_batch_size, observer_tensor
+from ._bpm_components import lbl, tbl, teb, ti, tv
 from .Utils import (
     a_weighting_db,
     power_ratio_to_spl,
-    third_octave_spectrum_to_overall_level,
+    spl_spectrum_to_overall_level,
 )
 from ..Kinematics import Kinematics
 
@@ -21,30 +19,24 @@ if TYPE_CHECKING:
     from ..Propeller import Propeller
 
 
-def _load_bpm_component(name: str) -> ModuleType:
-    """Load a BPM component module from the sibling BPM directory."""
-    component_path = Path(__file__).with_suffix("") / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"{__name__}_{name}", component_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load BPM component module: {component_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_tbl_component = _load_bpm_component("tbl")
-_lbl_component = _load_bpm_component("lbl")
-_teb_component = _load_bpm_component("teb")
-_ti_component = _load_bpm_component("ti")
-_tv_component = _load_bpm_component("tv")
-
-
 class BPM:
     """Brooks-Pope-Marcolini broadband noise model.
 
     The object consumes a Propeller, BEMT solution, and optional shared
     Kinematics object. Calling ``run`` stores third-octave component spectra,
     total SPL, and total OSPL/OASPL on the instance.
+
+    Args:
+        propeller: Propeller containing geometry and simulation settings.
+        bemt: BEMT analysis supplying the aerodynamic section solution.
+        kinematics: Optional matching rotating-section kinematics.
+        rpm: Operating speed used to select a multi-point BEMT solution.
+        v_inf: Freestream velocity used with ``rpm`` for solution selection.
+        turbulence_length_scale: Turbulent inflow length scale in meters.
+        turbulence_intensity: Turbulent inflow intensity as a fraction.
+        trailing_edge_offset: Distance from each acoustic section reference
+            point to its trailing-edge source in meters. Defaults to half the
+            local chord.
     """
 
     def __init__(
@@ -55,31 +47,17 @@ class BPM:
         kinematics: Kinematics | None = None,
         rpm: float | None = None,
         v_inf: float | None = None,
-        lt: float = 1.0,
-        i: float = 0.01,
-        alpha_stall: float = 15.0,
+        turbulence_length_scale: float = 1.0,
+        turbulence_intensity: float = 0.01,
         trailing_edge_offset: ArrayLike | None = None,
-        c1: ArrayLike | None = None,
     ) -> None:
-        from ..Aerodynamics.BEMT import BEMT
-
-        if not isinstance(bemt, BEMT):
-            raise TypeError("bemt must be a FastBEMT Aerodynamics.BEMT object.")
-        if bemt.propeller is not propeller:
-            raise ValueError("The BEMT analysis belongs to a different propeller.")
-        if bemt.environment is not propeller.environment:
-            raise ValueError("BPM and BEMT must use the same environment.")
-        if trailing_edge_offset is not None and c1 is not None:
-            raise ValueError("Specify either trailing_edge_offset or c1, not both.")
-
         self.propeller = propeller
         self.environment = propeller.environment
         self.bemt = bemt
         self.device = torch.device(propeller.device)
         self.dtype = propeller.dtype
-        self.lt = float(lt)
-        self.i = float(i)
-        self.alpha_stall = float(alpha_stall)
+        self.turbulence_length_scale = float(turbulence_length_scale)
+        self.turbulence_intensity = float(turbulence_intensity)
         self.rpm, self.v_inf = bemt.resolve_operating_point(rpm, v_inf)
         self.rotation_period = 60.0 / self.rpm
 
@@ -98,20 +76,17 @@ class BPM:
 
         solution = bemt.solution_for(self.rpm, self.v_inf)
         self.section_mask = self._valid_section_mask(solution)
-        if not np.any(self.section_mask):
-            raise ValueError("No valid blade sections available for BPM.")
         self._selected_sections = torch.as_tensor(
             self.section_mask,
             dtype=torch.bool,
             device=self.device,
         )
         self.section_indices = np.flatnonzero(self.section_mask)
-        self.ns = int(self.section_indices.shape[0])
-        self.nb = self.kinematics.nb
-        self.source_rotation_count = self._source_rotation_count()
-        self.nt = self.source_rotation_count
+        self.n_sections = int(self.section_indices.shape[0])
+        self.n_blades = self.kinematics.n_blades
+        self.n_source_times = self._source_time_count()
         self.source_times = self.kinematics.source_times[
-            : self.source_rotation_count
+            : self.n_source_times
         ].to(dtype=self.dtype, device=self.device)
 
         geometry = propeller.section_geometry_np
@@ -119,51 +94,55 @@ class BPM:
             dtype=self.dtype,
             device=self.device,
         )
-        self.r = self._section_tensor(geometry["r"])
-        self.dr = self._section_tensor(geometry["dr"])
-        self.chord = self._section_tensor(geometry["chord"])
-        self.alpha = self._solution_tensor(solution, "alpha")
-        self.vi = self._solution_tensor(solution, "u")
-        self.u = self._solution_tensor(solution, "W")
-        self.re_c = self._solution_tensor(solution, "Re")
-        self.m = self._solution_tensor(solution, "Ma")
-        self.delta_p = self._solution_tensor(solution, "dp")
-        self.delta_s = self._solution_tensor(solution, "ds")
-        self.psi = self._section_tensor(geometry["boat_tail_angle"])
-        self.a_inf = torch.tensor(
-            self.environment.a_inf,
-            dtype=self.dtype,
-            device=self.device,
+        self.section_radius = self._section_tensor(geometry["r"])
+        self.section_width = self._section_tensor(geometry["dr"])
+        self.section_chord = self._section_tensor(geometry["chord"])
+        self.angle_of_attack_deg = self._solution_tensor(
+            solution,
+            "angle_of_attack_deg",
         )
-        self.rho = torch.tensor(
-            self.environment.rho,
-            dtype=self.dtype,
-            device=self.device,
+        self.relative_velocity = self._solution_tensor(
+            solution,
+            "relative_velocity",
         )
+        self.reynolds_number = self._solution_tensor(solution, "reynolds_number")
+        self.mach_number = self._solution_tensor(solution, "mach_number")
+        self.upper_displacement_thickness = self._solution_tensor(
+            solution,
+            "upper_displacement_thickness",
+        )
+        self.lower_displacement_thickness = self._solution_tensor(
+            solution,
+            "lower_displacement_thickness",
+        )
+        self.boat_tail_angle_deg = self._section_tensor(
+            geometry["boat_tail_angle"]
+        )
+        self.a_inf = propeller.a_inf_tensor
+        self.rho = propeller.rho_tensor
         self.trailing_edge_offset = self._trailing_edge_offset(
             trailing_edge_offset,
-            c1,
             geometry["chord"],
         )
 
         self.observers: torch.Tensor | None = None
+        self.source_reception_times: torch.Tensor | None = None
         self.observer_times: torch.Tensor | None = None
-        self.t: torch.Tensor | None = None
         self.observer_rotations: int | None = None
-        self.observer_time_range: float | None = None
-        self.num_observer_times: int | None = None
+        self.observer_duration: float | None = None
+        self.n_observer_times: int | None = None
         self.sample_spacing: float | None = None
         self.source_rotation_repetitions: int | None = None
         self.base_val_te: torch.Tensor | None = None
         self.base_val_le: torch.Tensor | None = None
         self.base_val_low: torch.Tensor | None = None
-        self.component_p2: dict[str, torch.Tensor] = {}
+        self.component_power_ratio: dict[str, torch.Tensor] = {}
         self.component_spl: dict[str, torch.Tensor] = {}
         self.spl: torch.Tensor | None = None
         self.spl_a: torch.Tensor | None = None
         self.ospl: torch.Tensor | None = None
         self.oaspl: torch.Tensor | None = None
-        self.source_component_p2: dict[str, torch.Tensor] | None = None
+        self.source_component_power_ratio: dict[str, torch.Tensor] | None = None
 
     def _kinematics_matches(self, kinematics: Kinematics | None) -> bool:
         if kinematics is None:
@@ -174,32 +153,23 @@ class BPM:
 
     def _valid_section_mask(self, solution: object) -> np.ndarray:
         finite_solution = np.ones(self.propeller.n_sections, dtype=bool)
-        for column in ("alpha", "u", "W", "Re", "Ma", "dp", "ds"):
+        for column in (
+            "angle_of_attack_deg",
+            "relative_velocity",
+            "reynolds_number",
+            "mach_number",
+            "upper_displacement_thickness",
+            "lower_displacement_thickness",
+        ):
             finite_solution &= np.isfinite(
                 np.asarray(solution[column].to_numpy(), dtype=np.float64)
             )
-        return self.propeller.bpm_geometry_mask & finite_solution
+        return self.propeller.aerodynamic_section_mask & finite_solution
 
-    def _source_rotation_count(self) -> int:
-        simulation_times = self.propeller.simulation.src_times_one_rotation
-        if simulation_times is not None:
-            count = int(torch.as_tensor(simulation_times).shape[0])
-            if 0 < count <= self.kinematics.nt:
-                return count
-
-        if self.kinematics.nt == 1:
-            return 1
-
-        source_times = self.kinematics.source_times
-        median_dt = torch.median(torch.diff(source_times))
-        first_rotation_end = source_times[0] + self.rotation_period
-        mask = source_times < (first_rotation_end - 0.5 * median_dt)
-        count = int(mask.sum().item())
-        if count > 0:
-            return count
-
-        estimated_count = int(round(self.rotation_period / float(median_dt.item())))
-        return max(1, min(estimated_count, self.kinematics.nt))
+    def _source_time_count(self) -> int:
+        return int(
+            self.propeller.simulation.source_times_one_revolution.shape[0]
+        )
 
     def _section_tensor(self, values: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(
@@ -246,7 +216,6 @@ class BPM:
     def _trailing_edge_offset(
         self,
         trailing_edge_offset: ArrayLike | None,
-        c1: ArrayLike | None,
         full_chord: np.ndarray,
     ) -> torch.Tensor:
         selected_chord = full_chord[self.section_mask].astype(np.float64, copy=False)
@@ -256,13 +225,6 @@ class BPM:
                 name="trailing_edge_offset",
                 full_chord=full_chord,
             )
-        elif c1 is not None:
-            c1_values = self._selected_optional_values(
-                c1,
-                name="c1",
-                full_chord=full_chord,
-            )
-            values = selected_chord - c1_values
         else:
             values = 0.5 * selected_chord
         return torch.as_tensor(values, dtype=self.dtype, device=self.device)
@@ -271,12 +233,11 @@ class BPM:
     def run(
         self,
         observers: ArrayLike,
-        observer_time_range: float | None = None,
-        num_observer_times: int | None = None,
+        observer_duration: float | None = None,
+        n_observer_times: int | None = None,
         *,
-        lt: float | None = None,
-        i: float | None = None,
-        alpha_stall: float | None = None,
+        turbulence_length_scale: float | None = None,
+        turbulence_intensity: float | None = None,
         observer_batch_size: int | None = None,
         retain_source_terms: bool = False,
     ) -> None:
@@ -284,11 +245,10 @@ class BPM:
 
         Args:
             observers: Stationary observer coordinates, shape ``(O, 3)``.
-            observer_time_range: Optional requested observer-time duration.
-            num_observer_times: Optional requested observer sample count.
-            lt: Override the turbulent length scale for this run.
-            i: Override the turbulence intensity for this run.
-            alpha_stall: Override the stall angle in degrees for this run.
+            observer_duration: Optional requested observer-time duration.
+            n_observer_times: Optional requested observer sample count.
+            turbulence_length_scale: Override the turbulent length scale.
+            turbulence_intensity: Override the turbulence intensity.
             observer_batch_size: Optional number of observers to process at a
                 time. Results are merged onto this object in observer order.
             retain_source_terms: Keep uncombined source component powers.
@@ -305,11 +265,10 @@ class BPM:
         if batch_size is None:
             self._run_observer_batch(
                 observer_values,
-                observer_time_range=observer_time_range,
-                num_observer_times=num_observer_times,
-                lt=lt,
-                i=i,
-                alpha_stall=alpha_stall,
+                observer_duration=observer_duration,
+                n_observer_times=n_observer_times,
+                turbulence_length_scale=turbulence_length_scale,
+                turbulence_intensity=turbulence_intensity,
                 retain_source_terms=retain_source_terms,
             )
             return
@@ -319,11 +278,10 @@ class BPM:
             observer_batch = observer_values[start : start + batch_size]
             self._run_observer_batch(
                 observer_batch,
-                observer_time_range=observer_time_range,
-                num_observer_times=num_observer_times,
-                lt=lt,
-                i=i,
-                alpha_stall=alpha_stall,
+                observer_duration=observer_duration,
+                n_observer_times=n_observer_times,
+                turbulence_length_scale=turbulence_length_scale,
+                turbulence_intensity=turbulence_intensity,
                 retain_source_terms=retain_source_terms,
             )
             batch_results.append(
@@ -342,22 +300,21 @@ class BPM:
         self,
         observers: torch.Tensor,
         *,
-        observer_time_range: float | None,
-        num_observer_times: int | None,
-        lt: float | None,
-        i: float | None,
-        alpha_stall: float | None,
+        observer_duration: float | None,
+        n_observer_times: int | None,
+        turbulence_length_scale: float | None,
+        turbulence_intensity: float | None,
         retain_source_terms: bool,
     ) -> None:
         self._reset_results()
         self.observers = observers
 
         source_positions, source_beta = self._source_trajectory()
-        source_observer_times = self._source_observer_times(
+        source_reception_times = self._calculate_source_reception_times(
             self.observers,
             source_positions,
         )
-        self.observer_times = source_observer_times.permute(
+        self.source_reception_times = source_reception_times.permute(
             3,
             0,
             2,
@@ -369,16 +326,16 @@ class BPM:
             interpolation_positions,
             interpolation_beta,
         ) = self._extend_periodic_sources(
-            source_observer_times,
+            source_reception_times,
             source_positions,
             source_beta,
         )
         output_times = self._observer_output_times(
             interpolation_times,
-            observer_time_range,
-            num_observer_times,
+            observer_duration,
+            n_observer_times,
         )
-        self.t = output_times.T.contiguous()
+        self.observer_times = output_times.T.contiguous()
 
         positions_at_observer = self._interpolate_positions(
             output_times,
@@ -397,46 +354,43 @@ class BPM:
         )
 
         source_components = self.compute_noise_components(
-            lt=self.lt if lt is None else float(lt),
-            i=self.i if i is None else float(i),
-            alpha_stall=(
-                self.alpha_stall if alpha_stall is None else float(alpha_stall)
+            turbulence_length_scale=(
+                self.turbulence_length_scale
+                if turbulence_length_scale is None
+                else float(turbulence_length_scale)
+            ),
+            turbulence_intensity=(
+                self.turbulence_intensity
+                if turbulence_intensity is None
+                else float(turbulence_intensity)
             ),
         )
         if retain_source_terms:
-            self.source_component_p2 = source_components
+            self.source_component_power_ratio = source_components
 
-        self.component_p2 = {
+        self.component_power_ratio = {
             name: values.sum(dim=(2, 3))
             for name, values in source_components.items()
         }
         band_power = {
             name: values.mean(dim=1).T.contiguous()
-            for name, values in self.component_p2.items()
+            for name, values in self.component_power_ratio.items()
         }
         self.component_spl = {
             name: power_ratio_to_spl(values)
             for name, values in band_power.items()
         }
 
-        total_band_power: torch.Tensor | None = None
-        for values in band_power.values():
-            total_band_power = (
-                values
-                if total_band_power is None
-                else total_band_power + values
-            )
-        if total_band_power is None:
-            raise RuntimeError("BPM did not compute any noise components.")
+        total_band_power = torch.stack(tuple(band_power.values())).sum(dim=0)
 
         self.spl = power_ratio_to_spl(total_band_power)
         self.spl_a = self.spl + a_weighting_db(self.frequencies)[None, :]
-        self.ospl = third_octave_spectrum_to_overall_level(
+        self.ospl = spl_spectrum_to_overall_level(
             self.spl,
             self.frequencies,
             frequency_dim=1,
         )
-        self.oaspl = third_octave_spectrum_to_overall_level(
+        self.oaspl = spl_spectrum_to_overall_level(
             self.spl,
             self.frequencies,
             weighted=True,
@@ -449,17 +403,17 @@ class BPM:
         retain_source_terms: bool,
     ) -> dict[str, object]:
         result: dict[str, object] = {
+            "source_reception_times": self.source_reception_times,
             "observer_times": self.observer_times,
-            "t": self.t,
             "observer_rotations": self.observer_rotations,
-            "observer_time_range": self.observer_time_range,
-            "num_observer_times": self.num_observer_times,
+            "observer_duration": self.observer_duration,
+            "n_observer_times": self.n_observer_times,
             "sample_spacing": self.sample_spacing,
             "source_rotation_repetitions": self.source_rotation_repetitions,
             "base_val_te": self.base_val_te,
             "base_val_le": self.base_val_le,
             "base_val_low": self.base_val_low,
-            "component_p2": self.component_p2,
+            "component_power_ratio": self.component_power_ratio,
             "component_spl": self.component_spl,
             "spl": self.spl,
             "spl_a": self.spl_a,
@@ -468,7 +422,9 @@ class BPM:
             "frequencies": self.frequencies,
         }
         if retain_source_terms:
-            result["source_component_p2"] = self.source_component_p2
+            result["source_component_power_ratio"] = (
+                self.source_component_power_ratio
+            )
         return result
 
     def _merge_batch_results(
@@ -481,8 +437,8 @@ class BPM:
         first = batch_results[0]
         self.observers = observers
         self.observer_rotations = int(first["observer_rotations"])
-        self.observer_time_range = float(first["observer_time_range"])
-        self.num_observer_times = int(first["num_observer_times"])
+        self.observer_duration = float(first["observer_duration"])
+        self.n_observer_times = int(first["n_observer_times"])
         self.sample_spacing = float(first["sample_spacing"])
         self.source_rotation_repetitions = max(
             int(result["source_rotation_repetitions"])
@@ -490,32 +446,14 @@ class BPM:
         )
         self.frequencies = first["frequencies"]
 
-        for result in batch_results[1:]:
-            if int(result["observer_rotations"]) != self.observer_rotations:
-                raise RuntimeError("BPM observer batches used different durations.")
-            if int(result["num_observer_times"]) != self.num_observer_times:
-                raise RuntimeError(
-                    "BPM observer batches used different sample counts."
-                )
-            if not np.isclose(
-                float(result["sample_spacing"]),
-                self.sample_spacing,
-                rtol=1.0e-7,
-                atol=1.0e-12,
-            ):
-                raise RuntimeError(
-                    "BPM observer batches used different sample spacing."
-                )
-            if not torch.allclose(result["frequencies"], self.frequencies):
-                raise RuntimeError(
-                    "BPM observer batches produced different frequency grids."
-                )
-
+        self.source_reception_times = torch.cat(
+            [result["source_reception_times"] for result in batch_results],
+            dim=0,
+        )
         self.observer_times = torch.cat(
             [result["observer_times"] for result in batch_results],
             dim=0,
         )
-        self.t = torch.cat([result["t"] for result in batch_results], dim=0)
         self.base_val_te = torch.cat(
             [result["base_val_te"] for result in batch_results],
             dim=3,
@@ -529,10 +467,13 @@ class BPM:
             dim=3,
         )
 
-        component_names = tuple(first["component_p2"])
-        self.component_p2 = {
+        component_names = tuple(first["component_power_ratio"])
+        self.component_power_ratio = {
             name: torch.cat(
-                [result["component_p2"][name] for result in batch_results],
+                [
+                    result["component_power_ratio"][name]
+                    for result in batch_results
+                ],
                 dim=2,
             )
             for name in component_names
@@ -558,10 +499,10 @@ class BPM:
             dim=0,
         )
         if retain_source_terms:
-            self.source_component_p2 = {
+            self.source_component_power_ratio = {
                 name: torch.cat(
                     [
-                        result["source_component_p2"][name]
+                        result["source_component_power_ratio"][name]
                         for result in batch_results
                     ],
                     dim=4,
@@ -569,44 +510,44 @@ class BPM:
                 for name in component_names
             }
         else:
-            self.source_component_p2 = None
+            self.source_component_power_ratio = None
 
     def _reset_results(self) -> None:
         self.observers = None
+        self.source_reception_times = None
         self.observer_times = None
-        self.t = None
         self.observer_rotations = None
-        self.observer_time_range = None
-        self.num_observer_times = None
+        self.observer_duration = None
+        self.n_observer_times = None
         self.sample_spacing = None
         self.source_rotation_repetitions = None
         self.base_val_te = None
         self.base_val_le = None
         self.base_val_low = None
-        self.component_p2 = {}
+        self.component_power_ratio = {}
         self.component_spl = {}
         self.spl = None
         self.spl_a = None
         self.ospl = None
         self.oaspl = None
-        self.source_component_p2 = None
+        self.source_component_power_ratio = None
 
     def _source_trajectory(self) -> tuple[torch.Tensor, torch.Tensor]:
         reference_position = self.kinematics.section_position_global_frame[
-            : self.source_rotation_count,
+            : self.n_source_times,
             :,
             self._selected_sections,
             :,
-        ].to(dtype=self.dtype, device=self.device)
+        ]
         blade_to_global = self.kinematics.blade_to_global_rotation_matrix[
-            : self.source_rotation_count
-        ].to(dtype=self.dtype, device=self.device)
+            : self.n_source_times
+        ]
         airfoil_to_blade = self.kinematics.airfoil_to_blade_rotation_matrix[
             self._selected_sections
-        ].to(dtype=self.dtype, device=self.device)
+        ]
 
         offset_airfoil = torch.zeros(
-            (self.ns, 3),
+            (self.n_sections, 3),
             dtype=self.dtype,
             device=self.device,
         )
@@ -627,16 +568,21 @@ class BPM:
             1,
             3,
         ).contiguous()
-        source_beta = self.kinematics.blade_angles[
-            : self.source_rotation_count,
+        source_beta = self.kinematics.blade_angles_rad[
+            : self.n_source_times,
             None,
             :,
             None,
-        ].to(dtype=self.dtype, device=self.device)
-        source_beta = source_beta.expand(-1, self.ns, -1, -1).contiguous()
+        ]
+        source_beta = source_beta.expand(
+            -1,
+            self.n_sections,
+            -1,
+            -1,
+        ).contiguous()
         return source_position, source_beta
 
-    def _source_observer_times(
+    def _calculate_source_reception_times(
         self,
         observers: torch.Tensor,
         source_positions: torch.Tensor,
@@ -649,114 +595,61 @@ class BPM:
 
     def _extend_periodic_sources(
         self,
-        observer_times: torch.Tensor,
+        source_reception_times: torch.Tensor,
         source_positions: torch.Tensor,
         source_beta: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        latest_reception_start = torch.amax(observer_times[0], dim=(0, 1))
-        earliest_reception_end = torch.amin(observer_times[-1], dim=(0, 1))
-        available_time_range = torch.amin(
-            earliest_reception_end - latest_reception_start
-        ).item()
-        extra_rotations = max(
-            1,
-            int(
-                np.ceil(
-                    max(0.0, self.rotation_period - available_time_range)
-                    / self.rotation_period
-                )
-            ),
-        )
-
-        time_blocks = []
-        position_blocks = []
-        beta_blocks = []
-        two_pi = torch.tensor(
-            2.0 * np.pi,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        for repeat_index in range(extra_rotations + 1):
-            time_shift = repeat_index * self.rotation_period
-            time_blocks.append(observer_times + time_shift)
-            position_blocks.append(source_positions)
-            beta_blocks.append(source_beta + repeat_index * two_pi)
-        self.source_rotation_repetitions = extra_rotations + 1
+        self.source_rotation_repetitions = 2
         return (
-            torch.cat(time_blocks, dim=0),
-            torch.cat(position_blocks, dim=0),
-            torch.cat(beta_blocks, dim=0),
+            torch.cat(
+                (
+                    source_reception_times,
+                    source_reception_times + self.rotation_period,
+                ),
+                dim=0,
+            ),
+            torch.cat((source_positions, source_positions), dim=0),
+            torch.cat((source_beta, source_beta + 2.0 * np.pi), dim=0),
         )
 
     def _observer_output_times(
         self,
-        observer_times: torch.Tensor,
-        observer_time_range: float | None,
-        num_observer_times: int | None,
+        source_reception_times: torch.Tensor,
+        observer_duration: float | None,
+        n_observer_times: int | None,
     ) -> torch.Tensor:
-        requested_time_range = (
-            self.propeller.simulation.observer_time_range
-            if observer_time_range is None
-            else float(observer_time_range)
+        requested_duration = (
+            self.propeller.simulation.observer_duration
+            if observer_duration is None
+            else float(observer_duration)
         )
-        if requested_time_range is None:
-            requested_time_range = self.rotation_period
-        requested_time_range = float(requested_time_range)
-        if not np.isfinite(requested_time_range) or requested_time_range <= 0.0:
-            raise ValueError("observer_time_range must be finite and positive.")
+        if requested_duration is None:
+            requested_duration = self.rotation_period
 
-        requested_rotations = int(
-            np.floor(requested_time_range / self.rotation_period + 1.0e-7)
-        )
-        if requested_rotations < 1:
-            raise ValueError(
-                "observer_time_range must contain at least one complete "
-                f"rotor revolution ({self.rotation_period:.9g} s)."
+        if n_observer_times is None:
+            samples_per_rotation = int(
+                self.propeller.simulation.timesteps_per_revolution
             )
-
-        if num_observer_times is None:
-            samples_per_rotation = int(self.propeller.simulation.num_obs_times_per_rev)
         else:
-            requested_observer_count = int(num_observer_times)
-            if requested_observer_count <= 0:
-                raise ValueError("num_observer_times must be greater than zero.")
-            requested_spacing = requested_time_range / requested_observer_count
+            requested_observer_count = int(n_observer_times)
+            requested_spacing = requested_duration / requested_observer_count
             samples_per_rotation = max(
                 1,
                 int(np.rint(self.rotation_period / requested_spacing)),
             )
-        if samples_per_rotation <= 0:
-            raise ValueError("num_observer_times must imply at least one sample.")
         sample_spacing = self.rotation_period / samples_per_rotation
 
-        latest_reception_start = torch.amax(observer_times[0], dim=(0, 1))
-        earliest_reception_end = torch.amin(observer_times[-1], dim=(0, 1))
-        available_time_range = torch.amin(
-            earliest_reception_end - latest_reception_start
-        ).item()
-        available_rotations = int(
-            np.floor(
-                (
-                    available_time_range
-                    + sample_spacing
-                    + 1.0e-7 * self.rotation_period
-                )
-                / self.rotation_period
-            )
+        latest_reception_start = torch.amax(
+            source_reception_times[0],
+            dim=(0, 1),
         )
-        if available_rotations < 1:
-            raise ValueError(
-                "The source-time data do not cover one complete observer "
-                "revolution after the latest initial reception time."
-            )
-
         self.observer_rotations = 1
-        self.observer_time_range = self.rotation_period
-        self.num_observer_times = samples_per_rotation
+        self.observer_duration = self.rotation_period
+        self.n_observer_times = samples_per_rotation
         self.sample_spacing = sample_spacing
         offsets = (
             torch.arange(
-                self.num_observer_times,
+                self.n_observer_times,
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -770,21 +663,27 @@ class BPM:
         x_old: torch.Tensor,
         y_old: torch.Tensor,
     ) -> torch.Tensor:
-        nt, n_sec, n_b, _ = x_old.shape
-        n_steps, n_obs = x_new.shape
+        n_source_times, n_sections, n_blades, _ = x_old.shape
+        n_steps, n_observers = x_new.shape
 
         x_old_p = x_old.permute(3, 1, 2, 0).contiguous()
         x_new_p = (
-            x_new.T.view(n_obs, 1, 1, n_steps)
-            .expand(-1, n_sec, n_b, -1)
+            x_new.T.view(n_observers, 1, 1, n_steps)
+            .expand(-1, n_sections, n_blades, -1)
             .contiguous()
         )
         idx = torch.searchsorted(x_old_p, x_new_p)
-        idx = torch.clamp(idx, 1, nt - 1)
+        idx = torch.clamp(idx, 1, n_source_times - 1)
 
         coord_count = y_old.shape[-1]
         y_old_p = y_old.permute(3, 1, 2, 0).contiguous()
-        y_old_exp = y_old_p.unsqueeze(1).expand(-1, n_obs, -1, -1, -1)
+        y_old_exp = y_old_p.unsqueeze(1).expand(
+            -1,
+            n_observers,
+            -1,
+            -1,
+            -1,
+        )
         idx_exp = idx.unsqueeze(0).expand(coord_count, -1, -1, -1, -1)
 
         y0 = torch.gather(y_old_exp, 4, idx_exp - 1)
@@ -862,7 +761,7 @@ class BPM:
             torch.where(phi_abs > one_seventy_five_deg, phi_large, phi),
         )
 
-        mach = self.m[None, :, None, None]
+        mach = self.mach_number[None, :, None, None]
         dh_te = (2.0 * torch.sin(theta / 2.0) ** 2 * torch.sin(phi) ** 2) / (
             (1.0 + mach * torch.cos(theta))
             * (1.0 + 0.2 * mach * torch.cos(theta)) ** 2
@@ -883,7 +782,7 @@ class BPM:
             source_positions,
             beta,
         )
-        m5_dr = (self.m**5 * self.dr)[None, :, None, None]
+        m5_dr = (self.mach_number**5 * self.section_width)[None, :, None, None]
         r_mag_sq = r_mag**2
         self.base_val_te = (m5_dr * dh_te) / r_mag_sq
         self.base_val_le = (m5_dr * dh_le) / r_mag_sq
@@ -892,9 +791,8 @@ class BPM:
     def compute_noise_components(
         self,
         *,
-        lt: float,
-        i: float,
-        alpha_stall: float,
+        turbulence_length_scale: float,
+        turbulence_intensity: float,
     ) -> dict[str, torch.Tensor]:
         if (
             self.base_val_te is None
@@ -903,58 +801,62 @@ class BPM:
         ):
             raise RuntimeError("BPM base directivity values have not been computed.")
 
+        # The standard positive-angle-of-attack propeller contract makes the
+        # lower surface the pressure side and the upper surface the suction side.
+        pressure_displacement_thickness = self.lower_displacement_thickness
+        suction_displacement_thickness = self.upper_displacement_thickness
+
         return {
-            "tbl": _tbl_component.compute_tbl_noise(
+            "tbl": tbl.compute_tbl_noise(
                 frequencies=self.frequencies,
-                chord=self.chord,
-                alpha=self.alpha,
-                u=self.u,
-                re_c=self.re_c,
-                m=self.m,
-                delta_p=self.delta_p,
-                delta_s=self.delta_s,
+                chord=self.section_chord,
+                alpha=self.angle_of_attack_deg,
+                u=self.relative_velocity,
+                re_c=self.reynolds_number,
+                m=self.mach_number,
+                delta_p=pressure_displacement_thickness,
+                delta_s=suction_displacement_thickness,
                 base_val_te=self.base_val_te,
                 base_val_low=self.base_val_low,
-                alpha_stall=alpha_stall,
             ),
-            "lbl": _lbl_component.compute_lbl_noise(
+            "lbl": lbl.compute_lbl_noise(
                 frequencies=self.frequencies,
-                alpha=self.alpha,
-                u=self.u,
-                re_c=self.re_c,
-                delta_p=self.delta_p,
+                alpha=self.angle_of_attack_deg,
+                u=self.relative_velocity,
+                re_c=self.reynolds_number,
+                delta_p=pressure_displacement_thickness,
                 base_val_le=self.base_val_le,
             ),
-            "teb": _teb_component.compute_teb_noise(
+            "teb": teb.compute_teb_noise(
                 frequencies=self.frequencies,
-                chord=self.chord,
-                u=self.u,
-                m=self.m,
-                delta_p=self.delta_p,
-                delta_s=self.delta_s,
-                psi=self.psi,
+                chord=self.section_chord,
+                u=self.relative_velocity,
+                m=self.mach_number,
+                delta_p=pressure_displacement_thickness,
+                delta_s=suction_displacement_thickness,
+                psi=self.boat_tail_angle_deg,
                 base_val_te=self.base_val_te,
             ),
-            "ti": _ti_component.compute_ti_noise(
+            "ti": ti.compute_ti_noise(
                 frequencies=self.frequencies,
-                chord=self.chord,
-                alpha=self.alpha,
-                u=self.u,
-                m=self.m,
+                chord=self.section_chord,
+                alpha=self.angle_of_attack_deg,
+                u=self.relative_velocity,
+                m=self.mach_number,
                 rho=self.rho,
                 a_inf=self.a_inf,
                 base_val_le=self.base_val_le,
                 base_val_low=self.base_val_low,
-                lt=lt,
-                i=i,
+                turbulence_length_scale=turbulence_length_scale,
+                turbulence_intensity=turbulence_intensity,
             ),
-            "tv": _tv_component.compute_tv_noise(
+            "tv": tv.compute_tv_noise(
                 frequencies=self.frequencies,
-                r=self.r,
-                dr=self.dr,
-                chord=self.chord,
-                alpha=self.alpha,
-                m=self.m,
+                r=self.section_radius,
+                dr=self.section_width,
+                chord=self.section_chord,
+                alpha=self.angle_of_attack_deg,
+                m=self.mach_number,
                 a_inf=self.a_inf,
                 base_val_te=self.base_val_te,
             ),

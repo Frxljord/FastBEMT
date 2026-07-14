@@ -10,8 +10,6 @@ __all__ = [
     "a_weighting_db",
     "power_ratio_to_spl",
     "spl_spectrum_to_overall_level",
-    "sum_spl_spectra",
-    "third_octave_spectrum_to_overall_level",
     "time_domain_to_spl_spectrum",
 ]
 
@@ -28,34 +26,21 @@ def _one_sided_rms_spectrum(
         pressure: Time-domain acoustic pressure.
         sample_spacing: Time between samples in seconds.
         time_dim: Dimension containing time samples.
-        frequency_bin_width: Target frequency bin width in Hz. If provided,
-            the pressure signal will be zero-padded to achieve the desired
-            resolution. Default is None (use native FFT resolution).
+        frequency_bin_width: Maximum frequency-bin width in Hz. Signals with
+            wider native bins are zero-padded; finer native resolution is kept.
     """
     pressure = torch.as_tensor(pressure)
     if not pressure.is_floating_point():
         pressure = pressure.to(torch.get_default_dtype())
-    if pressure.ndim == 0:
-        raise ValueError("pressure must have at least one dimension.")
-
     time_dim = time_dim % pressure.ndim
     sample_count = int(pressure.shape[time_dim])
-    if sample_count <= 0:
-        raise ValueError("The time dimension must contain at least one sample.")
     sample_spacing = float(sample_spacing)
-    if not math.isfinite(sample_spacing) or sample_spacing <= 0.0:
-        raise ValueError("sample_spacing must be finite and greater than zero.")
-    
-    # Enforce frequency bin width if specified
+
     if frequency_bin_width is not None:
         frequency_bin_width = float(frequency_bin_width)
-        if not math.isfinite(frequency_bin_width) or frequency_bin_width <= 0.0:
-            raise ValueError("frequency_bin_width must be finite and greater than zero.")
-        # Required duration: T = 1 / frequency_bin_width
-        # Required samples: N = ceil(T / sample_spacing)
-        required_duration = 1.0 / frequency_bin_width
-        required_sample_count = math.ceil(required_duration / sample_spacing)
-        # Pad to required sample count if necessary
+        required_sample_count = math.ceil(
+            1.0 / (frequency_bin_width * sample_spacing)
+        )
         if required_sample_count > sample_count:
             pad_amount = required_sample_count - sample_count
             pad_spec = [0, 0] * pressure.ndim
@@ -94,8 +79,6 @@ def _rms_amplitude_to_spl(
 ) -> torch.Tensor:
     """Convert RMS pressure amplitudes to SPL."""
     p_ref = float(p_ref)
-    if not math.isfinite(p_ref) or p_ref <= 0.0:
-        raise ValueError("p_ref must be finite and greater than zero.")
     return 20.0 * torch.log10(
         rms_amplitude.clamp_min(1.0e-15) / p_ref
     )
@@ -114,26 +97,7 @@ def power_ratio_to_spl(
         floor_value = torch.finfo(power_ratio.dtype).tiny
     else:
         floor_value = float(floor)
-        if not math.isfinite(floor_value) or floor_value <= 0.0:
-            raise ValueError("floor must be finite and greater than zero.")
     return 10.0 * torch.log10(power_ratio.clamp_min(floor_value))
-
-
-def sum_spl_spectra(
-    spl: torch.Tensor,
-    *,
-    component_dim: int = 0,
-) -> torch.Tensor:
-    """Log-sum SPL spectra along a component dimension."""
-    spl = torch.as_tensor(spl)
-    if not spl.is_floating_point():
-        spl = spl.to(torch.get_default_dtype())
-    if spl.ndim == 0:
-        raise ValueError("spl must have at least one dimension.")
-
-    component_dim = component_dim % spl.ndim
-    power_ratio = torch.pow(10.0, spl / 10.0)
-    return power_ratio_to_spl(torch.sum(power_ratio, dim=component_dim))
 
 
 def time_domain_to_spl_spectrum(
@@ -142,7 +106,7 @@ def time_domain_to_spl_spectrum(
     p_ref: float = 20.0e-6,
     *,
     time_dim: int = -1,
-    frequency_bin_width: float = 20.0,
+    frequency_bin_width: float | None = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert pressure histories to a one-sided RMS SPL spectrum.
 
@@ -151,8 +115,9 @@ def time_domain_to_spl_spectrum(
         sample_spacing: Time between samples in seconds.
         p_ref: Reference acoustic pressure in Pa.
         time_dim: Dimension containing time samples.
-        frequency_bin_width: Target frequency bin width in Hz. Pressure signals
-            will be zero-padded to achieve this resolution. Default is 20 Hz.
+        frequency_bin_width: Maximum frequency-bin width in Hz. Signals with
+            wider native bins are zero-padded. Use ``None`` to retain the
+            native FFT length. Default is 20 Hz.
 
     Returns:
         ``(frequencies, spl)`` where ``frequencies`` is one-dimensional and
@@ -216,22 +181,12 @@ def spl_spectrum_to_overall_level(
     spl = torch.as_tensor(spl)
     if not spl.is_floating_point():
         spl = spl.to(torch.get_default_dtype())
-    if spl.ndim == 0:
-        raise ValueError("spl must have at least one dimension.")
-
     frequency_dim = frequency_dim % spl.ndim
     frequencies = torch.as_tensor(
         frequencies,
         dtype=spl.dtype,
         device=spl.device,
     )
-    if frequencies.ndim != 1:
-        raise ValueError("frequencies must be one-dimensional.")
-    if frequencies.numel() != spl.shape[frequency_dim]:
-        raise ValueError(
-            "frequencies must match the selected frequency dimension."
-        )
-
     level_spectrum = spl
     if weighted:
         weighting_shape = [1] * spl.ndim
@@ -241,20 +196,6 @@ def spl_spectrum_to_overall_level(
         )
 
     power_ratio = torch.pow(10.0, level_spectrum / 10.0)
-    return 10.0 * torch.log10(torch.sum(power_ratio, dim=frequency_dim))
-
-
-def third_octave_spectrum_to_overall_level(
-    spl: torch.Tensor,
-    frequencies: torch.Tensor,
-    *,
-    weighted: bool = False,
-    frequency_dim: int = -1,
-) -> torch.Tensor:
-    """Integrate third-octave band SPL into OSPL or A-weighted OASPL."""
-    return spl_spectrum_to_overall_level(
-        spl,
-        frequencies,
-        weighted=weighted,
-        frequency_dim=frequency_dim,
+    return power_ratio_to_spl(
+        torch.sum(power_ratio, dim=frequency_dim),
     )

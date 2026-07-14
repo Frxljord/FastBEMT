@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -28,9 +27,8 @@ class Kinematics:
             omitted, the propeller simulation grid is configured from its
             revolutions and timesteps-per-revolution settings.
         section_geometry: Optional one-dimensional section data overriding the
-            propeller section grid. Expected keys are ``"r"`` plus either
-            ``"twist_rad"`` or ``"twist"``, ``"chord"``, ``"sweep"``, and
-            ``"rake"``.
+            propeller section grid. Expected keys are ``"r"``, ``"twist"``
+            in degrees, ``"chord"``, ``"sweep"``, and ``"rake"``.
     """
 
     def __init__(
@@ -49,115 +47,64 @@ class Kinematics:
         self.uses_custom_source_times = source_times is not None
         self.uses_custom_section_geometry = section_geometry is not None
 
+        simulation = propeller.simulation
         if source_times is None:
-            propeller.simulation.configure_operating_point(
+            simulation.configure_operating_point(
                 self.rpm,
                 self.n_blades,
             )
-
-            simulation = propeller.simulation
-            if (
-                simulation.omega is None
-                or simulation.src_times is None
-                or simulation.blade_angles is None
-            ):
-                raise RuntimeError(
-                    "The simulation operating point was not configured."
-                )
-
-            self.omega = torch.tensor(
-                simulation.omega,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self.source_times = torch.as_tensor(
-                simulation.src_times,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self.blade_phase_offsets = torch.as_tensor(
-                simulation.blade_angles,
-                dtype=self.dtype,
-                device=self.device,
-            )
         else:
-            if not math.isfinite(self.rpm) or self.rpm <= 0.0:
-                raise ValueError("rpm must be finite and greater than zero.")
-            self.omega = torch.tensor(
-                2.0 * math.pi * self.rpm / 60.0,
-                dtype=self.dtype,
-                device=self.device,
+            simulation.configure_custom_source_times(
+                self.rpm,
+                self.n_blades,
+                source_times,
             )
-            self.source_times = self._validate_source_times(source_times)
-            self.blade_phase_offsets = (
-                2.0
-                * math.pi
-                / self.n_blades
-                * torch.arange(
-                    self.n_blades,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-            )
-            self._mirror_custom_times_to_simulation()
+
+        self.omega = torch.tensor(
+            simulation.omega,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.source_times = torch.as_tensor(
+            simulation.source_times,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.blade_phase_offsets_rad = torch.as_tensor(
+            simulation.blade_phase_offsets_rad,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         if section_geometry is None:
-            self.radial_positions = propeller.section_radius
-            self.chord = propeller.section_chord
-            self.twist_rad = propeller.section_twist_rad
-            self.sweep = propeller.section_sweep
-            self.rake = propeller.section_rake
+            self.section_radius = propeller.section_radius
+            self.section_chord = propeller.section_chord
+            self.section_twist_rad = propeller.section_twist_rad
+            self.section_sweep = propeller.section_sweep
+            self.section_rake = propeller.section_rake
         else:
-            self.radial_positions = self._section_geometry_tensor(
+            self.section_radius = self._section_geometry_tensor(
                 section_geometry,
                 "r",
             )
-            self.chord = self._section_geometry_tensor(
+            self.section_chord = self._section_geometry_tensor(
                 section_geometry,
                 "chord",
             )
-            if "twist_rad" in section_geometry:
-                self.twist_rad = self._section_geometry_tensor(
-                    section_geometry,
-                    "twist_rad",
-                )
-            elif "twist" in section_geometry:
-                self.twist_rad = torch.deg2rad(
-                    self._section_geometry_tensor(section_geometry, "twist")
-                )
-            else:
-                raise ValueError(
-                    "section_geometry must contain 'twist_rad' or 'twist'."
-                )
-            self.sweep = self._section_geometry_tensor(
+            self.section_twist_rad = torch.deg2rad(
+                self._section_geometry_tensor(section_geometry, "twist")
+            )
+            self.section_sweep = self._section_geometry_tensor(
                 section_geometry,
                 "sweep",
             )
-            self.rake = self._section_geometry_tensor(
+            self.section_rake = self._section_geometry_tensor(
                 section_geometry,
                 "rake",
             )
 
-            expected_shape = self.radial_positions.shape
-            for name, values in (
-                ("chord", self.chord),
-                ("twist", self.twist_rad),
-                ("sweep", self.sweep),
-                ("rake", self.rake),
-            ):
-                if values.shape != expected_shape:
-                    raise ValueError(
-                        "section_geometry arrays must all match the shape of "
-                        f"'r' {expected_shape}; '{name}' has shape {values.shape}."
-                    )
-
-        self.nt = int(self.source_times.shape[0])
-        self.ns = int(self.radial_positions.shape[0])
-        self.nb = int(self.blade_phase_offsets.shape[0])
-        if self.nb != self.n_blades:
-            raise ValueError(
-                "The configured blade angles do not match geometry['n_blades']."
-            )
+        self.n_source_times = int(self.source_times.shape[0])
+        self.n_sections = int(self.section_radius.shape[0])
         self._compute()
 
     def _section_geometry_tensor(
@@ -165,106 +112,22 @@ class Kinematics:
         section_geometry: Mapping[str, np.ndarray | torch.Tensor],
         name: str,
     ) -> torch.Tensor:
-        """Return a validated one-dimensional custom section array."""
-        if name not in section_geometry:
-            raise ValueError(f"section_geometry must contain '{name}'.")
-        values = torch.as_tensor(
+        """Return a custom section array on the propeller tensor backend."""
+        return torch.as_tensor(
             section_geometry[name],
             dtype=self.dtype,
             device=self.device,
-        )
-        if values.ndim != 1:
-            raise ValueError(f"section_geometry['{name}'] must be one-dimensional.")
-        if values.numel() == 0:
-            raise ValueError(f"section_geometry['{name}'] must not be empty.")
-        if not bool(torch.isfinite(values).all().item()):
-            raise ValueError(f"section_geometry['{name}'] must be finite.")
-        return values.contiguous()
-
-    def _validate_source_times(
-        self,
-        source_times: np.ndarray | torch.Tensor,
-    ) -> torch.Tensor:
-        """Return validated one-dimensional source timestamps."""
-        source_times_tensor = torch.as_tensor(
-            source_times,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        if source_times_tensor.ndim != 1:
-            raise ValueError("source_times must be one-dimensional.")
-        if source_times_tensor.numel() == 0:
-            raise ValueError("source_times must contain at least one timestamp.")
-        if not bool(torch.isfinite(source_times_tensor).all().item()):
-            raise ValueError("source_times must contain only finite values.")
-        if source_times_tensor.numel() > 1 and not bool(
-            torch.all(source_times_tensor[1:] > source_times_tensor[:-1]).item()
-        ):
-            raise ValueError("source_times must be strictly increasing.")
-        return source_times_tensor.contiguous()
-
-    def _mirror_custom_times_to_simulation(self) -> None:
-        """Keep the shared Simulation timing fields consistent enough to inspect."""
-        simulation = self.propeller.simulation
-        simulation.rpm = self.rpm
-        simulation.omega = float(self.omega.item())
-        simulation.src_times = self.source_times
-        simulation.num_src_times = int(self.source_times.shape[0])
-        simulation.blade_angles = self.blade_phase_offsets
-        simulation.num_obs_times = int(self.source_times.shape[0])
-
-        if self.source_times.numel() == 1:
-            simulation.revolutions = 1
-            simulation.dt = None
-            simulation.duration = 0.0
-            simulation.observer_time_range = 0.0
-            simulation.src_times_one_rotation = self.source_times
-            simulation.num_obs_times_per_rev = 1
-            simulation.blade_passing_period = (
-                2.0 * math.pi / float(self.omega.item()) / self.n_blades
-            )
-            return
-
-        time_deltas = torch.diff(self.source_times)
-        median_dt = torch.median(time_deltas).item()
-        source_duration = (
-            self.source_times[-1] - self.source_times[0]
-        ).item()
-        rotation_period = 2.0 * math.pi / float(self.omega.item())
-        estimated_revolutions = max(
-            1,
-            int(round(source_duration / rotation_period)),
-        )
-        first_rotation_end = self.source_times[0] + rotation_period
-        first_rotation_mask = self.source_times < (
-            first_rotation_end - 0.5 * median_dt
-        )
-        first_rotation_count = int(first_rotation_mask.sum().item())
-        if first_rotation_count <= 0:
-            first_rotation_count = min(
-                int(self.source_times.shape[0]),
-                max(1, int(round(rotation_period / median_dt))),
-            )
-
-        simulation.dt = float(median_dt)
-        simulation.revolutions = estimated_revolutions
-        simulation.duration = float(source_duration)
-        simulation.observer_time_range = float(source_duration)
-        simulation.blade_passing_period = rotation_period / self.n_blades
-        simulation.num_obs_times_per_rev = first_rotation_count
-        simulation.src_times_one_rotation = self.source_times[
-            :first_rotation_count
-        ]
+        ).contiguous()
 
     def _compute(self) -> None:
         """Compute rotations, section positions, and their time derivatives."""
-        self.blade_angles = (
+        self.blade_angles_rad = (
             self.omega * self.source_times[:, None]
-            + self.blade_phase_offsets[None, :]
+            + self.blade_phase_offsets_rad[None, :]
         )
 
-        cos_angle = torch.cos(self.blade_angles)
-        sin_angle = torch.sin(self.blade_angles)
+        cos_angle = torch.cos(self.blade_angles_rad)
+        sin_angle = torch.sin(self.blade_angles_rad)
         zeros = torch.zeros_like(cos_angle)
         ones = torch.ones_like(cos_angle)
 
@@ -276,17 +139,12 @@ class Kinematics:
             ],
             dim=-2,
         )
-        self.blade_to_global_rotation_matrix = torch.stack(
-            [
-                torch.stack([ones, zeros, zeros], dim=-1),
-                torch.stack([zeros, cos_angle, -sin_angle], dim=-1),
-                torch.stack([zeros, sin_angle, cos_angle], dim=-1),
-            ],
-            dim=-2,
+        self.blade_to_global_rotation_matrix = (
+            self.global_to_blade_rotation_matrix.transpose(-2, -1).contiguous()
         )
 
-        cos_twist = torch.cos(self.twist_rad)
-        sin_twist = torch.sin(self.twist_rad)
+        cos_twist = torch.cos(self.section_twist_rad)
+        sin_twist = torch.sin(self.section_twist_rad)
         twist_zeros = torch.zeros_like(cos_twist)
         twist_ones = torch.ones_like(cos_twist)
 
@@ -298,44 +156,38 @@ class Kinematics:
             ],
             dim=-2,
         )
-        self.airfoil_to_blade_rotation_matrix = torch.stack(
-            [
-                torch.stack([-sin_twist, twist_zeros, cos_twist], dim=-1),
-                torch.stack([twist_zeros, twist_ones, twist_zeros], dim=-1),
-                torch.stack([-cos_twist, twist_zeros, -sin_twist], dim=-1),
-            ],
-            dim=-2,
+        self.airfoil_to_blade_rotation_matrix = (
+            self.blade_to_airfoil_rotation_matrix.transpose(-2, -1).contiguous()
         )
 
-        self.airfoil_origin_blade_frame = torch.stack(
+        airfoil_origin_blade_frame = torch.stack(
             [
-                self.rake,
-                self.radial_positions,
-                -self.sweep,
+                self.section_rake,
+                self.section_radius,
+                -self.section_sweep,
             ],
             dim=-1,
         )
-        self.section_position_airfoil_frame = torch.stack(
+        section_position_airfoil_frame = torch.stack(
             [
-                0.75 * self.chord,
-                torch.zeros_like(self.radial_positions),
-                torch.zeros_like(self.radial_positions),
+                0.75 * self.section_chord,
+                torch.zeros_like(self.section_radius),
+                torch.zeros_like(self.section_radius),
             ],
             dim=-1,
         )
-        self.airfoil_shift_blade_frame = (
+        section_position_blade_frame = (
             torch.einsum(
                 "sij,sj->si",
                 self.airfoil_to_blade_rotation_matrix,
-                self.section_position_airfoil_frame,
+                section_position_airfoil_frame,
             )
-            + self.airfoil_origin_blade_frame
+            + airfoil_origin_blade_frame
         )
-        self.section_position_blade_frame = self.airfoil_shift_blade_frame
         self.section_position_global_frame = torch.einsum(
             "tbij,sj->tbsi",
             self.blade_to_global_rotation_matrix,
-            self.section_position_blade_frame,
+            section_position_blade_frame,
         ).contiguous()
 
         self.omega_vec = torch.zeros(
@@ -344,18 +196,18 @@ class Kinematics:
             device=self.device,
         )
         self.omega_vec[..., 0] = self.omega
-        self.section_vel = torch.linalg.cross(
+        self.section_velocity_global_frame = torch.linalg.cross(
             self.omega_vec,
             self.section_position_global_frame,
             dim=-1,
         ).contiguous()
-        self.section_acc = torch.linalg.cross(
+        self.section_acceleration_global_frame = torch.linalg.cross(
             self.omega_vec,
-            self.section_vel,
+            self.section_velocity_global_frame,
             dim=-1,
         ).contiguous()
-        self.section_jerk = torch.linalg.cross(
+        self.section_jerk_global_frame = torch.linalg.cross(
             self.omega_vec,
-            self.section_acc,
+            self.section_acceleration_global_frame,
             dim=-1,
         ).contiguous()

@@ -2,7 +2,7 @@
 
 import torch
 
-from FastBEMT.Aeroacoustics._bpm_common import (
+from .._bpm_common import (
     safe_log10,
     st,
     torch_select as _torch_select,
@@ -203,7 +203,6 @@ def compute_tbl_noise(
     delta_s: torch.Tensor,
     base_val_te: torch.Tensor,
     base_val_low: torch.Tensor,
-    alpha_stall: float = 15.0,
 ) -> torch.Tensor:
     """Compute turbulent boundary-layer broadband noise."""
     m_5d = m[None, None, :, None, None]
@@ -241,7 +240,6 @@ def compute_tbl_noise(
     log_dp_bv_low = 10 * safe_log10(delta_p_5d * bv_low)
 
     delta_k1_val = delta_k1((re_c_5d / chord_5d * delta_p_5d), alpha_5d)
-    del alpha_stall
     gamma0 = 23.430 * m_5d + 4.651
     alpha_stall_julia = torch.minimum(torch.full_like(gamma0, 12.5), gamma0)
     alpha_mask = alpha_5d < alpha_stall_julia
@@ -257,25 +255,3 @@ def compute_tbl_noise(
     )
 
     return 10 ** (spl_s / 10) + 10 ** (spl_p / 10) + 10 ** (spl_a / 10)
-
-
-__all__ = [
-    "compute_tbl_noise",
-    "st",
-    "safe_log10",
-    "st1",
-    "st2",
-    "tbl_te_a_min",
-    "tbl_te_a_max",
-    "tbl_te_a0",
-    "tbl_te_ar",
-    "tbl_te_a",
-    "tbl_te_b_min",
-    "tbl_te_b_max",
-    "tbl_te_b0",
-    "tbl_te_br",
-    "tbl_te_b",
-    "k1",
-    "delta_k1",
-    "k2",
-]

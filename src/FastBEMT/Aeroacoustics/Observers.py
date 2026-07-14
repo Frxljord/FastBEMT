@@ -11,7 +11,7 @@ def uniform_observer_grid(size: float, nx: int, ny: int) -> np.ndarray:
     return np.stack([x.ravel(), y.ravel(), np.zeros_like(x).ravel()], axis=1)
 
 
-def circular_observer_array(radius: float, n_points: int) -> np.ndarray:
+def semicircular_observer_array(radius: float, n_points: int) -> np.ndarray:
     """Return a semicircular observer array in the x-y plane."""
     angles = np.linspace(-np.pi / 2.0, np.pi / 2.0, n_points, endpoint=True)
     return np.stack(

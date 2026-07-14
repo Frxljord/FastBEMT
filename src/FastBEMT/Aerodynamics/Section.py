@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import warnings
 
 import aerosandbox as asb
@@ -10,13 +9,6 @@ import numpy as np
 import scipy.optimize
 
 from ..Utils.Environment import Environment
-
-
-@dataclass
-class RootResult:
-    """Fallback root finding result compatible with scipy's root object."""
-
-    root: float
 
 
 class SectionForces:
@@ -31,7 +23,7 @@ class SectionForces:
         theta: float,
         environment: Environment,
         omega: float,
-        prop_radius: float,
+        tip_radius: float,
         hub_radius: float,
         n_blades: int,
     ) -> None:
@@ -42,13 +34,13 @@ class SectionForces:
         self.theta = theta
         self.environment = environment
         self.omega = omega
-        self.prop_radius = prop_radius
+        self.tip_radius = tip_radius
         self.hub_radius = hub_radius
         self.n_blades = n_blades
         self._tables: dict[tuple[float, float], tuple[np.ndarray, ...]] = {}
-        self.v_inf: float | None = None
-        self.re: float | None = None
-        self.ma: float | None = None
+        self.v_inf = 0.0
+        self.re = np.nan
+        self.ma = np.nan
         self.delta_star_upper = np.nan
         self.delta_star_lower = np.nan
         self._build_prandtl_loss_table()
@@ -63,7 +55,7 @@ class SectionForces:
         self._phi_grid = np.linspace(np.radians(-89.9), np.radians(89.9), 401)
         sin_phi = np.maximum(np.abs(np.sin(self._phi_grid)), np.finfo(float).eps)
         denominator = 2.0 * self.r * sin_phi
-        f_tip = self.n_blades * (self.prop_radius - self.r) / denominator
+        f_tip = self.n_blades * (self.tip_radius - self.r) / denominator
         f_hub = self.n_blades * (self.r - self.hub_radius) / denominator
         self._f_grid = (
             2.0
@@ -81,22 +73,22 @@ class SectionForces:
     def airfoil_coefficients(
         self,
         alpha: float,
-        re: float,
-        ma: float,
+        reynolds_number: float,
+        mach_number: float,
         model_size: str = "xxxlarge",
     ) -> tuple[float, float]:
         """Return lift and drag coefficients, using cached NeuralFoil tables."""
-        re_bin = round(re, -4)
-        ma_bin = round(ma, 0)
-        key = (re_bin, ma_bin)
+        reynolds_bin = round(reynolds_number, -4)
+        mach_bin = round(mach_number, 0)
+        key = (reynolds_bin, mach_bin)
 
         if key not in self._tables:
             alpha_grid = np.linspace(-20.0, 40.0, 121)
             output = asb.Airfoil.get_aero_from_neuralfoil(
                 self.airfoil,
                 alpha=alpha_grid,
-                Re=re_bin,
-                mach=ma_bin,
+                Re=reynolds_bin,
+                mach=mach_bin,
                 model_size=model_size,
             )
             self._tables[key] = (
@@ -135,8 +127,8 @@ class SectionForces:
             output = asb.Airfoil.get_aero_from_neuralfoil(
                 self.airfoil,
                 alpha=alpha,
-                Re=re,
-                mach=ma,
+                Re=reynolds_number,
+                mach=mach_number,
                 model_size=model_size,
             )
             c_l = float(output["CL"].item())
@@ -150,29 +142,42 @@ class SectionForces:
 
         cos_phi = np.cos(phi)
         sin_phi = np.sin(phi)
-        c_l_prime = c_l * cos_phi - c_d * sin_phi
-        c_d_prime = c_l * sin_phi + c_d * cos_phi
-        loss_factor = self.prandtl_loss(phi)
-        k_t = self.sigma * c_l_prime / (4.0 * loss_factor * sin_phi * cos_phi)
-        k_q = self.sigma * c_d_prime / (4.0 * loss_factor * sin_phi * cos_phi)
+        normal_force_coefficient = c_l * cos_phi - c_d * sin_phi
+        tangential_force_coefficient = c_l * sin_phi + c_d * cos_phi
+        prandtl_loss_factor = self.prandtl_loss(phi)
+        axial_induction_term = self.sigma * normal_force_coefficient / (
+            4.0 * prandtl_loss_factor * sin_phi * cos_phi
+        )
+        tangential_induction_term = self.sigma * tangential_force_coefficient / (
+            4.0 * prandtl_loss_factor * sin_phi * cos_phi
+        )
 
-        u = self.omega * self.r * k_t / (1.0 + k_q)
-        a_prime = k_q / (1.0 + k_q)
-        v_a = self.v_inf + u
-        v_t = self.omega * self.r * (1.0 - a_prime)
-        w = np.sqrt(v_a**2 + v_t**2)
+        induced_velocity = (
+            self.omega
+            * self.r
+            * axial_induction_term
+            / (1.0 + tangential_induction_term)
+        )
+        tangential_induction_factor = tangential_induction_term / (
+            1.0 + tangential_induction_term
+        )
+        axial_velocity = self.v_inf + induced_velocity
+        tangential_velocity = self.omega * self.r * (
+            1.0 - tangential_induction_factor
+        )
+        relative_velocity = np.sqrt(axial_velocity**2 + tangential_velocity**2)
         return (
             alpha,
             c_l,
             c_d,
-            loss_factor,
-            u,
-            a_prime,
-            w,
-            c_l_prime,
-            c_d_prime,
-            v_a,
-            v_t,
+            prandtl_loss_factor,
+            induced_velocity,
+            tangential_induction_factor,
+            relative_velocity,
+            normal_force_coefficient,
+            tangential_force_coefficient,
+            axial_velocity,
+            tangential_velocity,
         )
 
     def residual_function(self, phi: float) -> float:
@@ -187,15 +192,14 @@ class SectionForces:
     ) -> tuple[float, ...]:
         """Solve this section for the current operating point."""
         self.v_inf = v_inf
-        if self.re is None or self.ma is None:
-            local_velocity = np.sqrt(self.v_inf**2 + (self.omega * self.r) ** 2)
-            self.ma = local_velocity / self.environment.a_inf
-            self.re = (
-                self.environment.rho
-                * local_velocity
-                * self.chord
-                / self.environment.mu
-            )
+        local_velocity = np.sqrt(self.v_inf**2 + (self.omega * self.r) ** 2)
+        self.ma = local_velocity / self.environment.a_inf
+        self.re = (
+            self.environment.rho
+            * local_velocity
+            * self.chord
+            / self.environment.mu
+        )
 
         bracket = self._initial_phi_bracket(prev_phi)
         try:
@@ -212,63 +216,68 @@ class SectionForces:
                 xtol=1e-4,
                 x0=np.mean(bracket),
             )
-        if not result.converged:
+        if result.converged:
+            phi = float(result.root)
+        else:
             warnings.warn(
                 f"Root finding did not converge at r = {self.r}",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            result = RootResult(
-                root=prev_phi if prev_phi is not None else float(np.mean(bracket)),
+            phi = (
+                prev_phi if prev_phi is not None else float(np.mean(bracket))
             )
-
-        phi = result.root
         (
             alpha,
             _,
             _,
-            loss_factor,
-            u,
-            a_prime,
-            w,
-            c_l_prime,
-            c_d_prime,
+            prandtl_loss_factor,
+            induced_velocity,
+            tangential_induction_factor,
+            relative_velocity,
+            normal_force_coefficient,
+            tangential_force_coefficient,
             _,
             _,
         ) = self.section_parameters(phi)
 
-        self.re = self.environment.rho * w * self.chord / self.environment.mu
-        self.ma = w / self.environment.a_inf
-        d_t = (
+        self.re = (
+            self.environment.rho
+            * relative_velocity
+            * self.chord
+            / self.environment.mu
+        )
+        self.ma = relative_velocity / self.environment.a_inf
+        section_thrust = (
             self.sigma
             * np.pi
             * self.environment.rho
-            * w**2
-            * c_l_prime
+            * relative_velocity**2
+            * normal_force_coefficient
             * self.r
             * self.dr
         )
-        d_q = (
+        section_torque = (
             self.sigma
             * np.pi
             * self.environment.rho
-            * w**2
-            * c_d_prime
+            * relative_velocity**2
+            * tangential_force_coefficient
             * self.r**2
             * self.dr
         )
 
         return (
             phi,
-            d_t,
-            d_q,
+            section_thrust,
+            section_torque,
             alpha,
-            u,
-            a_prime,
-            c_l_prime,
-            c_d_prime,
-            loss_factor,
-            w,
+            induced_velocity,
+            tangential_induction_factor,
+            normal_force_coefficient,
+            tangential_force_coefficient,
+            prandtl_loss_factor,
+            relative_velocity,
             self.re,
             self.ma,
             self.delta_star_upper,

@@ -1,3 +1,5 @@
+"""Load current-schema propeller geometry files."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -8,154 +10,73 @@ from typing import Any
 import numpy as np
 
 
-def _find_repo_root(start: Path) -> Path:
-    """Locate the repository root by walking upward to ``pyproject.toml``."""
-    for parent in (start, *start.parents):
-        if (parent / "pyproject.toml").exists():
-            return parent
-    raise FileNotFoundError("Could not find repo root (pyproject.toml).")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _repo_root() -> Path:
-    """Return the repository root for the current working directory."""
-    return _find_repo_root(Path.cwd())
+def load_propeller_geometry(path: str | Path) -> dict[str, Any]:
+    """Load one current-schema propeller geometry pickle."""
+    return _load_pickle(_resolve_repo_path(path, add_pickle_suffix=True))
 
 
-def load_propeller_dict(name: str | Path) -> list[tuple[str, dict[str, Any]]]:
-    """Load one propeller pickle, or all pickles in a dataset directory."""
-    path = _resolve_propeller_path(name)
-    if path.is_dir():
-        return [
-            (pkl_file.stem, _load_pickle(pkl_file))
-            for pkl_file in sorted(path.glob("*.pkl"))
-        ]
-
-    if not path.suffix:
-        path = path.with_suffix(".pkl")
-    return [(path.stem, _load_pickle(path))]
+def load_propeller_geometries(
+    directory: str | Path,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Load all propeller geometry pickles in a directory."""
+    path = _resolve_repo_path(directory)
+    return [
+        (pickle_path.stem, _load_pickle(pickle_path))
+        for pickle_path in sorted(path.glob("*.pkl"))
+    ]
 
 
-def _resolve_propeller_path(name: str | Path) -> Path:
-    """Resolve propeller geometry paths from repo or legacy dataset roots."""
-    raw_path = Path(name)
-    root = _repo_root()
-    candidates = (
-        (raw_path,)
-        if raw_path.is_absolute()
-        else (
-            root / raw_path,
-            Path.cwd() / raw_path,
-            root / "Datasets" / raw_path,
-        )
-    )
-
-    for candidate in candidates:
-        if candidate.is_dir() or candidate.is_file():
-            return candidate
-        if not candidate.suffix:
-            pkl_candidate = candidate.with_suffix(".pkl")
-            if pkl_candidate.is_file():
-                return pkl_candidate
-
-    candidate = candidates[0]
-    return candidate if candidate.suffix else candidate.with_suffix(".pkl")
+def _resolve_repo_path(
+    path: str | Path,
+    *,
+    add_pickle_suffix: bool = False,
+) -> Path:
+    resolved_path = Path(path)
+    if not resolved_path.is_absolute():
+        resolved_path = REPOSITORY_ROOT / resolved_path
+    if add_pickle_suffix and not resolved_path.suffix:
+        resolved_path = resolved_path.with_suffix(".pkl")
+    return resolved_path
 
 
 def _load_pickle(path: Path) -> dict[str, Any]:
     with path.open("rb") as file:
-        return normalize_propeller_geometry(pickle.load(file))
+        return pickle.load(file)
 
 
 def normalize_propeller_geometry(
     geometry: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return a validated new-convention propeller geometry dictionary."""
-    required_keys = {
-        "airfoils",
-        "chord",
-        "n_blades",
-        "r",
-        "rake",
-        "sweep",
-        "twist",
+    """Convert a current-schema geometry mapping to canonical NumPy arrays."""
+    vectors = {
+        name: np.asarray(geometry[name], dtype=np.float64).copy()
+        for name in ("r", "chord", "twist", "sweep", "rake")
     }
-    missing_keys = sorted(required_keys.difference(geometry))
-    if missing_keys:
-        raise ValueError(
-            "Propeller geometry must use the new convention and contain "
-            f"{', '.join(missing_keys)}."
-        )
-
-    r = _geometry_vector(geometry, "r")
-    chord = _geometry_vector(geometry, "chord")
-    rake = _geometry_vector(geometry, "rake")
-    sweep = _geometry_vector(geometry, "sweep")
-    twist = _geometry_vector(geometry, "twist")
     airfoils = np.asarray(geometry["airfoils"], dtype=np.float64)
-    if airfoils.ndim != 3 or airfoils.shape[2] != 2:
-        raise ValueError(
-            "geometry['airfoils'] must have shape (sections, points, 2)."
-        )
-
-    section_count = r.shape[0]
-    for name, values in (
-        ("chord", chord),
-        ("rake", rake),
-        ("sweep", sweep),
-        ("twist", twist),
-    ):
-        if values.shape != (section_count,):
-            raise ValueError(
-                f"geometry['{name}'] must contain {section_count} entries."
-            )
-    if airfoils.shape[0] != section_count:
-        raise ValueError(
-            "geometry['airfoils'] must contain one airfoil per radial section."
-        )
 
     return {
-        "r": r,
-        "dr": _radial_widths(r),
-        "chord": chord,
-        "twist": twist,
-        "airfoils": [
-            np.array(airfoil, dtype=np.float64, copy=True)
-            for airfoil in airfoils
-        ],
-        "sweep": sweep,
-        "rake": rake,
+        "r": vectors["r"],
+        "dr": _radial_widths(vectors["r"]),
+        "chord": vectors["chord"],
+        "twist": vectors["twist"],
+        "airfoils": [airfoil.copy() for airfoil in airfoils],
+        "sweep": vectors["sweep"],
+        "rake": vectors["rake"],
         "n_blades": int(geometry["n_blades"]),
-        "tip_radius": float(geometry.get("tip_radius", r[-1])),
-        "hub_radius": float(geometry.get("hub_radius", r[0])),
+        "tip_radius": float(geometry["tip_radius"]),
+        "hub_radius": float(geometry["hub_radius"]),
     }
 
 
-def _geometry_vector(
-    geometry: Mapping[str, Any],
-    name: str,
-) -> np.ndarray:
-    values = np.asarray(geometry[name], dtype=np.float64)
-    if values.ndim != 1:
-        raise ValueError(f"geometry['{name}'] must be one-dimensional.")
-    if values.size == 0:
-        raise ValueError(f"geometry['{name}'] must not be empty.")
-    if not np.all(np.isfinite(values)):
-        raise ValueError(f"geometry['{name}'] must contain only finite values.")
-    return values.copy()
-
-
-def _radial_widths(r: np.ndarray) -> np.ndarray:
-    if r.size < 2:
-        raise ValueError("geometry['r'] must contain at least two sections.")
-    if np.any(np.diff(r) <= 0.0):
-        raise ValueError("geometry['r'] must be strictly increasing.")
-
+def _radial_widths(radial_positions: np.ndarray) -> np.ndarray:
     radial_edges = np.concatenate(
-        ([r[0]], 0.5 * (r[:-1] + r[1:]), [r[-1]])
+        (
+            [radial_positions[0]],
+            0.5 * (radial_positions[:-1] + radial_positions[1:]),
+            [radial_positions[-1]],
+        )
     )
     return np.diff(radial_edges)
-
-
-def figures_dir() -> Path:
-    """Return the repository Figures directory."""
-    return _repo_root() / "Figures"

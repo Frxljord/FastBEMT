@@ -18,8 +18,17 @@ class BladeStressCalculator:
         self.propeller = propeller
         self.geometry = propeller.geometry
 
-    def compute_centrifugal_stress(self, rho: float, omega: float) -> np.ndarray:
-        """Return centrifugal stress at each section in Pa."""
+    def compute_centrifugal_stress(
+        self,
+        material_density: float,
+        angular_velocity: float,
+    ) -> np.ndarray:
+        """Return centrifugal stress at each section in Pa.
+
+        Args:
+            material_density: Blade-material density in kg/m^3.
+            angular_velocity: Propeller angular velocity in rad/s.
+        """
         r = np.asarray(self.geometry["r"])
         cross_section = np.asarray(self.geometry["cross_section"])
 
@@ -27,13 +36,14 @@ class BladeStressCalculator:
         r_mean = 0.5 * (r[1:] + r[:-1])
         area_average = 0.5 * (cross_section[:-1] + cross_section[1:])
 
-        centrifugal_load = rho * omega**2 * r_mean * area_average * dr
-        load_per_area = np.divide(
-            centrifugal_load,
-            cross_section[:-1],
-            out=np.zeros_like(centrifugal_load),
-            where=cross_section[:-1] != 0,
+        centrifugal_load = (
+            material_density
+            * angular_velocity**2
+            * r_mean
+            * area_average
+            * dr
         )
+        load_per_area = centrifugal_load / cross_section[:-1]
 
         stresses = np.zeros_like(cross_section)
         stresses[:-1] = np.cumsum(load_per_area[::-1])[::-1]
@@ -41,32 +51,28 @@ class BladeStressCalculator:
 
     def compute_bending_stress(
         self,
-        d_t_list: Iterable[float],
-        d_q_list: Iterable[float],
+        section_thrust: Iterable[float],
+        section_torque: Iterable[float],
     ) -> np.ndarray:
-        """Return bending stress over each section airfoil polygon in Pa."""
+        """Return bending stress over each section airfoil polygon in Pa.
+
+        Args:
+            section_thrust: Per-blade thrust load at each radial section in N.
+            section_torque: Per-blade torque load at each radial section in N m.
+        """
         r = np.asarray(self.geometry["r"])
-        d_t = np.asarray(d_t_list)
-        d_q = np.asarray(d_q_list)
+        section_thrust = np.asarray(section_thrust)
+        section_torque = np.asarray(section_torque)
         n_sections = len(self.geometry["airfoils"])
 
-        drag_like_load = np.divide(d_q, r, out=np.zeros_like(d_q), where=r != 0)
-        thrust_cumulative = np.cumsum(d_t[::-1])[::-1]
-        thrust_moment_cumulative = np.cumsum((d_t * r)[::-1])[::-1]
-        drag_cumulative = np.cumsum(drag_like_load[::-1])[::-1]
-        drag_moment_cumulative = np.cumsum((drag_like_load * r)[::-1])[::-1]
-
-        thrust_next = np.zeros_like(thrust_cumulative)
-        thrust_moment_next = np.zeros_like(thrust_moment_cumulative)
-        drag_next = np.zeros_like(drag_cumulative)
-        drag_moment_next = np.zeros_like(drag_moment_cumulative)
-        thrust_next[:-1] = thrust_cumulative[1:]
-        thrust_moment_next[:-1] = thrust_moment_cumulative[1:]
-        drag_next[:-1] = drag_cumulative[1:]
-        drag_moment_next[:-1] = drag_moment_cumulative[1:]
-
-        bending_moments_x = thrust_moment_next - r * thrust_next
-        bending_moments_z = drag_moment_next - r * drag_next
+        drag_load = np.divide(
+            section_torque,
+            r,
+            out=np.zeros_like(section_torque),
+            where=r != 0,
+        )
+        bending_moments_x = self._outboard_bending_moment(section_thrust, r)
+        bending_moments_z = self._outboard_bending_moment(drag_load, r)
 
         stresses = []
         for section_index in range(n_sections):
@@ -85,56 +91,63 @@ class BladeStressCalculator:
             )
         return np.array(stresses)
 
-    def blade_stress_report(
+    def compute_stress(
         self,
-        material_rho: float,
+        material_density: float,
         bemt: BEMT,
-        show: bool = False,
         rpm: float | None = None,
         v_inf: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Compute centrifugal and bending stress for a BEMT operating point."""
-        if bemt.propeller is not self.propeller:
-            raise ValueError("The BEMT analysis belongs to a different propeller.")
+        """Compute centrifugal and bending stress for a BEMT operating point.
 
+        Args:
+            material_density: Blade-material density in kg/m^3.
+            bemt: Completed aerodynamic analysis for this propeller.
+            rpm: Rotational speed to select when ``bemt`` has multiple points.
+            v_inf: Freestream speed to select when ``bemt`` has multiple points.
+
+        Returns:
+            Centrifugal section stress and bending stress over each airfoil.
+        """
         operating_rpm, operating_v_inf = bemt.resolve_operating_point(rpm, v_inf)
         solution = bemt.solution_for(operating_rpm, operating_v_inf)
-        omega = 2.0 * np.pi * operating_rpm / 60.0
+        angular_velocity = 2.0 * np.pi * operating_rpm / 60.0
         n_blades = self.geometry["n_blades"]
-
-        sigma_c = self.compute_centrifugal_stress(material_rho, omega)
-        sigma_b = self.compute_bending_stress(
-            solution["d_t"].values / n_blades,
-            solution["d_q"].values / n_blades,
+        aerodynamic_sections = self.propeller.aerodynamic_section_mask
+        section_thrust = np.where(
+            aerodynamic_sections,
+            solution["section_thrust"].to_numpy(),
+            0.0,
+        )
+        section_torque = np.where(
+            aerodynamic_sections,
+            solution["section_torque"].to_numpy(),
+            0.0,
         )
 
-        if show:
-            self._plot_stress_report(sigma_c, sigma_b)
-
-        return sigma_c, sigma_b
-
-    def _plot_stress_report(self, sigma_c: np.ndarray, sigma_b: np.ndarray) -> None:
-        """Plot spanwise stress envelopes."""
-        import matplotlib.pyplot as plt
-
-        radius = self.geometry["r"]
-        bending_max = sigma_b.max(axis=1)
-        plt.figure(figsize=(8, 5))
-        plt.plot(radius, sigma_c / 1e6, label="Centrifugal")
-        plt.plot(radius, bending_max / 1e6, label="Bending")
-        plt.plot(
-            radius,
-            (sigma_c + bending_max) / 1e6,
-            label="Total",
-            linestyle="--",
+        centrifugal_stress = self.compute_centrifugal_stress(
+            material_density,
+            angular_velocity,
         )
-        plt.xlabel("Radius [m]")
-        plt.ylabel("Stress [MPa]")
-        plt.title("Blade Stress Envelopes")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+        bending_stress = self.compute_bending_stress(
+            section_thrust / n_blades,
+            section_torque / n_blades,
+        )
+        return centrifugal_stress, bending_stress
+
+    @staticmethod
+    def _outboard_bending_moment(
+        section_load: np.ndarray,
+        radius: np.ndarray,
+    ) -> np.ndarray:
+        """Return each section's bending moment from its outboard loads."""
+        cumulative_load = np.cumsum(section_load[::-1])[::-1]
+        cumulative_moment = np.cumsum((section_load * radius)[::-1])[::-1]
+        outboard_load = np.zeros_like(cumulative_load)
+        outboard_moment = np.zeros_like(cumulative_moment)
+        outboard_load[:-1] = cumulative_load[1:]
+        outboard_moment[:-1] = cumulative_moment[1:]
+        return outboard_moment - radius * outboard_load
 
     @staticmethod
     def _compute_moment_of_inertia(
@@ -142,41 +155,44 @@ class BladeStressCalculator:
         y: np.ndarray,
     ) -> tuple[float, float, float]:
         """Compute polygon second moments of area in m^4."""
-        c_x, c_y = BladeStressCalculator._compute_com(x, y)
+        c_x, c_y = BladeStressCalculator._polygon_centroid(x, y)
         x = x - c_x
         y = y - c_y
 
-        i_xx = 0.0
-        i_zz = 0.0
-        i_xz = 0.0
-        for index in range(len(x)):
-            x0, y0 = x[index], y[index]
-            x1, y1 = x[(index + 1) % len(x)], y[(index + 1) % len(x)]
-            common = x0 * y1 - x1 * y0
-            i_xx += (y0**2 + y0 * y1 + y1**2) * common
-            i_zz += (x0**2 + x0 * x1 + x1**2) * common
-            i_xz += (x0 * y1 + 2 * x0 * y0 + 2 * x1 * y1 + x1 * y0) * common
+        x_next = np.roll(x, -1)
+        y_next = np.roll(y, -1)
+        cross = x * y_next - x_next * y
+        i_xx = np.sum((y**2 + y * y_next + y_next**2) * cross)
+        i_zz = np.sum((x**2 + x * x_next + x_next**2) * cross)
+        i_xz = np.sum(
+            (x * y_next + 2.0 * x * y + 2.0 * x_next * y_next + x_next * y)
+            * cross
+        )
 
         return abs(i_xx / 12.0), abs(i_zz / 12.0), i_xz / 24.0
 
     @staticmethod
-    def _compute_com(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-        """Compute polygon centroid with the shoelace formula."""
-        xi = x[:-1]
-        yi = y[:-1]
-        xi1 = x[1:]
-        yi1 = y[1:]
+    def _polygon_centroid(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+        """Compute a polygon centroid with the shoelace formula."""
+        x_current = x[:-1]
+        y_current = y[:-1]
+        x_next = x[1:]
+        y_next = y[1:]
+        cross = x_current * y_next - x_next * y_current
+        scale = 3.0 * np.sum(cross)
+        return (
+            float(np.sum((x_current + x_next) * cross) / scale),
+            float(np.sum((y_current + y_next) * cross) / scale),
+        )
 
-        area_terms = xi * yi1 - xi1 * yi
-        area = 0.5 * np.sum(area_terms)
-        c_x = np.sum((xi + xi1) * area_terms) / (6.0 * area)
-        c_y = np.sum((yi + yi1) * area_terms) / (6.0 * area)
-        return c_x, c_y
-
-    def compute_propeller_mass(self, rho: float) -> float:
-        """Return total propeller mass in kg."""
+    def compute_propeller_mass(self, material_density: float) -> float:
+        """Return total propeller mass in kg for a material density in kg/m^3."""
         segment_volumes = (
             np.asarray(self.geometry["cross_section"])
             * np.asarray(self.geometry["dr"])
         )
-        return float(np.sum(segment_volumes) * rho * self.geometry["n_blades"])
+        return float(
+            np.sum(segment_volumes)
+            * material_density
+            * self.geometry["n_blades"]
+        )

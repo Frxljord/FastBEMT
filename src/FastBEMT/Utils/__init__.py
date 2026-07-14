@@ -1,4 +1,4 @@
-from .DataLoader import load_propeller_dict, normalize_propeller_geometry
+from .DataLoader import load_propeller_geometries, load_propeller_geometry
 from .Environment import Environment
 from .Plotter import Plotter
 from .Simulation import Simulation
@@ -9,6 +9,6 @@ __all__ = [
     "Environment",
     "Plotter",
     "Simulation",
-    "load_propeller_dict",
-    "normalize_propeller_geometry",
+    "load_propeller_geometries",
+    "load_propeller_geometry",
 ]

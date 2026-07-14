@@ -2,7 +2,7 @@
 
 import torch
 
-from FastBEMT.Aeroacoustics._bpm_common import (
+from .._bpm_common import (
     safe_log10,
     st,
     torch_select as _torch_select,
@@ -144,10 +144,9 @@ def compute_teb_noise(
     delta_s: torch.Tensor,
     psi: torch.Tensor,
     base_val_te: torch.Tensor,
-    h: float | None = None,
 ) -> torch.Tensor:
     """Compute trailing-edge bluntness broadband noise."""
-    h_val = (chord * 0.01) if h is None else torch.full_like(chord, h)
+    h_val = chord * 0.01
 
     delta_avg = (delta_p + delta_s) * 0.5
     h_5d = h_val[None, None, :, None, None]
@@ -167,19 +166,3 @@ def compute_teb_noise(
     spl_teb = log_h_bv + g4(q, psi_5d) + g5_tot(q, eta, psi_5d)
 
     return 10 ** (spl_teb / 10)
-
-
-__all__ = [
-    "compute_teb_noise",
-    "st",
-    "safe_log10",
-    "st_peak_3prime",
-    "g4",
-    "calc_mu",
-    "calc_m",
-    "calc_eta0",
-    "calc_k",
-    "g5",
-    "g5_0",
-    "g5_tot",
-]

@@ -11,15 +11,15 @@ def compute_ti_noise(
     alpha: torch.Tensor,
     u: torch.Tensor,
     m: torch.Tensor,
-    rho: float,
-    a_inf: float,
+    rho: torch.Tensor,
+    a_inf: torch.Tensor,
     base_val_le: torch.Tensor,
     base_val_low: torch.Tensor,
-    lt: float,
-    i: float,
+    turbulence_length_scale: float,
+    turbulence_intensity: float,
 ) -> torch.Tensor:
     """Compute turbulence-ingestion broadband noise."""
-    ns = alpha.shape[0]
+    n_sections = alpha.shape[0]
     bv_le = base_val_le[None, :, :, :, :]
     bv_low = base_val_low[None, :, :, :, :]
 
@@ -39,17 +39,17 @@ def compute_ti_noise(
     lfc_term = torch.clamp(lfc / (1.0 + lfc), min=1e-15)
     lfc_5d = lfc_term[:, None, :, None, None]
 
-    k1_hat = k1_val / (3.0 / (4.0 * lt))
+    k1_hat = k1_val / (3.0 / (4.0 * turbulence_length_scale))
     phi_term = (k1_hat**3) / ((1.0 + k1_hat**2) ** (7.0 / 3.0))
     alpha_sq = (alpha**2)[None, None, :, None, None]
 
     inner_val = (
         (rho**2)
         * (a_inf**4)
-        * lt
+        * turbulence_length_scale
         * 0.5
-        * (i**2)
-        * phi_term.view(frequencies.shape[0], 1, ns, 1, 1)
+        * (turbulence_intensity**2)
+        * phi_term.view(frequencies.shape[0], 1, n_sections, 1, 1)
         * bv_ti
     )
 
@@ -61,6 +61,3 @@ def compute_ti_noise(
     )
 
     return 10.0 ** (spl_ti / 10.0)
-
-
-__all__ = ["compute_ti_noise"]

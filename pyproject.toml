@@ -6,25 +6,47 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aerosandbox>=4.2.9",
-    "ipython>=9.9.0",
-    "kaleido>=1.2.0",
-    "line-profiler>=5.0.0",
-    "matplotlib>=3.10.8",
-    "nbformat>=5.10.4",
-    "numpy>=2.4.0",
-    "opt-einsum>=3.4.0",
+    "ipykernel>=7.3.0",
+    "matplotlib==3.10.9",
+    "numpy>=2.4.1",
     "pandas>=2.3.3",
-    "pip>=25.3",
-    "plotly>=6.5.1",
-    "pyfar>=0.7.3",
-    "scienceplots>=2.2.0",
-    "scikit-learn>=1.8.0",
+    "scienceplots>=2.2.2",
     "scipy>=1.16.3",
-    "shapely>=2.1.2",
-    "snakeviz>=2.2.2",
-    "torch-tb-profiler>=0.4.3",
+    "torch>=2.8.0",
+]
+
+[project.optional-dependencies]
+examples = [
+    "ipykernel>=6.29.5",
+    "scienceplots>=2.2.2",
+]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.14.0",
 ]
 
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["FastBEMT*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }

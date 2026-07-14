@@ -2,13 +2,9 @@
 
 import numpy as np
 import torch
+from scipy.interpolate import Akima1DInterpolator
 
-from FastBEMT.Aeroacoustics._bpm_common import safe_log10, st
-
-try:
-    from scipy.interpolate import Akima1DInterpolator
-except Exception:  # pragma: no cover - scipy is a project dependency.
-    Akima1DInterpolator = None
+from .._bpm_common import safe_log10, st
 
 
 ASPECT_DATA = np.array([2.0, 2.67, 4.0, 6.0, 12.0, 24.0])
@@ -26,10 +22,7 @@ def aspect_ratio_correction(aspect_ratio: torch.Tensor) -> torch.Tensor:
     if aspect_value < 2.0:
         aratio = 0.5
     elif aspect_value <= 24.0:
-        if Akima1DInterpolator is None:
-            aratio = float(np.interp(aspect_value, ASPECT_DATA, ARATIO_DATA))
-        else:
-            aratio = float(Akima1DInterpolator(ASPECT_DATA, ARATIO_DATA)(aspect_value))
+        aratio = float(Akima1DInterpolator(ASPECT_DATA, ARATIO_DATA)(aspect_value))
     else:
         aratio = 1.0
     return torch.tensor(
@@ -47,11 +40,11 @@ def compute_tv_noise(
     chord: torch.Tensor,
     alpha: torch.Tensor,
     m: torch.Tensor,
-    a_inf: float,
+    a_inf: torch.Tensor,
     base_val_te: torch.Tensor,
 ) -> torch.Tensor:
     """Compute tip-vortex broadband noise."""
-    nt, ns, nb, n_obs = base_val_te.shape
+    n_source_times, n_sections, n_blades, n_observers = base_val_te.shape
 
     chord_tip = chord[-1]
     m_tip = m[-1]
@@ -81,19 +74,16 @@ def compute_tv_noise(
     )
 
     spp_full = torch.zeros(
-        (frequencies.shape[0], nt, ns, nb, n_obs),
+        (
+            frequencies.shape[0],
+            n_source_times,
+            n_sections,
+            n_blades,
+            n_observers,
+        ),
         device=base_val_te.device,
         dtype=base_val_te.dtype,
     )
     spp_full[:, :, -1, :, :] = 10 ** (spl_tip.squeeze(2) / 10)
 
     return spp_full
-
-
-__all__ = [
-    "compute_tv_noise",
-    "st",
-    "safe_log10",
-    "calc_l_tip",
-    "aspect_ratio_correction",
-]
